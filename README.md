@@ -414,7 +414,7 @@ Gradient Memory      | 136.03     MB
 - **Backward table**: BW Head, BW Embed, BW Attention, BW FeedForward, BW Norms; Gradient Memory matches summary.
 - **Optimizer mem/step**: Memory for the optimizer update only, not fwd/bwd activations.
 
-## 🔬 Parameter Experimentation Guide
+## Parameter Experimentation Guide
 
 Understanding how architectural parameters impact performance:
 

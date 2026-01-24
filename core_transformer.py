@@ -463,7 +463,7 @@ class EinsumTransformer:
         if self.use_lora:
             print(f"  {'LoRA (A,B)':<18} {'float32':<18} {'-':<18} {'—':<14}")
         print(f"  {'-'*18} {'-'*18} {'-'*18} {'-'*14}")
-        print(f"  {'Total (all layers)':<18} {'':<18} {'':<18} {total_save:<14}")
+        print(f"  {f'Total (all {n_layers} layers)':<24} {'':<18} {'':<18} {total_save:<14}")
 
     def _bind_weights(self):
         c = self.cfg
@@ -553,13 +553,15 @@ class EinsumTransformer:
             if scale == 0:
                 return w
             wi = np.clip(np.round(w / scale).astype(np.int32), -128, 127).astype(np.int8)
-            return wi.astype(np.float32) * scale
+            out = wi.astype(np.float32) * scale
+            return np.clip(np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0), -1e6, 1e6)
         if bits == 4:
             scale = np.max(np.abs(w)) / 7.0
             if scale == 0:
                 return w
             wi = np.clip(np.round(w / scale).astype(np.int32), -8, 7).astype(np.int8)
-            return wi.astype(np.float32) * scale
+            out = wi.astype(np.float32) * scale
+            return np.clip(np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0), -1e6, 1e6)
         return w
 
     def _quantize_dequant_act(self, x, bits):
@@ -591,8 +593,9 @@ class EinsumTransformer:
         if hasattr(self, '_stats') and 'weight_load' in self._stats:
             self._stats['weight_load'].append(dt)
         # Mixed-precision weight quantization (simulated: quantize->dequant to float32 for einsum)
+        # Skip LoRA adapters: keep float32 to avoid overflow in A@B and to support training
         wb = getattr(self.cfg, "quantization_weight_bits", 0)
-        if wb in (4, 8):
+        if wb in (4, 8) and "lora" not in str(name).lower():
             data = self._quantize_dequant_weight(data.astype(np.float32), wb)
         return data.T if transpose else data
 
@@ -708,13 +711,6 @@ class EinsumTransformer:
             if hasattr(self, '_kv_size_mb') and self._kv_size_mb > 0:
                 self._log("-" * 46)
                 self._log(f"{'KV Cache Size':<20} | {self._kv_size_mb:<10.2f} MB")
-        
-        # Memory stats (backward and optimizer)
-        if hasattr(self, '_memory_stats') and is_backward_table:
-            grad_mb = self._memory_stats.get('grad_total_mb', 0)
-            if grad_mb > 0:
-                self._log("-" * 46)
-                self._log(f"{'Gradient Memory':<20} | {grad_mb:<10.2f} MB")
         
         # Optimizer stats
         if self._stats.get('opt_step'):
@@ -847,14 +843,18 @@ class EinsumTransformer:
                 # Actually standard LoRA is B(A(x)).
                 # x: (B, T, d). A: (d, r) -> x@A: (B, T, r). B: (r, d). x@A@B: (B, T, d).
                 # So effectively we are adding A @ B to the weight matrix W (if x @ W).
-                # So yes, W_q += scale * (A @ B).
-                delta_q = (A_q @ B_q)
+                # So yes, W_q += scale * (A @ B). Sanitize A,B and delta to avoid overflow/div0 in matmul.
+                A_q = np.clip(np.nan_to_num(np.asarray(A_q, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0), -50.0, 50.0)
+                B_q = np.clip(np.nan_to_num(np.asarray(B_q, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0), -50.0, 50.0)
+                delta_q = np.clip(np.nan_to_num(A_q @ B_q, nan=0.0, posinf=0.0, neginf=0.0), -1e4, 1e4)
                 W_q = W_q + scale * delta_q
 
             if "v_proj" in self.lora_target_modules and p.get("lora_A_v") is not None:
                 A_v = self.get_w(p["lora_A_v"])
                 B_v = self.get_w(p["lora_B_v"])
-                delta_v = (A_v @ B_v)
+                A_v = np.clip(np.nan_to_num(np.asarray(A_v, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0), -50.0, 50.0)
+                B_v = np.clip(np.nan_to_num(np.asarray(B_v, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0), -50.0, 50.0)
+                delta_v = np.clip(np.nan_to_num(A_v @ B_v, nan=0.0, posinf=0.0, neginf=0.0), -1e4, 1e4)
                 W_v = W_v + scale * delta_v
 
         self._stats['attn_load'].append(time.time() - t_load)
@@ -1122,7 +1122,13 @@ class EinsumTransformer:
         self._log(f"[INFO] Logits computed, shape: {res.shape}")
 
         # Note: Sampling and detokenization are handled in generate() method for streaming
-        
+
+        if training and hasattr(self, '_memory_stats'):
+            def _nbytes(v):
+                if hasattr(v, 'nbytes'): return v.nbytes
+                if isinstance(v, dict): return sum(_nbytes(x) for x in v.values())
+                return 0
+            self._memory_stats['fwd_activation_mb'] = sum(_nbytes(v) for v in self._activations.values()) / (1024 * 1024)
 
         if self.verbose and not self.training:
             self._print_stats_table()
@@ -1689,5 +1695,3 @@ class EinsumOptimizer:
         # Track stats
         m._stats['opt_step'].append(opt_time)
         m._memory_stats['opt_per_step_mb'].append(step_memory_mb)
-                    
-        print(f"[INFO] Optimizer update: {opt_time:.3f}s | opt_mem: {step_memory_mb:.1f} MB")
