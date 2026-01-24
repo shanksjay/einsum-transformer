@@ -1,0 +1,14 @@
+[project]
+name = "einsum"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "huggingface-hub",
+    "safetensors",
+    "numpy"
+]
+
+[project.optional-dependencies]
+ray = ["ray"]

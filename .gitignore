@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[oc]
+*.pyo
+build/
+dist/
+wheels/
+*.egg-info
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv
+venv
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env and secrets
+.env
+.env.*
+!.env.example
+
+# Logs and outputs
+*.log
+logs/
+
+# Model weights and caches (large files; add paths where you store checkpoints)
+# models/
+# checkpoints/
+# *.safetensors
