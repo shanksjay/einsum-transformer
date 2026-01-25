@@ -462,9 +462,16 @@ class EinsumTransformer:
                 "norm2": must(prefix + "post_attention_layernorm.weight")
             }
             if self.use_lora:
-                if layer["lora_A_q"] is None and f"lora_A_q_{i}" in self.weights:
+                if layer["lora_A_q"] is None:
+                    if f"lora_A_q_{i}" not in self.weights:
+                        self.weights[f"lora_A_q_{i}"] = np.random.randn(c.d_model, self.lora_rank).astype(np.float32) * 0.02
+                        self.weights[f"lora_B_q_{i}"] = np.random.randn(self.lora_rank, c.d_model).astype(np.float32) * 0.02
                     layer["lora_A_q"], layer["lora_B_q"] = f"lora_A_q_{i}", f"lora_B_q_{i}"
-                if layer["lora_A_v"] is None and f"lora_A_v_{i}" in self.weights:
+                if layer["lora_A_v"] is None:
+                    if f"lora_A_v_{i}" not in self.weights:
+                        d_kv = c.n_kv_heads * c.d_head
+                        self.weights[f"lora_A_v_{i}"] = np.random.randn(c.d_model, self.lora_rank).astype(np.float32) * 0.02
+                        self.weights[f"lora_B_v_{i}"] = np.random.randn(self.lora_rank, d_kv).astype(np.float32) * 0.02
                     layer["lora_A_v"], layer["lora_B_v"] = f"lora_A_v_{i}", f"lora_B_v_{i}"
             self.layer_weights.append(layer)
 
