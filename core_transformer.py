@@ -137,11 +137,9 @@ class LazyWeightManager:
             res = data.astype(np.float32)
             
         self.cache[key] = res
-
         # Evict if necessary
         if self.max_cache_size and len(self.cache) > self.max_cache_size:
             self.cache.popitem(last=False)
-
         return res
 
     def __setitem__(self, key, value):
@@ -201,7 +199,6 @@ class EinsumTransformer:
 
         if _from_weights is not None:
             if _E_name is None or _layer_weights is None:
-                # Allow just _from_weights for sharing across instances
                 self.weights = DictWeightManager(_from_weights) if isinstance(_from_weights, dict) else _from_weights
                 self._bind_weights()
             else:
@@ -424,6 +421,9 @@ class EinsumTransformer:
                 return None
             return name
 
+        def maybe(name):
+            return name if name in self.weights else None
+
         self.E_name = must("model.embed_tokens.weight") or must("transformer.wte.weight")
         self.layer_weights = []
         for i in range(c.n_layers):
@@ -450,10 +450,10 @@ class EinsumTransformer:
                 "W_k": must(prefix + "self_attn.k_proj.weight"),
                 "W_v": must(prefix + "self_attn.v_proj.weight"),
                 "W_o": must(prefix + "self_attn.o_proj.weight"),
-                "lora_A_q": must(prefix + "self_attn.q_proj.lora_A.weight") if self.use_lora and "q_proj" in self.lora_target_modules else None,
-                "lora_B_q": must(prefix + "self_attn.q_proj.lora_B.weight") if self.use_lora and "q_proj" in self.lora_target_modules else None,
-                "lora_A_v": must(prefix + "self_attn.v_proj.lora_A.weight") if self.use_lora and "v_proj" in self.lora_target_modules else None,
-                "lora_B_v": must(prefix + "self_attn.v_proj.lora_B.weight") if self.use_lora and "v_proj" in self.lora_target_modules else None,
+                "lora_A_q": maybe(prefix + "self_attn.q_proj.lora_A.weight") if self.use_lora and "q_proj" in self.lora_target_modules else None,
+                "lora_B_q": maybe(prefix + "self_attn.q_proj.lora_B.weight") if self.use_lora and "q_proj" in self.lora_target_modules else None,
+                "lora_A_v": maybe(prefix + "self_attn.v_proj.lora_A.weight") if self.use_lora and "v_proj" in self.lora_target_modules else None,
+                "lora_B_v": maybe(prefix + "self_attn.v_proj.lora_B.weight") if self.use_lora and "v_proj" in self.lora_target_modules else None,
                 "W1": W1 if not c.use_moe else None,
                 "W2": W2 if not c.use_moe else None,
                 "W3": W3 if not c.use_moe else None,
@@ -532,7 +532,7 @@ class EinsumTransformer:
 
         # Check if we should apply (and cache) simulated quantization
         wb = getattr(self.cfg, "quantization_weight_bits", 0)
-        if wb in (4, 8) and not getattr(data, "_is_quantized", False):
+        if wb in (4, 8) and not getattr(data, "_is_quantized", False) and "lora" not in str(name).lower():
             data = self._quantize_dequant_weight(data.astype(np.float32), wb)
             # Mark as quantized and store back in weight manager cache to avoid re-computing
             try:
@@ -552,24 +552,21 @@ class EinsumTransformer:
         norm_x = x / rms
         res = norm_x * w
         if hasattr(self, '_stats') and 'norm' in self._stats: self._stats['norm'].append(time.time() - t0)
-        if self.training and key is not None: self._activations[key] = {"x": x, "rms": rms, "w": w, "norm_x": norm_x}
+        if self.training and key is not None: self._activations[key] = {"x": x, "rms": rms, "norm_x": norm_x}
         return res
 
     def swiglu(self, x, W1, W2, W3, key=None):
         t0 = time.time()
         a = np.einsum("btd,df->btf", x, W1, optimize=True)
         b = np.einsum("btd,df->btf", x, W2, optimize=True)
-        sig_b = np.empty_like(b)
-        mask = b >= 0
-        sig_b[mask] = 1 / (1 + np.exp(-b[mask]))
-        sig_b[~mask] = np.exp(b[~mask]) / (1 + np.exp(b[~mask]))
+        sig_b = 1.0 / (1.0 + np.exp(-b))
         swish_b = b * sig_b
         gated = a * swish_b
         res = np.einsum("btf,fd->btd", gated, W3, optimize=True)
         if hasattr(self, '_stats') and 'ffn_compute' in self._stats:
             self._stats['ffn_compute'].append(time.time() - t0)
         if self.training and key is not None:
-            self._activations[key] = {"x": x, "W1": W1, "W2": W2, "W3": W3, "a": a, "b": b, "sig_b": sig_b, "gated": gated}
+            self._activations[key] = {"x": x, "a": a, "b": b, "sig_b": sig_b, "gated": gated}
         return res
 
     def _log(self, *args, **kwargs):
@@ -600,9 +597,9 @@ class EinsumTransformer:
         lora_q = lora_v = None
         if self.use_lora:
             scale = self.lora_alpha / self.lora_rank
-            if "q_proj" in self.lora_target_modules and p.get("lora_A_q") is not None:
+            if p.get("lora_A_q") is not None:
                 lora_q = (self.get_w(p["lora_A_q"]), self.get_w(p["lora_B_q"]), scale)
-            if "v_proj" in self.lora_target_modules and p.get("lora_A_v") is not None:
+            if p.get("lora_A_v") is not None:
                 lora_v = (self.get_w(p["lora_A_v"]), self.get_w(p["lora_B_v"]), scale)
         self._stats['attn_load'].append(time.time() - t_load)
         
@@ -662,9 +659,8 @@ class EinsumTransformer:
         self._stats['attn'].append(time.time() - t0)
         if self.training:
             self._activations[f"attn_{layer_idx}"] = {
-                "x": x, "W_q": W_q, "W_k": W_k, "W_v": W_v, "W_o": W_o,
-                "Q": Q, "K": K, "V": V, "Q_t": Q_t, "K_t": K_t, "V_t": V_t,
-                "attn": attn, "weighted_v": weighted_v, "weighted_v_merged": weighted_v_merged
+                "x": x, "Q_t": Q_t, "K_t": K_t, "V_t": V_t,
+                "attn": attn, "weighted_v_merged": weighted_v_merged
             }
         return res
 
@@ -697,7 +693,7 @@ class EinsumTransformer:
         self._stats['embedding'].append(time.time() - t_embed)
         ab = getattr(self.cfg, "quantization_activation_bits", 0)
         if ab in (4, 8, 16): x = self._quantize_dequant_act(x.astype(np.float32), ab)
-        if training: self._activations["embedding"], self._activations["E"] = x, E
+        if training: self._activations["embedding"] = x
         
         n_layers = max_layers if max_layers is not None else self.cfg.n_layers
         for i in range(n_layers):
@@ -722,18 +718,17 @@ class EinsumTransformer:
         if inference: self.cur_pos += tokens.shape[1]
         if not is_decode and inference: self._stats['prefill'].append(time.time() - t_stage_start)
         elif is_decode: self._stats['decode'].append(time.time() - t_stage_start)
+
         if training:
             self._activations["final_x"] = x
-            # Calculate activation memory footprint
-            total_act_bytes = 0
+            # Calculate activation memory footprint correctly
             def _sum_bytes(d):
                 b = 0
                 for v in d.values():
                     if isinstance(v, np.ndarray): b += v.nbytes
                     elif isinstance(v, dict): b += _sum_bytes(v)
                 return b
-            total_act_bytes = _sum_bytes(self._activations)
-            self._memory_stats['fwd_activation_mb'] = total_act_bytes / (1024 * 1024)
+            self._memory_stats['fwd_activation_mb'] = _sum_bytes(self._activations) / (1024 * 1024)
 
         t_head = time.time()
         res = np.einsum("btd,vd->btv", x, E, optimize=True)
@@ -744,26 +739,32 @@ class EinsumTransformer:
 
     def backward(self, d_logits):
         t_total = time.time()
-        c, E, final_x = self.cfg, self._activations["E"], self._activations["final_x"]
+        c = self.cfg
+        E = self.get_w(self.E_name)
+        final_x = self._activations["final_x"]
         dx = np.einsum("btv,vd->btd", d_logits, E, optimize=True)
         if not self.use_lora: self._grads["E"] = np.einsum("btv,btd->vd", d_logits, final_x, optimize=True)
         for i in reversed(range(c.n_layers)):
+            p = self.layer_weights[i]
             if not c.use_moe:
                 act_ffn, dffn_out = self._activations[f"ffn_{i}"], dx
+                W1, W2, W3 = [self.get_w(p[k], transpose=True) for k in ["W1", "W2", "W3"]]
                 if not self.use_lora: self._grads[f"W3_{i}"] = np.einsum("btf,btd->fd", act_ffn["gated"], dffn_out, optimize=True)
-                dgated = np.einsum("btd,fd->btf", dffn_out, act_ffn["W3"], optimize=True)
+                dgated = np.einsum("btd,fd->btf", dffn_out, W3, optimize=True)
                 da = dgated * (act_ffn["b"] * act_ffn["sig_b"])
                 db = dgated * act_ffn["a"] * (act_ffn["sig_b"] * (1 + act_ffn["b"] * (1 - act_ffn["sig_b"])))
                 if not self.use_lora:
                     self._grads[f"W1_{i}"], self._grads[f"W2_{i}"] = np.einsum("btd,btf->df", act_ffn["x"], da, optimize=True), np.einsum("btd,btf->df", act_ffn["x"], db, optimize=True)
-                dx = dx + np.einsum("btf,df->btd", da, act_ffn["W1"], optimize=True) + np.einsum("btf,df->btd", db, act_ffn["W2"], optimize=True)
+                dx = dx + np.einsum("btf,df->btd", da, W1, optimize=True) + np.einsum("btf,df->btd", db, W2, optimize=True)
                 act_norm2, dx_norm2 = self._activations[f"norm2_{i}"], dx
+                norm2_w = self.get_w(p["norm2"])
                 if not self.use_lora: self._grads[f"norm2_{i}"] = np.einsum("btd,btd->d", dx_norm2, act_norm2["norm_x"], optimize=True)
-                term1 = dx_norm2 * act_norm2["w"]
+                term1 = dx_norm2 * norm2_w
                 dx = dx + (term1 - np.mean(term1 * act_norm2["norm_x"], axis=-1, keepdims=True) * act_norm2["norm_x"]) / act_norm2["rms"]
             act_attn, dattn_out = self._activations[f"attn_{i}"], dx
+            W_o = self.get_w(p["W_o"], transpose=True)
             if not self.use_lora: self._grads[f"W_o_{i}"] = np.einsum("btd,bth->dh", act_attn["weighted_v_merged"], dattn_out, optimize=True)
-            dweighted = np.einsum("bth,dh->btd", dattn_out, act_attn["W_o"], optimize=True).reshape(dx.shape[0], dx.shape[1], c.n_heads, c.d_head).transpose(0, 2, 1, 3)
+            dweighted = np.einsum("bth,dh->btd", dattn_out, W_o, optimize=True).reshape(dx.shape[0], dx.shape[1], c.n_heads, c.d_head).transpose(0, 2, 1, 3)
             dattn = np.einsum("bhid,bhjd->bhij", dweighted, act_attn["V_t"], optimize=True)
             dscores = act_attn["attn"] * (dattn - np.sum(dattn * act_attn["attn"], axis=-1, keepdims=True)) / np.sqrt(c.d_head)
             dQ_t, dK_t_f = np.einsum("bhij,bhjd->bhid", dscores, act_attn["K_t"], optimize=True), np.einsum("bhji,bhjd->bhid", dscores, act_attn["Q_t"], optimize=True)
@@ -785,13 +786,15 @@ class EinsumTransformer:
                     self._grads[f"lora_A_v_{i}"] = al["s"] * np.einsum("btd,btr->dr", act_attn["x"], dV_B, optimize=True)
             if not self.use_lora:
                 self._grads[f"W_q_{i}"], self._grads[f"W_k_{i}"], self._grads[f"W_v_{i}"] = [np.einsum("btd,bth->dh", act_attn["x"], t, optimize=True) for t in [dQf, dKf, dVf]]
-            dx = dx + np.einsum("bth,dh->btd", dQf, act_attn["W_q"], optimize=True) + np.einsum("bth,dh->btd", dKf, act_attn["W_k"], optimize=True) + np.einsum("bth,dh->btd", dVf, act_attn["W_v"], optimize=True)
+            W_q, W_k, W_v = [self.get_w(p[k], transpose=True) for k in ["W_q", "W_k", "W_v"]]
+            dx = dx + np.einsum("bth,dh->btd", dQf, W_q, optimize=True) + np.einsum("bth,dh->btd", dKf, W_k, optimize=True) + np.einsum("bth,dh->btd", dVf, W_v, optimize=True)
             if self.use_lora:
                 if dQ_B is not None: dx += self._activations[f"lora_q_{i}"]["s"] * np.einsum("btr,dr->btd", dQ_B, self._activations[f"lora_q_{i}"]["A"], optimize=True)
                 if dV_B is not None: dx += self._activations[f"lora_v_{i}"]["s"] * np.einsum("btr,dr->btd", dV_B, self._activations[f"lora_v_{i}"]["A"], optimize=True)
             act_norm1, dx_norm1 = self._activations[f"norm1_{i}"], dx
+            norm1_w = self.get_w(p["norm1"])
             if not self.use_lora: self._grads[f"norm1_{i}"] = np.einsum("btd,btd->d", dx_norm1, act_norm1["norm_x"], optimize=True)
-            term1 = dx_norm1 * act_norm1["w"]
+            term1 = dx_norm1 * norm1_w
             dx = dx + (term1 - np.mean(term1 * act_norm1["norm_x"], axis=-1, keepdims=True) * act_norm1["norm_x"]) / act_norm1["rms"]
         if not self.use_lora: np.add.at(self._grads["E"], self._activations["tokens"], dx)
 
@@ -847,60 +850,37 @@ class EinsumTransformer:
                 draft_input = np.full((1, 1), d_tok)
             
             # b. Target verifies in one batch forward pass
-            # We must include the tokens the draft model predicted.
-            # The target model's cache is currently at len(generated).
-            # We feed it d_tokens to see what it would have predicted.
-            v_input = np.array(d_tokens).reshape(1, -1)
+            # Feed the last confirmed token plus all but the last draft prediction
+            v_input = np.array([generated[-1]] + d_tokens[:-1]).reshape(1, -1)
             v_logits = self.forward(v_input, inference=True, verbose=False)
             
             # c. Verify
             n_accepted = 0
             for j in range(k):
-                # target_tok is the prediction for the position where d_tokens[j] sits
                 target_tok = self.sample_top_k(v_logits[:, j:j+1, :], k=self.cfg.top_k_sample, temperature=self.cfg.temperature)[0]
                 if target_tok == d_tokens[j]:
                     generated.append(d_tokens[j])
                     print(self.detokenize([d_tokens[j]])[0], end="", flush=True)
                     n_accepted += 1
                 else:
-                    # Mismatch! Accept target's correction and stop.
                     generated.append(target_tok)
                     print(f"[{self.detokenize([target_tok])[0]}]", end="", flush=True)
                     break
             
-            # d. Rollback Draft Cache
-            # Draft model advanced k steps. We accepted n_accepted draft tokens + 1 target correction (if n_accepted < k).
-            # Total tokens verified/added: n_accepted + (1 if n_accepted < k else 0).
-            # We must rollback draft cache to this new state.
-            if n_accepted < k:
-                # We have added n_accepted tokens from draft and 1 correction from target to 'generated'
-                # The target model's cache has 'k' new tokens (d_tokens)
-                # We need to rollback target cache to n_accepted (discarding d_tokens[n_accepted:]),
-                # then forward the correction token.
-                n_target_rollback = k - n_accepted
+            # d. Rollback target model cache to n_accepted confirmed tokens
+            n_target_rollback = k - n_accepted
+            if n_target_rollback > 0:
                 for layer in self.cache:
-                    layer["K"] = layer["K"][:, :, :-n_target_rollback, :]
-                    layer["V"] = layer["V"][:, :, :-n_target_rollback, :]
+                    if layer["K"] is not None:
+                        layer["K"] = layer["K"][:, :, :-n_target_rollback, :]
+                        layer["V"] = layer["V"][:, :, :-n_target_rollback, :]
                 self.cur_pos -= n_target_rollback
-                _ = self.forward(np.full((1, 1), generated[-1]), inference=True, verbose=False)
 
-                # Same for draft model
-                for layer in draft_model.cache:
-                    layer["K"] = layer["K"][:, :, :-n_target_rollback, :]
-                    layer["V"] = layer["V"][:, :, :-n_target_rollback, :]
-                draft_model.cur_pos -= n_target_rollback
-                _ = draft_model.forward(np.full((1, 1), generated[-1]), inference=True, verbose=False)
-            else:
-                # All k draft tokens accepted!
-                # Target model has k tokens in cache. We can actually take ONE MORE from target's last prediction.
-                # v_logits[:, k-1] was for d_tokens[k-1]. We accepted it.
-                # But we don't have the prediction for the token AFTER d_tokens[k-1] yet in `generated`.
-                # Let's run one more target forward if we want, or just sample from the last v_logits if it wasn't used.
-                # Wait, n_accepted == k means for all j in 0..k-1, target_tok == d_tokens[j].
-                # We have already added d_tokens[0..k-1] to generated.
-                # We haven't yet added the token predicted BY target from d_tokens[k-1].
-                # Let's just keep it simple and continue to next draft loop.
-                pass
+            # e. Sync draft model cache to target model's confirmed state
+            for l in range(self.cfg.draft_layers):
+                draft_model.cache[l]["K"] = self.cache[l]["K"].copy()
+                draft_model.cache[l]["V"] = self.cache[l]["V"].copy()
+            draft_model.cur_pos = self.cur_pos
 
         print()
         return generated
