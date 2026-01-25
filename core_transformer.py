@@ -848,23 +848,24 @@ class EinsumTransformer:
             # Draft model advanced k steps. We accepted n_accepted draft tokens + 1 target correction (if n_accepted < k).
             # Total tokens verified/added: n_accepted + (1 if n_accepted < k else 0).
             # We must rollback draft cache to this new state.
-            n_to_rollback = k - n_accepted
             if n_accepted < k:
-                # Rollback draft to position of mismatch, then add the correction token
-                for layer in draft_model.cache:
-                    layer["K"] = layer["K"][:, :, :-n_to_rollback, :]
-                    layer["V"] = layer["V"][:, :, :-n_to_rollback, :]
-                draft_model.cur_pos -= n_to_rollback
-                _ = draft_model.forward(np.full((1, 1), generated[-1]), inference=True, verbose=False)
+                # We have added n_accepted tokens from draft and 1 correction from target to 'generated'
+                # The target model's cache has 'k' new tokens (d_tokens)
+                # We need to rollback target cache to n_accepted (discarding d_tokens[n_accepted:]),
+                # then forward the correction token.
+                n_target_rollback = k - n_accepted
+                for layer in self.cache:
+                    layer["K"] = layer["K"][:, :, :-n_target_rollback, :]
+                    layer["V"] = layer["V"][:, :, :-n_target_rollback, :]
+                self.cur_pos -= n_target_rollback
+                _ = self.forward(np.full((1, 1), generated[-1]), inference=True, verbose=False)
 
-                # Target model also advanced k steps but we only want it to keep the accepted ones + 1 correction.
-                # It currently has k new tokens in cache. We need to rollback (k - n_accepted - 1).
-                n_target_rollback = k - n_accepted - 1
-                if n_target_rollback > 0:
-                    for layer in self.cache:
-                        layer["K"] = layer["K"][:, :, :-n_target_rollback, :]
-                        layer["V"] = layer["V"][:, :, :-n_target_rollback, :]
-                    self.cur_pos -= n_target_rollback
+                # Same for draft model
+                for layer in draft_model.cache:
+                    layer["K"] = layer["K"][:, :, :-n_target_rollback, :]
+                    layer["V"] = layer["V"][:, :, :-n_target_rollback, :]
+                draft_model.cur_pos -= n_target_rollback
+                _ = draft_model.forward(np.full((1, 1), generated[-1]), inference=True, verbose=False)
             else:
                 # All k draft tokens accepted!
                 # Target model has k tokens in cache. We can actually take ONE MORE from target's last prediction.
