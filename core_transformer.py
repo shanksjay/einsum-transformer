@@ -83,12 +83,14 @@ class TransformerConfig:
 
 
 class LazyWeightManager:
-    def __init__(self, weight_paths, target_dtype="float32", max_cache_size=512):
+    def __init__(self, weight_paths, target_dtype="float32", max_cache_size=32):
         self.handles = {}
         self.tensor_to_shard = {}
         self.target_dtype = target_dtype
         self.max_cache_size = max_cache_size
         self.cache = OrderedDict()
+        # Persistent cache for tensors not backed by files (e.g. generated LoRA adapters)
+        self.persistent_cache = {}
         
         print(f"[INFO] Initializing LazyWeightManager with {len(weight_paths)} shards (max_cache_size={max_cache_size})...")
         for path in weight_paths:
@@ -101,6 +103,9 @@ class LazyWeightManager:
                 self.tensor_to_shard[key] = path
 
     def __getitem__(self, key):
+        if key in self.persistent_cache:
+            return self.persistent_cache[key]
+
         if key in self.cache:
             # Move to end (LRU)
             val = self.cache.pop(key)
@@ -143,6 +148,11 @@ class LazyWeightManager:
         return res
 
     def __setitem__(self, key, value):
+        # If not backed by a shard, store in persistent cache to avoid eviction
+        if key not in self.tensor_to_shard:
+            self.persistent_cache[key] = value
+            return
+
         if key in self.cache:
             self.cache.pop(key)
         self.cache[key] = value
@@ -153,11 +163,19 @@ class LazyWeightManager:
         print(f"[INFO] Purging weight cache ({len(self.cache)} tensors removed)")
         self.cache.clear()
 
+    def get_cache_memory_mb(self):
+        b = sum(v.nbytes for v in self.cache.values() if isinstance(v, np.ndarray))
+        b += sum(v.nbytes for v in self.persistent_cache.values() if isinstance(v, np.ndarray))
+        return b / (1024 * 1024)
+
     def __contains__(self, key):
-        return key in self.tensor_to_shard or key in self.cache
+        return key in self.tensor_to_shard or key in self.cache or key in self.persistent_cache
 
     def keys(self):
-        return list(self.tensor_to_shard.keys()) + [k for k in self.cache if k not in self.tensor_to_shard]
+        k = set(self.tensor_to_shard.keys())
+        k.update(self.cache.keys())
+        k.update(self.persistent_cache.keys())
+        return list(k)
 
 
 class DictWeightManager:
@@ -179,6 +197,10 @@ class DictWeightManager:
 
     def purge_cache(self):
         pass
+
+    def get_cache_memory_mb(self):
+        b = sum(v.nbytes for v in self.cache.values() if isinstance(v, np.ndarray))
+        return b / (1024 * 1024)
 
 
 class EinsumTransformer:
@@ -221,7 +243,9 @@ class EinsumTransformer:
             print(f"[INFO] No weight_file specified, initializing random weights...")
             self._init_weights_random()
         if getattr(self.cfg, "quantization", "none") != "none":
-            print(f"[INFO] Mixed-precision quantization: {self.cfg.quantization} (W{getattr(self.cfg,'quantization_weight_bits',0)} A{getattr(self.cfg,'quantization_activation_bits',0)})")
+            quant_bits_w = getattr(self.cfg, 'quantization_weight_bits', 0)
+            quant_bits_a = getattr(self.cfg, 'quantization_activation_bits', 0)
+            print(f"[INFO] Mixed-precision quantization: {self.cfg.quantization} (W{quant_bits_w} A{quant_bits_a})")
 
     def clear_cache(self):
         self.cache = [{"K": None, "V": None} for _ in range(self.cfg.n_layers)]
@@ -388,29 +412,66 @@ class EinsumTransformer:
             return "float32"
 
         def mb(b): return b / (1024 * 1024)
-        bw = (4 - (1 if wb == 8 else 0.5 if wb == 4 else 4)) if wb in (4, 8) else 0
-        ba = (4 - (2 if ab == 16 else 1 if ab == 8 else 0.5 if ab == 4 else 4)) if ab in (4, 8, 16) else 0
 
-        emb_mb = mb(V * d * bw + ((B * T * d * ba) if ba else 0))
-        rms_mb = mb(2 * d * n_layers * bw) if bw else 0
-        attn_pl = (2 * d * d + 2 * d_kv * d) * bw + (B * T * d * ba if ba else 0)
-        attn_mb = mb(attn_pl * n_layers)
-        ffn_pl = 3 * d * d_ff * bw + (B * T * d * ba if ba else 0)
-        ffn_mb = mb(ffn_pl * n_layers)
+        # Source (Full precision) byte size
+        src_bytes = 4 # float32
+        if wd == "float16": src_bytes = 2
+        elif wd == "bfloat16": src_bytes = 2
 
-        def fmt_mb(x): return f"{x:.3f} MB" if x > 0 else "—"
+        # Quantized weight byte size
+        q_bytes = src_bytes
+        if wb == 8: q_bytes = 1
+        elif wb == 4: q_bytes = 0.5
 
-        print(f"[INFO] Per-layer operation breakdown (by tensor datatype, source→target) and memory saving:")
-        print(f"  {'Operation':<18} {'Weights':<18} {'Activations':<18} {'Mem save':<14}")
-        print(f"  {'-'*18} {'-'*18} {'-'*18} {'-'*14}")
-        print(f"  {'Embedding':<18} {weight_str():<18} {act_str():<18} {fmt_mb(emb_mb):<14}")
-        print(f"  {'RMSNorm (×2)':<18} {weight_str():<18} {'float32':<18} {fmt_mb(rms_mb):<14}")
-        print(f"  {'Attn (Q,K,V,O)':<18} {weight_str():<18} {act_str():<18} {fmt_mb(attn_mb):<14}")
-        print(f"  {'FFN (W1,W2,W3)':<18} {weight_str():<18} {act_str():<18} {fmt_mb(ffn_mb):<14}")
+        # Activation byte size (simulated)
+        a_src_bytes = 4 # float32
+        a_q_bytes = a_src_bytes
+        if ab == 16: a_q_bytes = 2
+        elif ab == 8: a_q_bytes = 1
+        elif ab == 4: a_q_bytes = 0.5
+
+        def calc_mem(w_count, a_count, w_b, a_b):
+            return mb(w_count * w_b + a_count * a_b)
+
+        # Embedding
+        emb_w = V * d
+        emb_a = B * T * d
+        emb_before = calc_mem(emb_w, emb_a, src_bytes, a_src_bytes)
+        emb_after = calc_mem(emb_w, emb_a, q_bytes, a_q_bytes)
+
+        # RMSNorm
+        rms_w = 2 * d * n_layers
+        rms_a = 0 # RMSNorm activations usually small or same precision
+        rms_before = calc_mem(rms_w, rms_a, src_bytes, a_src_bytes)
+        rms_after = calc_mem(rms_w, rms_a, q_bytes, a_src_bytes)
+
+        # Attn
+        attn_w = (2 * d * d + 2 * d_kv * d) * n_layers
+        attn_a = B * T * d * n_layers
+        attn_before = calc_mem(attn_w, attn_a, src_bytes, a_src_bytes)
+        attn_after = calc_mem(attn_w, attn_a, q_bytes, a_q_bytes)
+
+        # FFN
+        ffn_w = 3 * d * d_ff * n_layers
+        ffn_a = B * T * d * n_layers
+        ffn_before = calc_mem(ffn_w, ffn_a, src_bytes, a_src_bytes)
+        ffn_after = calc_mem(ffn_w, ffn_a, q_bytes, a_q_bytes)
+
+        def fmt_mb(x): return f"{x:,.3f} MB" if x > 0 else "—"
+
+        print(f"[INFO] Per-layer operation breakdown (by tensor datatype, source→target) and memory usage:")
+        print(f"  {'Operation':<18} {'Weights':<18} {'Activations':<18} {'Before':<14} {'After':<14} {'Mem save':<14}")
+        print(f"  {'-'*18} {'-'*18} {'-'*18} {'-'*14} {'-'*14} {'-'*14}")
+        print(f"  {'Embedding':<18} {weight_str():<18} {act_str():<18} {fmt_mb(emb_before):<14} {fmt_mb(emb_after):<14} {fmt_mb(emb_before - emb_after):<14}")
+        print(f"  {'RMSNorm (×2)':<18} {weight_str():<18} {'float32':<18} {fmt_mb(rms_before):<14} {fmt_mb(rms_after):<14} {fmt_mb(rms_before - rms_after):<14}")
+        print(f"  {'Attn (Q,K,V,O)':<18} {weight_str():<18} {act_str():<18} {fmt_mb(attn_before):<14} {fmt_mb(attn_after):<14} {fmt_mb(attn_before - attn_after):<14}")
+        print(f"  {'FFN (W1,W2,W3)':<18} {weight_str():<18} {act_str():<18} {fmt_mb(ffn_before):<14} {fmt_mb(ffn_after):<14} {fmt_mb(ffn_before - ffn_after):<14}")
         if self.use_lora:
-            print(f"  {'LoRA (A,B)':<18} {'float32':<18} {'-':<18} {'—':<14}")
-        print(f"  {'-'*18} {'-'*18} {'-'*18} {'-'*14}")
-        print(f"  {'Total (all layers)':<18} {'':<18} {'':<18} {fmt_mb(emb_mb + rms_mb + attn_mb + ffn_mb):<14}")
+            print(f"  {'LoRA (A,B)':<18} {'float32':<18} {'-':<18} {'—':<14} {'—':<14} {'—':<14}")
+        print(f"  {'-'*18} {'-'*18} {'-'*18} {'-'*14} {'-'*14} {'-'*14}")
+        total_before = emb_before + rms_before + attn_before + ffn_before
+        total_after = emb_after + rms_after + attn_after + ffn_after
+        print(f"  {'Total (all ' + str(n_layers) + ' layers)':<18} {'':<18} {'':<18} {fmt_mb(total_before):<14} {fmt_mb(total_after):<14} {fmt_mb(total_before - total_after):<14}")
 
     def _bind_weights(self):
         c = self.cfg
@@ -559,7 +620,10 @@ class EinsumTransformer:
         t0 = time.time()
         a = np.einsum("btd,df->btf", x, W1, optimize=True)
         b = np.einsum("btd,df->btf", x, W2, optimize=True)
-        sig_b = 1.0 / (1.0 + np.exp(-b))
+        # Numerical stable sigmoid to avoid overflow in np.exp(-b)
+        sig_b = np.where(b >= 0,
+                         1.0 / (1.0 + np.exp(-b)),
+                         np.exp(b) / (1.0 + np.exp(b)))
         swish_b = b * sig_b
         gated = a * swish_b
         res = np.einsum("btf,fd->btd", gated, W3, optimize=True)
@@ -632,9 +696,15 @@ class EinsumTransformer:
         Q, K = self.apply_rope(Q, pos), self.apply_rope(K, pos)
         self._stats['attn_rope'].append(time.time() - t_rope)
 
-        Q_t, K_t, V_t = [t.transpose(0, 2, 1, 3) for t in [Q, K, V]]
+        # Transpose to [Batch, Heads, SeqLen, HeadDim]
+        Q_t = Q.transpose(0, 2, 1, 3)
+        K_t = K.transpose(0, 2, 1, 3)
+        V_t = V.transpose(0, 2, 1, 3)
+
         if inference:
-            if self.cache[layer_idx]["K"] is None: self.cache[layer_idx]["K"], self.cache[layer_idx]["V"] = K_t, V_t
+            # Update or initialize KV cache for iterative decoding
+            if self.cache[layer_idx]["K"] is None:
+                self.cache[layer_idx]["K"], self.cache[layer_idx]["V"] = K_t, V_t
             else:
                 self.cache[layer_idx]["K"] = np.concatenate([self.cache[layer_idx]["K"], K_t], axis=2)
                 self.cache[layer_idx]["V"] = np.concatenate([self.cache[layer_idx]["V"], V_t], axis=2)
@@ -652,8 +722,13 @@ class EinsumTransformer:
         self._stats['attn_score'].append(time.time() - t_score)
 
         t_out = time.time()
+        # Multiply attention weights by values: [B, H, T, T] x [B, H, T, D_head] -> [B, H, T, D_head]
         weighted_v = np.einsum("bhij,bhjd->bhid", attn, V_t, optimize=True)
+
+        # Merge heads back into model dimension
         weighted_v_merged = weighted_v.transpose(0, 2, 1, 3).reshape(B, T, c.d_model)
+
+        # Output projection
         res = np.einsum("btd,dh->bth", weighted_v_merged, W_o, optimize=True)
         self._stats['attn_out'].append(time.time() - t_out)
         self._stats['attn'].append(time.time() - t0)
@@ -728,7 +803,8 @@ class EinsumTransformer:
                     if isinstance(v, np.ndarray): b += v.nbytes
                     elif isinstance(v, dict): b += _sum_bytes(v)
                 return b
-            self._memory_stats['fwd_activation_mb'] = _sum_bytes(self._activations) / (1024 * 1024)
+            w_mem = self.weights.get_cache_memory_mb() if hasattr(self.weights, 'get_cache_memory_mb') else 0
+            self._memory_stats['fwd_activation_mb'] = (_sum_bytes(self._activations) / (1024 * 1024)) + w_mem
 
         t_head = time.time()
         res = np.einsum("btd,vd->btv", x, E, optimize=True)
@@ -738,12 +814,22 @@ class EinsumTransformer:
         return res
 
     def backward(self, d_logits):
+        """
+        Implementation of the backward pass (Backpropagation Through Time).
+        Computes gradients for all parameters and activations.
+        """
         t_total = time.time()
         c = self.cfg
         E = self.get_w(self.E_name)
         final_x = self._activations["final_x"]
+
+        # Gradient with respect to the final layer activations
+        # [B, T, V] x [V, D] -> [B, T, D]
         dx = np.einsum("btv,vd->btd", d_logits, E, optimize=True)
-        if not self.use_lora: self._grads["E"] = np.einsum("btv,btd->vd", d_logits, final_x, optimize=True)
+
+        if not self.use_lora:
+            # Gradient with respect to the output embedding (tied with input embedding)
+            self._grads["E"] = np.einsum("btv,btd->vd", d_logits, final_x, optimize=True)
         for i in reversed(range(c.n_layers)):
             p = self.layer_weights[i]
             if not c.use_moe:
@@ -764,11 +850,21 @@ class EinsumTransformer:
             act_attn, dattn_out = self._activations[f"attn_{i}"], dx
             W_o = self.get_w(p["W_o"], transpose=True)
             if not self.use_lora: self._grads[f"W_o_{i}"] = np.einsum("btd,bth->dh", act_attn["weighted_v_merged"], dattn_out, optimize=True)
-            dweighted = np.einsum("bth,dh->btd", dattn_out, W_o, optimize=True).reshape(dx.shape[0], dx.shape[1], c.n_heads, c.d_head).transpose(0, 2, 1, 3)
-            dattn = np.einsum("bhid,bhjd->bhij", dweighted, act_attn["V_t"], optimize=True)
+            # Backward through Output Projection and Merge
+            d_weighted_v_merged = np.einsum("bth,dh->btd", dattn_out, W_o, optimize=True)
+            d_weighted_v = d_weighted_v_merged.reshape(dx.shape[0], dx.shape[1], c.n_heads, c.d_head).transpose(0, 2, 1, 3)
+
+            # Backward through Attention Softmax and Weighted Sum
+            # dattn: [B, H, T, T]
+            dattn = np.einsum("bhid,bhjd->bhij", d_weighted_v, act_attn["V_t"], optimize=True)
+
+            # Backward through Softmax
             dscores = act_attn["attn"] * (dattn - np.sum(dattn * act_attn["attn"], axis=-1, keepdims=True)) / np.sqrt(c.d_head)
-            dQ_t, dK_t_f = np.einsum("bhij,bhjd->bhid", dscores, act_attn["K_t"], optimize=True), np.einsum("bhji,bhjd->bhid", dscores, act_attn["Q_t"], optimize=True)
-            dV_t_f = np.einsum("bhij,bhid->bhjd", act_attn["attn"], dweighted, optimize=True)
+
+            # Gradients for Q, K, V projections
+            dQ_t = np.einsum("bhij,bhjd->bhid", dscores, act_attn["K_t"], optimize=True)
+            dK_t_f = np.einsum("bhji,bhjd->bhid", dscores, act_attn["Q_t"], optimize=True)
+            dV_t_f = np.einsum("bhij,bhid->bhjd", act_attn["attn"], d_weighted_v, optimize=True)
             groups = c.n_heads // c.n_kv_heads
             dQ, dK = dQ_t.transpose(0, 2, 1, 3), dK_t_f.reshape(dx.shape[0], c.n_kv_heads, groups, -1, c.d_head).sum(2).transpose(0, 2, 1, 3)
             dV = dV_t_f.reshape(dx.shape[0], c.n_kv_heads, groups, -1, c.d_head).sum(2).transpose(0, 2, 1, 3)
@@ -796,11 +892,14 @@ class EinsumTransformer:
             if not self.use_lora: self._grads[f"norm1_{i}"] = np.einsum("btd,btd->d", dx_norm1, act_norm1["norm_x"], optimize=True)
             term1 = dx_norm1 * norm1_w
             dx = dx + (term1 - np.mean(term1 * act_norm1["norm_x"], axis=-1, keepdims=True) * act_norm1["norm_x"]) / act_norm1["rms"]
-        if not self.use_lora: np.add.at(self._grads["E"], self._activations["tokens"], dx)
+        if not self.use_lora:
+            # Gradient for the input embedding (accumulated via add.at for multi-token indices)
+            np.add.at(self._grads["E"], self._activations["tokens"], dx)
 
         # Calculate gradient memory footprint
         total_grad_bytes = sum(g.nbytes for g in self._grads.values() if isinstance(g, np.ndarray))
-        self._memory_stats['grad_total_mb'] = total_grad_bytes / (1024 * 1024)
+        w_mem = self.weights.get_cache_memory_mb() if hasattr(self.weights, 'get_cache_memory_mb') else 0
+        self._memory_stats['grad_total_mb'] = (total_grad_bytes / (1024 * 1024)) + w_mem
 
         self._stats['bw_total'].append(time.time() - t_total)
         return self._grads
@@ -821,26 +920,33 @@ class EinsumTransformer:
         return generated
 
     def speculative_generate(self, tokens, k=4):
+        """
+        Implementation of speculative decoding.
+        A smaller 'draft' model (first few layers of the current model) predicts k tokens,
+        which are then verified in parallel by the full 'target' model.
+        """
         print(f"[INFO] Starting speculative decoding (k={k}, draft_layers={self.cfg.draft_layers})...")
         self.clear_cache()
+
+        # Initialize draft model using the first N layers of the target model
         draft_cfg = copy.deepcopy(self.cfg)
         draft_cfg.n_layers = self.cfg.draft_layers
         draft_model = EinsumTransformer(draft_cfg, _from_weights=self.weights,
                                         _E_name=self.E_name,
                                         _layer_weights=self.layer_weights[:self.cfg.draft_layers])
         
-        # 1. Prefill
+        # 1. Prefill: Process initial prompt tokens in both models
         logits = self.forward(tokens, inference=True, verbose=True)
         _ = draft_model.forward(tokens, inference=True, verbose=False)
         
-        # 2. Sample first token
+        # 2. Sample the first token after the prompt
         next_token = self.sample_top_k(logits, k=self.cfg.top_k_sample, temperature=self.cfg.temperature)
         generated = [next_token[0]]
         print(f"\n[STREAM] {self.detokenize([next_token[0]])[0]}", end="", flush=True)
-        
-        # 3. Speculative loop
+
+        # 3. Speculative loop: Iterate until max_new_tokens is reached
         while len(generated) < self.cfg.max_new_tokens:
-            # a. Draft predicts k tokens
+            # a. Draft predicts k speculative tokens sequentially
             d_tokens = []
             draft_input = np.full((1, 1), generated[-1])
             for _ in range(k):
@@ -849,34 +955,45 @@ class EinsumTransformer:
                 d_tokens.append(d_tok)
                 draft_input = np.full((1, 1), d_tok)
             
-            # b. Target verifies in one batch forward pass
-            # Feed the last confirmed token plus all but the last draft prediction
+            # b. Target verifies all k tokens in a single parallel forward pass
+            # We feed the last confirmed token plus k-1 draft tokens.
+            # v_logits[i] will be the prediction for v_input[i].
             v_input = np.array([generated[-1]] + d_tokens[:-1]).reshape(1, -1)
             v_logits = self.forward(v_input, inference=True, verbose=False)
             
-            # c. Verify
+            # c. Verify draft tokens against target model predictions
             n_accepted = 0
             for j in range(k):
+                # Sample the target model's prediction for the current position
                 target_tok = self.sample_top_k(v_logits[:, j:j+1, :], k=self.cfg.top_k_sample, temperature=self.cfg.temperature)[0]
+
                 if target_tok == d_tokens[j]:
+                    # Draft was correct!
                     generated.append(d_tokens[j])
                     print(self.detokenize([d_tokens[j]])[0], end="", flush=True)
                     n_accepted += 1
                 else:
+                    # Draft was incorrect. Accept the target's correction and stop verification.
                     generated.append(target_tok)
                     print(f"[{self.detokenize([target_tok])[0]}]", end="", flush=True)
                     break
             
-            # d. Rollback target model cache to n_accepted confirmed tokens
-            n_target_rollback = k - n_accepted
-            if n_target_rollback > 0:
-                for layer in self.cache:
-                    if layer["K"] is not None:
-                        layer["K"] = layer["K"][:, :, :-n_target_rollback, :]
-                        layer["V"] = layer["V"][:, :, :-n_target_rollback, :]
-                self.cur_pos -= n_target_rollback
+            # d. Rollback target model KV cache
+            # We processed 'k' tokens as input, but we only want to keep those that were confirmed
+            # (n_accepted) plus the one that produced the correction (1).
+            # If all were accepted, we keep all 'k' processed inputs.
+            if n_accepted < k:
+                n_to_keep = n_accepted + 1
+                n_target_rollback = k - n_to_keep
+                if n_target_rollback > 0:
+                    for layer in self.cache:
+                        if layer["K"] is not None:
+                            layer["K"] = layer["K"][:, :, :-n_target_rollback, :]
+                            layer["V"] = layer["V"][:, :, :-n_target_rollback, :]
+                    self.cur_pos -= n_target_rollback
 
-            # e. Sync draft model cache to target model's confirmed state
+            # e. Synchronize draft model state with target model
+            # This ensures both models are aligned for the next speculative step.
             for l in range(self.cfg.draft_layers):
                 draft_model.cache[l]["K"] = self.cache[l]["K"].copy()
                 draft_model.cache[l]["V"] = self.cache[l]["V"].copy()
@@ -996,5 +1113,6 @@ class EinsumOptimizer:
                     step_memory_bytes += m.weights[p[k]].nbytes + g[grad_key].nbytes
                     m.weights[p[k]] -= lr * g[grad_key]
 
-        m._memory_stats['opt_per_step_mb'].append(step_memory_bytes / (1024 * 1024))
+        w_mem = m.weights.get_cache_memory_mb() if hasattr(m.weights, 'get_cache_memory_mb') else 0
+        m._memory_stats['opt_per_step_mb'].append((step_memory_bytes / (1024 * 1024)) + w_mem)
         m._stats['opt_step'].append(time.time() - t0)
