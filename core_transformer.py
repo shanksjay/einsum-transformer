@@ -701,6 +701,11 @@ class EinsumTransformer:
         self._stats['attn_rope'].append(time.time() - t_rope)
 
         # Transpose to [Batch, Heads, SeqLen, HeadDim]
+        # Convention:
+        # B       - Batch size: number of independent sequences processed in parallel
+        # H       - Heads: number of attention heads
+        # T       - SeqLen: number of tokens in the sequence (time dimension)
+        # D_head  - HeadDim: dimension of each individual attention head
         Q_t = Q.transpose(0, 2, 1, 3)
         K_t = K.transpose(0, 2, 1, 3)
         V_t = V.transpose(0, 2, 1, 3)
