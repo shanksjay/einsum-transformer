@@ -413,7 +413,7 @@ class EinsumTransformer:
         if self.use_lora:
             print(f"  {'LoRA (A,B)':<18} {'float32':<18} {'-':<18} {'—':<14}")
         print(f"  {'-'*18} {'-'*18} {'-'*18} {'-'*14}")
-        print(f"  {'Total (all layers)':<18} {'':<18} {'':<18} {fmt_mb(emb_mb + rms_mb + attn_mb + ffn_mb):<14}")
+        print(f"  {'Total (all {n_layers} layers)':<18} {'':<18} {'':<18} {fmt_mb(emb_mb + rms_mb + attn_mb + ffn_mb):<14}")
 
     def _bind_weights(self):
         c = self.cfg
