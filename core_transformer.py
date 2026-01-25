@@ -949,15 +949,32 @@ class EinsumTransformer:
     def generate(self, tokens):
         if getattr(self.cfg, 'speculative', False): return self.speculative_generate(tokens)
         self.clear_cache()
+
+        t0 = time.time()
+        # Prefill
         logits = self.forward(tokens, inference=True, verbose=True)
         next_token = self.sample_top_k(logits, k=self.cfg.top_k_sample, temperature=self.cfg.temperature)
+        ttft = time.time() - t0
+
         generated = [next_token[0]]
-        print(f"\n[STREAM] {self.detokenize([next_token[0]])[0]}", end="", flush=True)
+
+        print(f"\n Decoding Stage")
+        print(f"=================")
+        print(f"[STREAM] {self.detokenize([next_token[0]])[0]}", end="", flush=True)
+
+        t_decode_start = time.time()
         for i in range(self.cfg.max_new_tokens - 1):
             logits = self.forward(np.full((tokens.shape[0], 1), generated[-1]), inference=True, verbose=False)
             next_token = self.sample_top_k(logits, k=self.cfg.top_k_sample, temperature=self.cfg.temperature)
             generated.append(next_token[0])
             print(self.detokenize([next_token[0]])[0], end="", flush=True)
+
+        t_decode_end = time.time()
+        duration = t_decode_end - t_decode_start
+        tokens_sec = (len(generated) - 1) / duration if duration > 0 else 0
+
+        print(f"\nTime to first Token ({self.detokenize([generated[0]])[0]}) : {ttft:.4f}s")
+        print(f"Output tokens/sec : {tokens_sec:.2f}")
         print()
         return generated
 
@@ -977,15 +994,21 @@ class EinsumTransformer:
                                         _E_name=self.E_name,
                                         _layer_weights=self.layer_weights[:self.cfg.draft_layers])
         
+        t0 = time.time()
         # 1. Prefill: Process initial prompt tokens in both models
         logits = self.forward(tokens, inference=True, verbose=True)
         _ = draft_model.forward(tokens, inference=True, verbose=False)
         
         # 2. Sample the first token after the prompt
         next_token = self.sample_top_k(logits, k=self.cfg.top_k_sample, temperature=self.cfg.temperature)
-        generated = [next_token[0]]
-        print(f"\n[STREAM] {self.detokenize([next_token[0]])[0]}", end="", flush=True)
+        ttft = time.time() - t0
 
+        generated = [next_token[0]]
+        print(f"\n Decoding Stage")
+        print(f"=================")
+        print(f"[STREAM] {self.detokenize([next_token[0]])[0]}", end="", flush=True)
+
+        t_decode_start = time.time()
         # 3. Speculative loop: Iterate until max_new_tokens is reached
         while len(generated) < self.cfg.max_new_tokens:
             # a. Draft predicts k speculative tokens sequentially
@@ -996,13 +1019,13 @@ class EinsumTransformer:
                 d_tok = self.sample_top_k(d_logits, k=self.cfg.top_k_sample, temperature=self.cfg.temperature)[0]
                 d_tokens.append(d_tok)
                 draft_input = np.full((1, 1), d_tok)
-            
+
             # b. Target verifies all k tokens in a single parallel forward pass
             # We feed the last confirmed token plus k-1 draft tokens.
             # v_logits[i] will be the prediction for v_input[i].
             v_input = np.array([generated[-1]] + d_tokens[:-1]).reshape(1, -1)
             v_logits = self.forward(v_input, inference=True, verbose=False)
-            
+
             # c. Verify draft tokens against target model predictions
             n_accepted = 0
             for j in range(k):
@@ -1019,7 +1042,7 @@ class EinsumTransformer:
                     generated.append(target_tok)
                     print(f"[{self.detokenize([target_tok])[0]}]", end="", flush=True)
                     break
-            
+
             # d. Rollback target model KV cache
             # We processed 'k' tokens as input, but we only want to keep those that were confirmed
             # (n_accepted) plus the one that produced the correction (1).
@@ -1041,6 +1064,12 @@ class EinsumTransformer:
                 draft_model.cache[l]["V"] = self.cache[l]["V"].copy()
             draft_model.cur_pos = self.cur_pos
 
+        t_decode_end = time.time()
+        duration = t_decode_end - t_decode_start
+        tokens_sec = (len(generated) - 1) / duration if duration > 0 else 0
+
+        print(f"\nTime to first Token ({self.detokenize([generated[0]])[0]}) : {ttft:.4f}s")
+        print(f"Output tokens/sec : {tokens_sec:.2f}")
         print()
         return generated
 
