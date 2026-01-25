@@ -837,6 +837,7 @@ class EinsumTransformer:
         E = self.get_w(self.E_name)
         final_x = self._activations["final_x"]
 
+        t_head = time.time()
         # Gradient with respect to the final layer activations
         # [B, T, V] x [V, D] -> [B, T, D]
         dx = np.einsum("btv,vd->btd", d_logits, E, optimize=True)
@@ -844,9 +845,13 @@ class EinsumTransformer:
         if not self.use_lora:
             # Gradient with respect to the output embedding (tied with input embedding)
             self._grads["E"] = np.einsum("btv,btd->vd", d_logits, final_x, optimize=True)
+        self._stats['bw_head'].append(time.time() - t_head)
+
         for i in reversed(range(c.n_layers)):
+            t_layer_start = time.time()
             p = self.layer_weights[i]
             if not c.use_moe:
+                t_ffn = time.time()
                 act_ffn, dffn_out = self._activations[f"ffn_{i}"], dx
                 W1, W2, W3 = [self.get_w(p[k], transpose=True) for k in ["W1", "W2", "W3"]]
                 if not self.use_lora: self._grads[f"W3_{i}"] = np.einsum("btf,btd->fd", act_ffn["gated"], dffn_out, optimize=True)
@@ -856,11 +861,17 @@ class EinsumTransformer:
                 if not self.use_lora:
                     self._grads[f"W1_{i}"], self._grads[f"W2_{i}"] = np.einsum("btd,btf->df", act_ffn["x"], da, optimize=True), np.einsum("btd,btf->df", act_ffn["x"], db, optimize=True)
                 dx = dx + np.einsum("btf,df->btd", da, W1, optimize=True) + np.einsum("btf,df->btd", db, W2, optimize=True)
+
+                t_norm2 = time.time()
                 act_norm2, dx_norm2 = self._activations[f"norm2_{i}"], dx
                 norm2_w = self.get_w(p["norm2"])
                 if not self.use_lora: self._grads[f"norm2_{i}"] = np.einsum("btd,btd->d", dx_norm2, act_norm2["norm_x"], optimize=True)
                 term1 = dx_norm2 * norm2_w
                 dx = dx + (term1 - np.mean(term1 * act_norm2["norm_x"], axis=-1, keepdims=True) * act_norm2["norm_x"]) / act_norm2["rms"]
+                self._stats['bw_norm'].append(time.time() - t_norm2)
+                self._stats['bw_ffn'].append(time.time() - t_ffn)
+
+            t_attn = time.time()
             act_attn, dattn_out = self._activations[f"attn_{i}"], dx
             W_o = self.get_w(p["W_o"], transpose=True)
             if not self.use_lora: self._grads[f"W_o_{i}"] = np.einsum("btd,bth->dh", act_attn["weighted_v_merged"], dattn_out, optimize=True)
@@ -901,14 +912,22 @@ class EinsumTransformer:
             if self.use_lora:
                 if dQ_B is not None: dx += self._activations[f"lora_q_{i}"]["s"] * np.einsum("btr,dr->btd", dQ_B, self._activations[f"lora_q_{i}"]["A"], optimize=True)
                 if dV_B is not None: dx += self._activations[f"lora_v_{i}"]["s"] * np.einsum("btr,dr->btd", dV_B, self._activations[f"lora_v_{i}"]["A"], optimize=True)
+
+            t_norm1 = time.time()
             act_norm1, dx_norm1 = self._activations[f"norm1_{i}"], dx
             norm1_w = self.get_w(p["norm1"])
             if not self.use_lora: self._grads[f"norm1_{i}"] = np.einsum("btd,btd->d", dx_norm1, act_norm1["norm_x"], optimize=True)
             term1 = dx_norm1 * norm1_w
             dx = dx + (term1 - np.mean(term1 * act_norm1["norm_x"], axis=-1, keepdims=True) * act_norm1["norm_x"]) / act_norm1["rms"]
+            self._stats['bw_norm'].append(time.time() - t_norm1)
+            self._stats['bw_attn'].append(time.time() - t_attn)
+            self._stats['bw_layers'].append(time.time() - t_layer_start)
+
+        t_embed = time.time()
         if not self.use_lora:
             # Gradient for the input embedding (accumulated via add.at for multi-token indices)
             np.add.at(self._grads["E"], self._activations["tokens"], dx)
+        self._stats['bw_embed'].append(time.time() - t_embed)
 
         # Calculate gradient memory footprint
         total_grad_bytes = sum(g.nbytes for g in self._grads.values() if isinstance(g, np.ndarray))
@@ -1017,7 +1036,7 @@ class EinsumTransformer:
         return generated
 
     def _init_stats(self):
-        self._stats = {k: [] for k in ['attn', 'ffn', 'layers', 'norm', 'weight_load', 'attn_load', 'attn_qkv', 'attn_rope', 'attn_score', 'attn_out', 'ffn_load', 'ffn_compute', 'prefill', 'decode', 'bw_total', 'bw_layers', 'bw_attn', 'bw_ffn', 'bw_norm', 'bw_head', 'bw_embed', 'opt_step', 'embedding', 'output_head']}
+        self._stats = {k: [] for k in ['attn', 'ffn', 'layers', 'norm', 'weight_load', 'attn_load', 'attn_qkv', 'attn_rope', 'attn_score', 'attn_out', 'ffn_load', 'ffn_compute', 'prefill', 'decode', 'bw_total', 'bw_layers', 'bw_attn', 'bw_ffn', 'bw_norm', 'bw_head', 'bw_embed', 'opt_step', 'opt_clip', 'opt_update', 'embedding', 'output_head']}
         self._memory_stats = {'grad_total_mb': 0.0, 'fwd_activation_mb': 0.0, 'grad_breakdown': {}, 'opt_per_step_mb': []}
 
     def _rope_backward(self, dy, positions):
@@ -1048,12 +1067,12 @@ class EinsumTransformer:
 
     def _print_stats_table(self, title="TIMING BREAKDOWN (seconds)"):
         self._log("\n" + "="*50)
-        self._log(title)
+        self._log(f"{title:^50}")
         self._log("-" * 50)
-        self._log(f"{'Phase':<20} | {'p50':<10} | {'p99':<10}")
+        self._log(f"{'Phase':<25} | {'p50':<10} | {'p99':<10}")
         self._log("-" * 50)
         def pr(n, ts):
-            if ts: self._log(f"{n:<20} | {np.percentile(ts, 50):<10.4f} | {np.percentile(ts, 99):<10.4f}")
+            if ts: self._log(f"{n:<25} | {np.percentile(ts, 50):<10.4f} | {np.percentile(ts, 99):<10.4f}")
 
         t_up = title.upper()
         if "FWD" in t_up or "TIMING BREAKDOWN" in t_up:
@@ -1065,13 +1084,24 @@ class EinsumTransformer:
             pr("  FeedForward", self._stats.get('ffn'))
             pr("    Compute", self._stats.get('ffn_compute'))
             pr("Output Head", self._stats.get('output_head'))
-            if self._stats.get('prefill'): pr("Prefill Stage", self._stats['prefill'])
-            if self._stats.get('decode'): pr("Decode Stage", self._stats['decode'])
+            if self._stats.get('prefill'):
+                self._log("-" * 50)
+                pr("Prefill Stage", self._stats['prefill'])
+            if self._stats.get('decode'):
+                self._log("-" * 50)
+                pr("Decode Stage", self._stats['decode'])
         elif "BWD" in t_up or "BACKWARD" in t_up:
             pr("Backward Pass", self._stats.get('bw_total'))
-            # Future: add detailed BWD breakdown if tracked
+            pr("  BW Head", self._stats.get('bw_head'))
+            pr("  BW Layers", self._stats.get('bw_layers'))
+            pr("    BW Attention", self._stats.get('bw_attn'))
+            pr("    BW FeedForward", self._stats.get('bw_ffn'))
+            pr("    BW Norms", self._stats.get('bw_norm'))
+            pr("  BW Embed", self._stats.get('bw_embed'))
         elif "OPT" in t_up:
             pr("Optimizer Step", self._stats.get('opt_step'))
+            pr("  Grad Clipping", self._stats.get('opt_clip'))
+            pr("  Weight Updates", self._stats.get('opt_update'))
 
         self._log("="*50 + "\n")
 
@@ -1099,6 +1129,7 @@ class EinsumOptimizer:
         m, g, lr = self.model, self.model._grads, self.lr
         t0 = time.time()
 
+        t_clip = time.time()
         # Global gradient clipping for stability
         if self.grad_clip > 0:
             total_norm = 0
@@ -1109,7 +1140,9 @@ class EinsumOptimizer:
             if clip_coef < 1:
                 for k in g:
                     g[k] *= clip_coef
+        m._stats['opt_clip'].append(time.time() - t_clip)
 
+        t_update = time.time()
         step_memory_bytes = 0
         if "E" in g:
             step_memory_bytes += m.weights[m.E_name].nbytes + g["E"].nbytes
@@ -1131,6 +1164,7 @@ class EinsumOptimizer:
                 if p.get(k) and grad_key in g:
                     step_memory_bytes += m.weights[p[k]].nbytes + g[grad_key].nbytes
                     m.weights[p[k]] -= lr * g[grad_key]
+        m._stats['opt_update'].append(time.time() - t_update)
 
         w_mem = m.weights.get_cache_memory_mb() if hasattr(m.weights, 'get_cache_memory_mb') else 0
         m._memory_stats['opt_per_step_mb'].append((step_memory_bytes / (1024 * 1024)) + w_mem)

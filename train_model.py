@@ -299,50 +299,61 @@ def main():
         print("="*50)
 
         if losses:
-            delta = (losses[-1] - losses[0]) / len(losses) if len(losses) > 0 else 0
-            print(f"Loss Trend(LR: {lr}):  start={losses[0]:.4f}  end={losses[-1]:.4f}  change per step = {delta:.6f}")
+            # Average loss delta across all steps
+            total_delta = losses[-1] - losses[0]
+            avg_delta = total_delta / len(losses) if len(losses) > 0 else 0
+            print(f"Loss Trend(LR: {lr}):  start={losses[0]:.4f}  end={losses[-1]:.4f}  change per step = {avg_delta:.6f}")
 
         if step_times:
             print("\nExecution Time breakdown:")
+            print("-" * 50)
+            print(f"{'Phase':<25} | {'p50':<10} | {'p99':<10}")
+            print("-" * 50)
             if step_t_fwd:
                 p50_f = np.percentile(step_t_fwd, 50)
                 p99_f = np.percentile(step_t_fwd, 99)
-                print(f"Step time (fwd):  p50={p50_f:.3f}s  p99={p99_f:.3f}s")
+                print(f"Step time (fwd):          | {p50_f:<10.3f} | {p99_f:<10.3f}")
             if step_t_bwd:
                 p50_b = np.percentile(step_t_bwd, 50)
                 p99_b = np.percentile(step_t_bwd, 99)
-                print(f"Step time (bwd):  p50={p50_b:.3f}s  p99={p99_b:.3f}s")
+                print(f"Step time (bwd):          | {p50_b:<10.3f} | {p99_b:<10.3f}")
             if step_t_opt:
                 p50_o = np.percentile(step_t_opt, 50)
                 p99_o = np.percentile(step_t_opt, 99)
-                print(f"Step time (opt):  p50={p50_o:.3f}s  p99={p99_o:.3f}s")
+                print(f"Step time (opt):          | {p50_o:<10.3f} | {p99_o:<10.3f}")
 
+            print("-" * 50)
             sum_p50 = ((np.percentile(step_t_fwd, 50) if step_t_fwd else 0) + \
                        (np.percentile(step_t_bwd, 50) if step_t_bwd else 0) + \
                        (np.percentile(step_t_opt, 50) if step_t_opt else 0)) * len(step_times)
             sum_p99 = ((np.percentile(step_t_fwd, 99) if step_t_fwd else 0) + \
                        (np.percentile(step_t_bwd, 99) if step_t_bwd else 0) + \
                        (np.percentile(step_t_opt, 99) if step_t_opt else 0)) * len(step_times)
-            print(f"Total ({len(step_times)} steps)   {sum_p50:.3f}s  {sum_p99:.3f}s")
+            print(f"Total ({len(step_times)} steps)            | {sum_p50:<10.3f} | {sum_p99:<10.3f}")
+            print("-" * 50)
 
             print("\nMemory Breakdown:")
-            if step_fwd_mem:
-                print(f"FWD mem/step: {np.mean(step_fwd_mem):.2f} MB")
-            if step_bwd_mem:
-                print(f"BWD mem/step: {np.mean(step_bwd_mem):.2f} MB")
-            if hasattr(model, '_memory_stats') and model._memory_stats.get('opt_per_step_mb'):
-                print(f"Optimizer mem/step:  {np.mean(model._memory_stats['opt_per_step_mb']):.2f} MB")
+            print("-" * 50)
+            fwd_m = np.mean(step_fwd_mem) if step_fwd_mem else 0
+            bwd_m = np.mean(step_bwd_mem) if step_bwd_mem else 0
+            opt_m = np.mean(model._memory_stats.get('opt_per_step_mb', [0]))
 
-            # Baseline memory from weight manager cache
+            print(f"FWD mem/step:       {fwd_m:.2f} MB")
+            print(f"BWD mem/step:       {bwd_m:.2f} MB")
+            print(f"Optimizer mem/step: {opt_m:.2f} MB")
+
+            # Realistic description of baseline memory (Weight Manager Cache)
             misc_mem = model.weights.get_cache_memory_mb() if hasattr(model.weights, 'get_cache_memory_mb') else 0
-            print(f"Misc (baseline memory which is used across the program i.e. caches, etc) : {misc_mem:.2f} MB")
+            print(f"Misc (baseline memory i.e. Weight Manager Cache) : {misc_mem:.2f} MB")
 
-            peak_total = max(max(step_fwd_mem) if step_fwd_mem else 0,
+            # Instantaneous peak = Max(FWD, BWD, OPT) + Misc
+            peak_comp = max(max(step_fwd_mem) if step_fwd_mem else 0,
                              max(step_bwd_mem) if step_bwd_mem else 0,
                              max(model._memory_stats['opt_per_step_mb']) if model._memory_stats.get('opt_per_step_mb') else 0)
-            print(f"Total memory: {peak_total:.2f} MB")
+            peak_total = peak_comp + misc_mem
+            print(f"Total memory (Peak): {peak_total:.2f} MB")
+            print("-" * 50)
 
-            print("\nAdd breakdown of the individual steps:")
             # Forward and backward timing tables (p50/p99 over all steps); skip when Ray workers run fwd/bwd
             if ray_workers <= 1:
                 model.verbose = True
