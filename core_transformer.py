@@ -624,10 +624,15 @@ class EinsumTransformer:
         t0 = time.time()
         a = np.einsum("btd,df->btf", x, W1, optimize=True)
         b = np.einsum("btd,df->btf", x, W2, optimize=True)
-        # Numerical stable sigmoid to avoid overflow in np.exp(-b)
-        sig_b = np.where(b >= 0,
-                         1.0 / (1.0 + np.exp(-b)),
-                         np.exp(b) / (1.0 + np.exp(b)))
+
+        # Numerical stable sigmoid to avoid overflow in np.exp
+        # We use a piecewise approach to avoid evaluating np.exp on values that would overflow
+        sig_b = np.zeros_like(b)
+        pos_mask = (b >= 0)
+        neg_mask = ~pos_mask
+        sig_b[pos_mask] = 1.0 / (1.0 + np.exp(-b[pos_mask]))
+        sig_b[neg_mask] = np.exp(b[neg_mask]) / (1.0 + np.exp(b[neg_mask]))
+
         swish_b = b * sig_b
         gated = a * swish_b
         res = np.einsum("btf,fd->btd", gated, W3, optimize=True)
@@ -1049,8 +1054,9 @@ class EinsumTransformer:
         self._log("-" * 50)
         def pr(n, ts):
             if ts: self._log(f"{n:<20} | {np.percentile(ts, 50):<10.4f} | {np.percentile(ts, 99):<10.4f}")
-        is_bw = "BACKWARD" in title.upper()
-        if not is_bw:
+
+        t_up = title.upper()
+        if "FWD" in t_up or "TIMING BREAKDOWN" in t_up:
             pr("Embedding", self._stats.get('embedding'))
             pr("Layer Total", self._stats.get('layers'))
             pr("  Norm", self._stats.get('norm'))
@@ -1061,8 +1067,12 @@ class EinsumTransformer:
             pr("Output Head", self._stats.get('output_head'))
             if self._stats.get('prefill'): pr("Prefill Stage", self._stats['prefill'])
             if self._stats.get('decode'): pr("Decode Stage", self._stats['decode'])
-        else:
+        elif "BWD" in t_up or "BACKWARD" in t_up:
             pr("Backward Pass", self._stats.get('bw_total'))
+            # Future: add detailed BWD breakdown if tracked
+        elif "OPT" in t_up:
+            pr("Optimizer Step", self._stats.get('opt_step'))
+
         self._log("="*50 + "\n")
 
     def merge_lora_weights(self):

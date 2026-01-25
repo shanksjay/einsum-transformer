@@ -293,14 +293,17 @@ def main():
             print(f"[INFO] OPT : {t_opt:.2f}s | mem: {opt_mem:.1f} MB")
             print(f"[Step {step+1:02d}] Loss: {losses[-1]:.4f} | Total: {dt:.2f}s [F:{pF:.0f}%, B:{pB:.0f}%, O:{pO:.0f}%] Peak: {mem_peak:.1f} MB")
 
-        # Display final training summary
+        # Display final training summary in the requested format
         print("\n" + "="*50)
         print("TRAINING SUMMARY")
         print("="*50)
+
+        if losses:
+            delta = (losses[-1] - losses[0]) / len(losses) if len(losses) > 0 else 0
+            print(f"Loss Trend(LR: {lr}):  start={losses[0]:.4f}  end={losses[-1]:.4f}  change per step = {delta:.6f}")
+
         if step_times:
-            total = sum(step_times)
-            print(f"Total Steps:         {len(step_times)}")
-            print(f"Total Time:          {total:.2f}s")
+            print("\nExecution Time breakdown:")
             if step_t_fwd:
                 p50_f = np.percentile(step_t_fwd, 50)
                 p99_f = np.percentile(step_t_fwd, 99)
@@ -313,8 +316,16 @@ def main():
                 p50_o = np.percentile(step_t_opt, 50)
                 p99_o = np.percentile(step_t_opt, 99)
                 print(f"Step time (opt):  p50={p50_o:.3f}s  p99={p99_o:.3f}s")
-            if losses:
-                print(f"Loss:                start={losses[0]:.4f}  end={losses[-1]:.4f}")
+
+            sum_p50 = ((np.percentile(step_t_fwd, 50) if step_t_fwd else 0) + \
+                       (np.percentile(step_t_bwd, 50) if step_t_bwd else 0) + \
+                       (np.percentile(step_t_opt, 50) if step_t_opt else 0)) * len(step_times)
+            sum_p99 = ((np.percentile(step_t_fwd, 99) if step_t_fwd else 0) + \
+                       (np.percentile(step_t_bwd, 99) if step_t_bwd else 0) + \
+                       (np.percentile(step_t_opt, 99) if step_t_opt else 0)) * len(step_times)
+            print(f"Total ({len(step_times)} steps)   {sum_p50:.3f}s  {sum_p99:.3f}s")
+
+            print("\nMemory Breakdown:")
             if step_fwd_mem:
                 print(f"FWD mem/step: {np.mean(step_fwd_mem):.2f} MB")
             if step_bwd_mem:
@@ -322,12 +333,23 @@ def main():
             if hasattr(model, '_memory_stats') and model._memory_stats.get('opt_per_step_mb'):
                 print(f"Optimizer mem/step:  {np.mean(model._memory_stats['opt_per_step_mb']):.2f} MB")
 
+            # Baseline memory from weight manager cache
+            misc_mem = model.weights.get_cache_memory_mb() if hasattr(model.weights, 'get_cache_memory_mb') else 0
+            print(f"Misc (baseline memory which is used across the program i.e. caches, etc) : {misc_mem:.2f} MB")
+
+            peak_total = max(max(step_fwd_mem) if step_fwd_mem else 0,
+                             max(step_bwd_mem) if step_bwd_mem else 0,
+                             max(model._memory_stats['opt_per_step_mb']) if model._memory_stats.get('opt_per_step_mb') else 0)
+            print(f"Total memory: {peak_total:.2f} MB")
+
+            print("\nAdd breakdown of the individual steps:")
             # Forward and backward timing tables (p50/p99 over all steps); skip when Ray workers run fwd/bwd
             if ray_workers <= 1:
                 model.verbose = True
-                model._print_stats_table("TIMING BREAKDOWN (seconds)")
-                model._print_stats_table("BACKWARD PASS TIMING BREAKDOWN (seconds)")
-    
+                model._print_stats_table("FWD per step breakdown (Seconds)")
+                model._print_stats_table("BWD per step breakdown (Seconds)")
+                model._print_stats_table("OPT per step breakdown (Seconds)")
+
         # Optional LoRA Merge
         if cfg.lora_merge_after_training:
             print("\n" + "="*50)

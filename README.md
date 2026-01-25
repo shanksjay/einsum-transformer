@@ -71,31 +71,42 @@ The per-layer breakdown and **Mem save** show the **theoretical** reduction vs a
 
 **Mem save is total across all layers** (not per layer): Embedding is once; Attn, FFN, and RMSNorm are summed over all `n_layers`. So Total can reach several GB for large models (e.g. ~9 GB for Llama 3.2 3B with W8A16: ~12 GB in float32 → ~3 GB in W8 + activation savings).
 
-**Example 1: `fast_lora` (d_model=512, 8 layers) with `W8A16` — total ~105 MB:**
+**Example 1: `fast_lora` (d_model=512, 8 layers) with `W8A16` — total ~105 MB saving:**
 
 ```
-  Operation          Weights            Activations        Mem save
-  ------------------ ------------------ ------------------ --------------
-  Embedding          float32→int8       float32→fp16       6.500 MB
-  RMSNorm (×2)       float32→int8       float32            0.023 MB
-  Attn (Q,K,V,O)     float32→int8       float32→fp16       22.000 MB
-  FFN (W1,W2,W3)     float32→int8       float32→fp16       76.000 MB
-  ---------------------------------------------------------------------------
-  Total (all layers)                                             104.523 MB
+[INFO] Per-layer operation breakdown (by tensor datatype, source→target) and memory usage:
+  Operation          Weights            Activations        Before         After          Mem save
+  ------------------ ------------------ ------------------ -------------- -------------- --------------
+  Embedding          float32→int8       float32→fp16       9.000 MB       2.500 MB       6.500 MB
+  RMSNorm (×2)       float32→int8       float32            0.031 MB       0.008 MB       0.023 MB
+  Attn (Q,K,V,O)     float32→int8       float32→fp16       32.000 MB      10.000 MB      22.000 MB
+  FFN (W1,W2,W3)     float32→int8       float32→fp16       104.000 MB     28.000 MB      76.000 MB
+  ------------------ ------------------ ------------------ -------------- -------------- --------------
+  Total (all 8 layers)                                       145.031 MB     40.508 MB      104.523 MB
 ```
 
-**Example 2: `llama` (Llama 3.2 3B, d_model=3072, 28 layers) with `W8A16` — total ~9.2 GB:**
+**Example 2: `llama` (Llama 3.2 3B, d_model=3072, 28 layers) with `W8A16` — total ~3.1 GB saving:**
 
 ```
-  Operation          Weights            Activations        Mem save
-  ------------------ ------------------ ------------------ --------------
-  Embedding          bfloat16→int8      float32→fp16       1128.000 MB
-  RMSNorm (×2)       bfloat16→int8      float32            0.492 MB
-  Attn (Q,K,V,O)     bfloat16→int8      float32→fp16       2037.000 MB
-  FFN (W1,W2,W3)     bfloat16→int8      float32→fp16       6069.000 MB
-  ---------------------------------------------------------------------------
-  Total (all layers)                                             9234.492 MB
+[INFO] Per-layer operation breakdown (by tensor datatype, source→target) and memory usage:
+  Operation          Weights            Activations        Before         After          Mem save
+  ------------------ ------------------ ------------------ -------------- -------------- --------------
+  Embedding          bfloat16→int8      float32→fp16       753.000 MB     376.500 MB     376.500 MB
+  RMSNorm (×2)       bfloat16→int8      float32            0.328 MB       0.164 MB       0.164 MB
+  Attn (Q,K,V,O)     bfloat16→int8      float32→fp16       1,386.000 MB   693.000 MB     693.000 MB
+  FFN (W1,W2,W3)     bfloat16→int8      float32→fp16       4,074.000 MB   2,037.000 MB   2,037.000 MB
+  LoRA (A,B)         float32            -                  —              —              —
+  ------------------ ------------------ ------------------ -------------- -------------- --------------
+  Total (all 28 layers)                                       6,213.328 MB   3,106.664 MB   3,106.664 MB
 ```
+
+### Impact of Quantization
+
+Quantization reduces the memory footprint of a model by representing weights and activations with fewer bits.
+
+1. **Memory Reduction**: By using `W8A16`, weights are reduced from 16-bit (bfloat16) or 32-bit (float32) to 8-bit integers, halving or quartering weight memory. Activations are cast to 16-bit (fp16), reducing their memory by half compared to float32. This allows larger models to fit in memory on limited hardware.
+2. **Computational Trade-offs**: In this implementation, quantization is simulated via quantize→dequant passes. While it reduces the **transfer** and **storage** memory, it introduces slight overhead due to the conversion steps. In real hardware with dedicated low-precision kernels, this would also lead to significant speedups.
+3. **Precision and Accuracy**: Lowering bit depth (e.g., to `W4A4`) significantly reduces memory but can lead to "quantization noise," potentially degrading model output quality. `W8A16` is generally considered a "sweet spot" for maintaining accuracy while achieving meaningful memory savings.
 
 - **Embedding**: E (V×d) + embedding output (B×T×d). One block for the whole model.
 - **Attn / FFN / RMSNorm**: Per-layer weight and activation (B×T×d at block input) savings, **summed over all layers**; hence large totals for 3B-scale models.
