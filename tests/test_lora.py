@@ -37,8 +37,12 @@ def test_lora_initialization(config_file):
             assert f"lora_B_v_{i}" in model.weights.keys()
             A_v = model.weights[f"lora_A_v_{i}"]
             B_v = model.weights[f"lora_B_v_{i}"]
+
+            d_head = d_model // cfg.n_heads
+            d_kv = cfg.n_kv_heads * d_head
+
             assert A_v.shape == (d_model, r)
-            assert B_v.shape == (r, d_model)
+            assert B_v.shape == (r, d_kv)
 
 def test_lora_training_step(config_file):
     """Verify that a training step runs and loss decreases (sanity check)."""
