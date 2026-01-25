@@ -290,11 +290,10 @@ def main():
             pF = (t_f / tot) * 100
             pB = (t_b / tot) * 100
             pO = (t_opt / tot) * 100
-            mem_peak = max(fwd_mem, bwd_mem, opt_mem)  # peak across FWD/BWD/OPT assuming prior-phase memory is freed
-
-            if ray_workers > 1 and step == 0:
-                # We'll print this as a note after the table starts if needed, but for now let's keep the table clean
-                pass
+            # Baseline memory from weight manager cache
+            misc_mem = model.weights.get_cache_memory_mb() if hasattr(model.weights, 'get_cache_memory_mb') else 0
+            # Instantaneous peak = Max(FWD, BWD, OPT) + Misc
+            mem_peak = max(fwd_mem, bwd_mem, opt_mem) + misc_mem
 
             print(f"| {step+1:<6} | {losses[-1]:<10.4f} | {dt:<10.2f} | {t_f:<10.2f} | {t_b:<10.2f} | {t_o:<10.2f} | {mem_peak:<10.1f} |")
 
@@ -308,7 +307,7 @@ def main():
         if losses:
             # Average loss delta across all steps
             total_delta = losses[-1] - losses[0]
-            avg_delta = total_delta / len(losses) if len(losses) > 0 else 0
+            avg_delta = total_delta / (len(losses) - 1) if len(losses) > 1 else total_delta
             print(f"Loss Trend(LR: {lr}):  start={losses[0]:.4f}  end={losses[-1]:.4f}  change per step = {avg_delta:.6f}")
 
         if step_times:

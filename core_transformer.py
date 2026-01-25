@@ -771,6 +771,12 @@ class EinsumTransformer:
     def forward(self, tokens, inference=False, verbose=True, training=False, max_layers=None):
         self.verbose, self.training = verbose, training
         if not hasattr(self, '_stats'): self._init_stats()
+
+        # Record start lengths of layered stats to aggregate them later
+        layered_keys = ['layers', 'norm', 'weight_load', 'attn', 'attn_load', 'attn_qkv',
+                        'attn_rope', 'attn_score', 'attn_out', 'ffn', 'ffn_load', 'ffn_compute']
+        stat_starts = {k: len(self._stats[k]) for k in layered_keys}
+
         if training: self._activations, self._grads = {"tokens": tokens}, {}
         is_decode = inference and any(c["K"] is not None for c in self.cache)
         if inference and not is_decode: self.cur_pos = 0
@@ -785,6 +791,10 @@ class EinsumTransformer:
         if training: self._activations["embedding"] = x
         
         n_layers = max_layers if max_layers is not None else self.cfg.n_layers
+
+        # Track aggregate time for all layers in this step
+        t_layers_step = 0
+
         for i in range(n_layers):
             t_layer_start = time.time()
             p = self.layer_weights[i]
@@ -802,7 +812,17 @@ class EinsumTransformer:
                 ffn_out = self.swiglu(x_norm, W1, W2, W3, key=f"ffn_{i}")
                 x = x + ffn_out
                 self._stats['ffn'].append(time.time() - t_ffn_start)
-            self._stats['layers'].append(time.time() - t_layer_start)
+
+            t_layer = time.time() - t_layer_start
+            self._stats['layers'].append(t_layer)
+            t_layers_step += t_layer
+
+        self._stats['layers_step'].append(t_layers_step)
+
+        # Aggregate layered stats for this forward pass
+        for k in layered_keys:
+            if k == 'layers': continue # handled above as layers_step
+            self._stats[k + '_step'].append(sum(self._stats[k][stat_starts[k]:]))
 
         if inference: self.cur_pos += tokens.shape[1]
         if not is_decode and inference: self._stats['prefill'].append(time.time() - t_stage_start)
@@ -833,6 +853,11 @@ class EinsumTransformer:
         Computes gradients for all parameters and activations.
         """
         t_total = time.time()
+
+        # Record start lengths of layered stats to aggregate them later
+        layered_keys = ['bw_layers', 'bw_norm', 'bw_attn', 'bw_ffn', 'bw_attn_out', 'bw_attn_score', 'bw_attn_qkv', 'bw_ffn_compute']
+        stat_starts = {k: len(self._stats[k]) for k in layered_keys}
+
         c = self.cfg
         E = self.get_w(self.E_name)
         final_x = self._activations["final_x"]
@@ -901,8 +926,14 @@ class EinsumTransformer:
             groups = c.n_heads // c.n_kv_heads
             dQ, dK = dQ_t.transpose(0, 2, 1, 3), dK_t_f.reshape(dx.shape[0], c.n_kv_heads, groups, -1, c.d_head).sum(2).transpose(0, 2, 1, 3)
             dV = dV_t_f.reshape(dx.shape[0], c.n_kv_heads, groups, -1, c.d_head).sum(2).transpose(0, 2, 1, 3)
-            dQ, dK = self._rope_backward(dQ, np.arange(dQ.shape[1])), self._rope_backward(dK, np.arange(dK.shape[1]))
-            dQf, dKf, dVf = [np.clip(t.reshape(dx.shape[0], dx.shape[1], -1), -1.0, 1.0) for t in [dQ, dK, dV]]
+            # Backward through RoPE
+            dQ = self._rope_backward(dQ, np.arange(dQ.shape[1]))
+            dK = self._rope_backward(dK, np.arange(dK.shape[1]))
+
+            # Reshape gradients and apply clipping for numerical stability
+            dQf = np.clip(dQ.reshape(dx.shape[0], dx.shape[1], -1), -1.0, 1.0)
+            dKf = np.clip(dK.reshape(dx.shape[0], dx.shape[1], -1), -1.0, 1.0)
+            dVf = np.clip(dV.reshape(dx.shape[0], dx.shape[1], -1), -1.0, 1.0)
             dQ_B = dV_B = None
             if self.use_lora:
                 if f"lora_q_{i}" in self._activations:
@@ -937,6 +968,10 @@ class EinsumTransformer:
             # Gradient for the input embedding (accumulated via add.at for multi-token indices)
             np.add.at(self._grads["E"], self._activations["tokens"], dx)
         self._stats['bw_embed'].append(time.time() - t_embed)
+
+        # Aggregate layered stats for this backward pass
+        for k in layered_keys:
+            self._stats[k + '_step'].append(sum(self._stats[k][stat_starts[k]:]))
 
         # Calculate gradient memory footprint
         total_grad_bytes = sum(g.nbytes for g in self._grads.values() if isinstance(g, np.ndarray))
@@ -1074,7 +1109,14 @@ class EinsumTransformer:
         return generated
 
     def _init_stats(self):
-        self._stats = {k: [] for k in ['attn', 'ffn', 'layers', 'norm', 'weight_load', 'attn_load', 'attn_qkv', 'attn_rope', 'attn_score', 'attn_out', 'ffn_load', 'ffn_compute', 'prefill', 'decode', 'bw_total', 'bw_layers', 'bw_attn', 'bw_ffn', 'bw_norm', 'bw_head', 'bw_embed', 'bw_attn_out', 'bw_attn_score', 'bw_attn_qkv', 'bw_ffn_compute', 'opt_step', 'opt_clip', 'opt_update', 'embedding', 'output_head']}
+        self._stats = {k: [] for k in [
+            'attn', 'ffn', 'layers', 'norm', 'weight_load', 'attn_load', 'attn_qkv', 'attn_rope', 'attn_score', 'attn_out', 'ffn_load', 'ffn_compute',
+            'prefill', 'decode', 'embedding', 'output_head',
+            'layers_step', 'norm_step', 'weight_load_step', 'attn_step', 'attn_load_step', 'attn_qkv_step', 'attn_rope_step', 'attn_score_step', 'attn_out_step', 'ffn_step', 'ffn_load_step', 'ffn_compute_step',
+            'bw_total', 'bw_layers', 'bw_attn', 'bw_ffn', 'bw_norm', 'bw_head', 'bw_embed', 'bw_attn_out', 'bw_attn_score', 'bw_attn_qkv', 'bw_ffn_compute',
+            'bw_layers_step', 'bw_attn_step', 'bw_ffn_step', 'bw_norm_step', 'bw_attn_out_step', 'bw_attn_score_step', 'bw_attn_qkv_step', 'bw_ffn_compute_step',
+            'opt_step', 'opt_clip', 'opt_update'
+        ]}
         self._memory_stats = {'grad_total_mb': 0.0, 'fwd_activation_mb': 0.0, 'grad_breakdown': {}, 'opt_per_step_mb': []}
 
     def _rope_backward(self, dy, positions):
@@ -1115,18 +1157,18 @@ class EinsumTransformer:
         t_up = title.upper()
         if "FWD" in t_up or "TIMING BREAKDOWN" in t_up:
             pr("Embedding", self._stats.get('embedding'))
-            pr("Layer Total", self._stats.get('layers'))
-            pr("  Norm", self._stats.get('norm'))
-            pr("  Weight Load", self._stats.get('weight_load'))
-            pr("  Attention", self._stats.get('attn'))
-            pr("    Ld weights", self._stats.get('attn_load'))
-            pr("    QKV Proj", self._stats.get('attn_qkv'))
-            pr("    RoPE", self._stats.get('attn_rope'))
-            pr("    Score/Sftmx", self._stats.get('attn_score'))
-            pr("    Out Agg/Proj", self._stats.get('attn_out'))
-            pr("  FeedForward", self._stats.get('ffn'))
-            pr("    Ld weights", self._stats.get('ffn_load'))
-            pr("    Compute", self._stats.get('ffn_compute'))
+            pr("Layer Total (All)", self._stats.get('layers_step'))
+            pr("  Norm", self._stats.get('norm_step'))
+            pr("  Weight Load", self._stats.get('weight_load_step'))
+            pr("  Attention", self._stats.get('attn_step'))
+            pr("    Ld weights", self._stats.get('attn_load_step'))
+            pr("    QKV Proj", self._stats.get('attn_qkv_step'))
+            pr("    RoPE", self._stats.get('attn_rope_step'))
+            pr("    Score/Sftmx", self._stats.get('attn_score_step'))
+            pr("    Out Agg/Proj", self._stats.get('attn_out_step'))
+            pr("  FeedForward", self._stats.get('ffn_step'))
+            pr("    Ld weights", self._stats.get('ffn_load_step'))
+            pr("    Compute", self._stats.get('ffn_compute_step'))
             pr("Output Head", self._stats.get('output_head'))
             if self._stats.get('prefill'):
                 self._log("-" * 50)
@@ -1137,14 +1179,14 @@ class EinsumTransformer:
         elif "BWD" in t_up or "BACKWARD" in t_up:
             pr("Backward Pass", self._stats.get('bw_total'))
             pr("  BW Head", self._stats.get('bw_head'))
-            pr("  BW Layers", self._stats.get('bw_layers'))
-            pr("    BW Attention", self._stats.get('bw_attn'))
-            pr("      BW Out Proj", self._stats.get('bw_attn_out'))
-            pr("      BW Score", self._stats.get('bw_attn_score'))
-            pr("      BW QKV", self._stats.get('bw_attn_qkv'))
-            pr("    BW FeedForward", self._stats.get('bw_ffn'))
-            pr("      BW SwiGLU", self._stats.get('bw_ffn_compute'))
-            pr("    BW Norms", self._stats.get('bw_norm'))
+            pr("  BW Layers (All)", self._stats.get('bw_layers_step'))
+            pr("    BW Attention", self._stats.get('bw_attn_step'))
+            pr("      BW Out Proj", self._stats.get('bw_attn_out_step'))
+            pr("      BW Score", self._stats.get('bw_attn_score_step'))
+            pr("      BW QKV", self._stats.get('bw_attn_qkv_step'))
+            pr("    BW FeedForward", self._stats.get('bw_ffn_step'))
+            pr("      BW SwiGLU", self._stats.get('bw_ffn_compute_step'))
+            pr("    BW Norms", self._stats.get('bw_norm_step'))
             pr("  BW Embed", self._stats.get('bw_embed'))
         elif "OPT" in t_up:
             pr("Optimizer Step", self._stats.get('opt_step'))
