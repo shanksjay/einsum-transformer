@@ -413,7 +413,7 @@ class EinsumTransformer:
         if self.use_lora:
             print(f"  {'LoRA (A,B)':<18} {'float32':<18} {'-':<18} {'—':<14}")
         print(f"  {'-'*18} {'-'*18} {'-'*18} {'-'*14}")
-        print(f"  {'Total (all {n_layers} layers)':<18} {'':<18} {'':<18} {fmt_mb(emb_mb + rms_mb + attn_mb + ffn_mb):<14}")
+        print(f"  {'Total (all layers)':<18} {'':<18} {'':<18} {fmt_mb(emb_mb + rms_mb + attn_mb + ffn_mb):<14}")
 
     def _bind_weights(self):
         c = self.cfg
@@ -715,7 +715,19 @@ class EinsumTransformer:
         if inference: self.cur_pos += tokens.shape[1]
         if not is_decode and inference: self._stats['prefill'].append(time.time() - t_stage_start)
         elif is_decode: self._stats['decode'].append(time.time() - t_stage_start)
-        if training: self._activations["final_x"] = x
+        if training:
+            self._activations["final_x"] = x
+            # Calculate activation memory footprint
+            total_act_bytes = 0
+            def _sum_bytes(d):
+                b = 0
+                for v in d.values():
+                    if isinstance(v, np.ndarray): b += v.nbytes
+                    elif isinstance(v, dict): b += _sum_bytes(v)
+                return b
+            total_act_bytes = _sum_bytes(self._activations)
+            self._memory_stats['fwd_activation_mb'] = total_act_bytes / (1024 * 1024)
+
         t_head = time.time()
         res = np.einsum("btd,vd->btv", x, E, optimize=True)
         if 'output_head' not in self._stats: self._stats['output_head'] = []
@@ -775,6 +787,11 @@ class EinsumTransformer:
             term1 = dx_norm1 * act_norm1["w"]
             dx = dx + (term1 - np.mean(term1 * act_norm1["norm_x"], axis=-1, keepdims=True) * act_norm1["norm_x"]) / act_norm1["rms"]
         if not self.use_lora: np.add.at(self._grads["E"], self._activations["tokens"], dx)
+
+        # Calculate gradient memory footprint
+        total_grad_bytes = sum(g.nbytes for g in self._grads.values() if isinstance(g, np.ndarray))
+        self._memory_stats['grad_total_mb'] = total_grad_bytes / (1024 * 1024)
+
         self._stats['bw_total'].append(time.time() - t_total)
         return self._grads
 
@@ -883,7 +900,7 @@ class EinsumTransformer:
 
     def _init_stats(self):
         self._stats = {k: [] for k in ['attn', 'ffn', 'layers', 'norm', 'weight_load', 'attn_load', 'attn_qkv', 'attn_rope', 'attn_score', 'attn_out', 'ffn_load', 'ffn_compute', 'prefill', 'decode', 'bw_total', 'bw_layers', 'bw_attn', 'bw_ffn', 'bw_norm', 'bw_head', 'bw_embed', 'opt_step', 'embedding', 'output_head']}
-        self._memory_stats = {'grad_total_mb': 0, 'grad_breakdown': {}, 'opt_per_step_mb': []}
+        self._memory_stats = {'grad_total_mb': 0.0, 'fwd_activation_mb': 0.0, 'grad_breakdown': {}, 'opt_per_step_mb': []}
 
     def _rope_backward(self, dy, positions):
         B, T, H, D = dy.shape
@@ -970,14 +987,27 @@ class EinsumOptimizer:
                 for k in g:
                     g[k] *= clip_coef
 
-        if "E" in g: m.weights[m.E_name] -= lr * g["E"]
+        step_memory_bytes = 0
+        if "E" in g:
+            step_memory_bytes += m.weights[m.E_name].nbytes + g["E"].nbytes
+            m.weights[m.E_name] -= lr * g["E"]
         for i in range(m.cfg.n_layers):
             p = m.layer_weights[i]
             for k in ["lora_A_q", "lora_B_q", "lora_A_v", "lora_B_v"]:
                 w_key = f"{k}_{i}"
-                if w_key in m.weights and w_key in g: m.weights[w_key] -= lr * g[w_key]
+                if w_key in m.weights and w_key in g:
+                    step_memory_bytes += m.weights[w_key].nbytes + g[w_key].nbytes
+                    m.weights[w_key] -= lr * g[w_key]
             for k in ["W_q", "W_k", "W_v", "W_o", "W1", "W2", "W3"]:
-                if p.get(k) and f"{k}_{i}" in g: m.weights[p[k]] -= lr * g[f"{k}_{i}"].T
+                grad_key = f"{k}_{i}"
+                if p.get(k) and grad_key in g:
+                    step_memory_bytes += m.weights[p[k]].nbytes + g[grad_key].nbytes
+                    m.weights[p[k]] -= lr * g[grad_key].T
             for k in ["norm1", "norm2"]:
-                if p.get(k) and f"{k}_{i}" in g: m.weights[p[k]] -= lr * g[f"{k}_{i}"]
+                grad_key = f"{k}_{i}"
+                if p.get(k) and grad_key in g:
+                    step_memory_bytes += m.weights[p[k]].nbytes + g[grad_key].nbytes
+                    m.weights[p[k]] -= lr * g[grad_key]
+
+        m._memory_stats['opt_per_step_mb'].append(step_memory_bytes / (1024 * 1024))
         m._stats['opt_step'].append(time.time() - t0)
