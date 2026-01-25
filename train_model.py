@@ -159,7 +159,7 @@ def main():
 
         # Learning rate: --lr overrides config "learning_rate"; if --lr omitted, use config or 1e-4
         lr = args.lr if args.lr is not None else config_dict.get("learning_rate", 1e-4)
-    
+
         cfg = TransformerConfig(config_dict)
         model = EinsumTransformer(cfg)
         optimizer = EinsumOptimizer(model, lr=lr)
@@ -183,6 +183,13 @@ def main():
         print(f"\n" + "#"*50)
         print(f"TRAINING START: {args.steps} steps, lr={lr} ({lr_src})" + (" (fixed batch)" if args.fix_batch else ""))
         print("#"*50)
+        if args.fix_batch:
+            print("[INFO] Using fixed batch (loss should decrease if training works)")
+
+        # Table header for training steps
+        print("\n" + "="*95)
+        print(f"| {'Step':<6} | {'Loss':<10} | {'Total (s)':<10} | {'FWD (s)':<10} | {'BWD (s)':<10} | {'OPT (s)':<10} | {'Peak Mem':<10} |")
+        print("-" * 95)
 
         model._init_stats()  # So forward/backward accumulate across steps; tables printed at end
 
@@ -190,7 +197,6 @@ def main():
         if args.fix_batch:
             x = np.random.randint(0, cfg.vocab_size, (cfg.batch_size, cfg.seq_len))
             y = np.roll(x, -1, axis=1)  # next-token target (learnable pattern)
-            print("[INFO] Using fixed batch (loss should decrease if training works)")
 
         step_times = []
         step_t_fwd, step_t_bwd, step_t_opt = [], [], []
@@ -287,11 +293,12 @@ def main():
             mem_peak = max(fwd_mem, bwd_mem, opt_mem)  # peak across FWD/BWD/OPT assuming prior-phase memory is freed
 
             if ray_workers > 1 and step == 0:
-                print("[INFO] With --ray-workers: FWD=per-shard activation; BWD=driver aggregated grad total; OPT=driver step. Use same use_lora to compare to non-Ray.")
-            print(f"[INFO] FWD : {t_f:.2f}s | mem: {fwd_mem:.1f} MB")
-            print(f"[INFO] BWD : {t_b:.2f}s | mem: {bwd_mem:.1f} MB")
-            print(f"[INFO] OPT : {t_opt:.2f}s | mem: {opt_mem:.1f} MB")
-            print(f"[Step {step+1:02d}] Loss: {losses[-1]:.4f} | Total: {dt:.2f}s [F:{pF:.0f}%, B:{pB:.0f}%, O:{pO:.0f}%] Peak: {mem_peak:.1f} MB")
+                # We'll print this as a note after the table starts if needed, but for now let's keep the table clean
+                pass
+
+            print(f"| {step+1:<6} | {losses[-1]:<10.4f} | {dt:<10.2f} | {t_f:<10.2f} | {t_b:<10.2f} | {t_o:<10.2f} | {mem_peak:<10.1f} |")
+
+        print("="*95)
 
         # Display final training summary in the requested format
         print("\n" + "="*50)

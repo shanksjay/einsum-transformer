@@ -852,6 +852,7 @@ class EinsumTransformer:
             p = self.layer_weights[i]
             if not c.use_moe:
                 t_ffn = time.time()
+                t_ffn_compute = time.time()
                 act_ffn, dffn_out = self._activations[f"ffn_{i}"], dx
                 W1, W2, W3 = [self.get_w(p[k], transpose=True) for k in ["W1", "W2", "W3"]]
                 if not self.use_lora: self._grads[f"W3_{i}"] = np.einsum("btf,btd->fd", act_ffn["gated"], dffn_out, optimize=True)
@@ -861,6 +862,7 @@ class EinsumTransformer:
                 if not self.use_lora:
                     self._grads[f"W1_{i}"], self._grads[f"W2_{i}"] = np.einsum("btd,btf->df", act_ffn["x"], da, optimize=True), np.einsum("btd,btf->df", act_ffn["x"], db, optimize=True)
                 dx = dx + np.einsum("btf,df->btd", da, W1, optimize=True) + np.einsum("btf,df->btd", db, W2, optimize=True)
+                self._stats['bw_ffn_compute'].append(time.time() - t_ffn_compute)
 
                 t_norm2 = time.time()
                 act_norm2, dx_norm2 = self._activations[f"norm2_{i}"], dx
@@ -874,18 +876,24 @@ class EinsumTransformer:
             t_attn = time.time()
             act_attn, dattn_out = self._activations[f"attn_{i}"], dx
             W_o = self.get_w(p["W_o"], transpose=True)
+
+            t_bw_attn_out = time.time()
             if not self.use_lora: self._grads[f"W_o_{i}"] = np.einsum("btd,bth->dh", act_attn["weighted_v_merged"], dattn_out, optimize=True)
             # Backward through Output Projection and Merge
             d_weighted_v_merged = np.einsum("bth,dh->btd", dattn_out, W_o, optimize=True)
             d_weighted_v = d_weighted_v_merged.reshape(dx.shape[0], dx.shape[1], c.n_heads, c.d_head).transpose(0, 2, 1, 3)
+            self._stats['bw_attn_out'].append(time.time() - t_bw_attn_out)
 
+            t_bw_attn_score = time.time()
             # Backward through Attention Softmax and Weighted Sum
             # dattn: [B, H, T, T]
             dattn = np.einsum("bhid,bhjd->bhij", d_weighted_v, act_attn["V_t"], optimize=True)
 
             # Backward through Softmax
             dscores = act_attn["attn"] * (dattn - np.sum(dattn * act_attn["attn"], axis=-1, keepdims=True)) / np.sqrt(c.d_head)
+            self._stats['bw_attn_score'].append(time.time() - t_bw_attn_score)
 
+            t_bw_attn_qkv = time.time()
             # Gradients for Q, K, V projections
             dQ_t = np.einsum("bhij,bhjd->bhid", dscores, act_attn["K_t"], optimize=True)
             dK_t_f = np.einsum("bhji,bhjd->bhid", dscores, act_attn["Q_t"], optimize=True)
@@ -912,6 +920,7 @@ class EinsumTransformer:
             if self.use_lora:
                 if dQ_B is not None: dx += self._activations[f"lora_q_{i}"]["s"] * np.einsum("btr,dr->btd", dQ_B, self._activations[f"lora_q_{i}"]["A"], optimize=True)
                 if dV_B is not None: dx += self._activations[f"lora_v_{i}"]["s"] * np.einsum("btr,dr->btd", dV_B, self._activations[f"lora_v_{i}"]["A"], optimize=True)
+            self._stats['bw_attn_qkv'].append(time.time() - t_bw_attn_qkv)
 
             t_norm1 = time.time()
             act_norm1, dx_norm1 = self._activations[f"norm1_{i}"], dx
@@ -1036,7 +1045,7 @@ class EinsumTransformer:
         return generated
 
     def _init_stats(self):
-        self._stats = {k: [] for k in ['attn', 'ffn', 'layers', 'norm', 'weight_load', 'attn_load', 'attn_qkv', 'attn_rope', 'attn_score', 'attn_out', 'ffn_load', 'ffn_compute', 'prefill', 'decode', 'bw_total', 'bw_layers', 'bw_attn', 'bw_ffn', 'bw_norm', 'bw_head', 'bw_embed', 'opt_step', 'opt_clip', 'opt_update', 'embedding', 'output_head']}
+        self._stats = {k: [] for k in ['attn', 'ffn', 'layers', 'norm', 'weight_load', 'attn_load', 'attn_qkv', 'attn_rope', 'attn_score', 'attn_out', 'ffn_load', 'ffn_compute', 'prefill', 'decode', 'bw_total', 'bw_layers', 'bw_attn', 'bw_ffn', 'bw_norm', 'bw_head', 'bw_embed', 'bw_attn_out', 'bw_attn_score', 'bw_attn_qkv', 'bw_ffn_compute', 'opt_step', 'opt_clip', 'opt_update', 'embedding', 'output_head']}
         self._memory_stats = {'grad_total_mb': 0.0, 'fwd_activation_mb': 0.0, 'grad_breakdown': {}, 'opt_per_step_mb': []}
 
     def _rope_backward(self, dy, positions):
@@ -1081,7 +1090,13 @@ class EinsumTransformer:
             pr("  Norm", self._stats.get('norm'))
             pr("  Weight Load", self._stats.get('weight_load'))
             pr("  Attention", self._stats.get('attn'))
+            pr("    Ld weights", self._stats.get('attn_load'))
+            pr("    QKV Proj", self._stats.get('attn_qkv'))
+            pr("    RoPE", self._stats.get('attn_rope'))
+            pr("    Score/Sftmx", self._stats.get('attn_score'))
+            pr("    Out Agg/Proj", self._stats.get('attn_out'))
             pr("  FeedForward", self._stats.get('ffn'))
+            pr("    Ld weights", self._stats.get('ffn_load'))
             pr("    Compute", self._stats.get('ffn_compute'))
             pr("Output Head", self._stats.get('output_head'))
             if self._stats.get('prefill'):
@@ -1095,7 +1110,11 @@ class EinsumTransformer:
             pr("  BW Head", self._stats.get('bw_head'))
             pr("  BW Layers", self._stats.get('bw_layers'))
             pr("    BW Attention", self._stats.get('bw_attn'))
+            pr("      BW Out Proj", self._stats.get('bw_attn_out'))
+            pr("      BW Score", self._stats.get('bw_attn_score'))
+            pr("      BW QKV", self._stats.get('bw_attn_qkv'))
             pr("    BW FeedForward", self._stats.get('bw_ffn'))
+            pr("      BW SwiGLU", self._stats.get('bw_ffn_compute'))
             pr("    BW Norms", self._stats.get('bw_norm'))
             pr("  BW Embed", self._stats.get('bw_embed'))
         elif "OPT" in t_up:
