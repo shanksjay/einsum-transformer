@@ -395,10 +395,14 @@ class EinsumTransformer:
         wb = getattr(c, "quantization_weight_bits", 0)
         ab = getattr(c, "quantization_activation_bits", 0)
         wd = getattr(c, "weight_dtype", "float32")
-        V, d, d_ff = c.vocab_size, c.d_model, c.d_ff
-        B, T = c.batch_size, c.seq_len
-        n_layers = c.n_layers
-        d_kv = c.n_kv_heads * (c.d_model // c.n_heads)
+        # Dimensions used for memory calculations:
+        V = c.vocab_size             # Vocabulary size
+        d = c.d_model                # Model dimension (hidden size)
+        d_ff = c.d_ff                # Feed-forward network intermediate dimension
+        B = c.batch_size             # Batch size
+        T = c.seq_len                # Sequence length (context window)
+        n_layers = c.n_layers        # Total number of transformer layers
+        d_kv = c.n_kv_heads * (c.d_model // c.n_heads) # Total dimension for Key/Value heads
 
         def weight_str():
             if wb == 8: return f"{wd}→int8"
@@ -433,25 +437,25 @@ class EinsumTransformer:
         def calc_mem(w_count, a_count, w_b, a_b):
             return mb(w_count * w_b + a_count * a_b)
 
-        # Embedding
+        # Embedding: Weights = V * d; Activations = B * T * d
         emb_w = V * d
         emb_a = B * T * d
         emb_before = calc_mem(emb_w, emb_a, src_bytes, a_src_bytes)
         emb_after = calc_mem(emb_w, emb_a, q_bytes, a_q_bytes)
 
-        # RMSNorm
+        # RMSNorm: 2 norms per layer, each with 'd' parameters
         rms_w = 2 * d * n_layers
         rms_a = 0 # RMSNorm activations usually small or same precision
         rms_before = calc_mem(rms_w, rms_a, src_bytes, a_src_bytes)
         rms_after = calc_mem(rms_w, rms_a, q_bytes, a_src_bytes)
 
-        # Attn
+        # Attention: Q,O are [d, d]; K,V are [d, d_kv]. Total 4 projections per layer.
         attn_w = (2 * d * d + 2 * d_kv * d) * n_layers
         attn_a = B * T * d * n_layers
         attn_before = calc_mem(attn_w, attn_a, src_bytes, a_src_bytes)
         attn_after = calc_mem(attn_w, attn_a, q_bytes, a_q_bytes)
 
-        # FFN
+        # FFN: SwiGLU uses 3 projections (gate, up, down) each of size [d, d_ff]
         ffn_w = 3 * d * d_ff * n_layers
         ffn_a = B * T * d * n_layers
         ffn_before = calc_mem(ffn_w, ffn_a, src_bytes, a_src_bytes)
