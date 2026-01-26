@@ -25,12 +25,15 @@
     "// 5": "Inference Settings",
     "max_new_tokens": 10,
     "// 6": "LoRA Fine-Tuning",
-    "use_lora": false,
+    "use_lora": true,
     "lora_rank": 8,
     "lora_alpha": 16.0,
     "lora_target_modules": [
         "q_proj",
         "v_proj"
     ],
-    "lora_merge_after_training": false
+    "lora_merge_after_training": false,
+    "// 7": "Optimization, Speculative decoding (draft config in optmizations)",
+    "speculative": true,
+    "draft_layers": 8
 }
