@@ -30,6 +30,8 @@ class TransformerConfig:
         self.d_model = cfg["d_model"]
         self.n_heads = cfg["n_heads"]
         self.n_kv_heads = cfg.get("n_kv_heads", self.n_heads)
+        if self.n_kv_heads < self.n_heads:
+            cfg["use_gqa"] = True
         self.d_ff = cfg["d_ff"]
         self.n_layers = cfg["n_layers"]
         self.rope_base = cfg.get("rope_base", 10000.0)
@@ -216,6 +218,7 @@ class EinsumTransformer:
     def __init__(self, cfg: TransformerConfig, *, _from_weights=None, _E_name=None, _layer_weights=None):
         self.cfg = cfg
         self.weights = None  # LazyWeightManager or DictWeightManager
+        self._weight_cache = {} # Fast cache for dequantized weights during inference
         self.cache = [{"K": None, "V": None} for _ in range(cfg.n_layers)]
         self.cur_pos = 0
         self._activations = {}
@@ -596,11 +599,15 @@ class EinsumTransformer:
         for k, v in d.items(): self.weights[k] = np.asarray(v).copy() if hasattr(v, "copy") else v
 
     def _quantize_dequant_weight(self, w, bits):
+        """
+        Simulate quantization by quantizing and then dequantizing.
+        In a real production environment, weights would be stored as int8/int4.
+        """
         if bits == 8:
-            amax = np.max(np.abs(w))
-            if amax == 0 or not np.isfinite(amax): return w
-            scale = amax / 127.5
-            return np.clip(np.round(w / scale).astype(np.int32), -128, 127).astype(np.float32) * scale
+            # Per-channel quantization for better accuracy in LLMs
+            amax = np.max(np.abs(w), axis=-1, keepdims=True)
+            scale = np.where(amax > 0, amax / 127.5, 1.0)
+            return np.clip(np.round(w / scale).astype(np.int8), -128, 127).astype(np.float32) * scale
         if bits == 4:
             amax = np.max(np.abs(w))
             if amax == 0 or not np.isfinite(amax): return w
@@ -609,13 +616,13 @@ class EinsumTransformer:
         return w
 
     def _quantize_dequant_act(self, x, bits):
+        """Quantize and dequantize activations."""
         if bits == 16:
             return np.clip(x, -65504, 65504).astype(np.float16).astype(np.float32)
         if bits == 8:
-            amax = np.max(np.abs(x))
-            if amax == 0 or not np.isfinite(amax): return x
-            scale = amax / 127.5
-            return np.clip(np.round(x / scale).astype(np.int32), -128, 127).astype(np.float32) * scale
+            amax = np.max(np.abs(x), axis=-1, keepdims=True)
+            scale = np.where(amax > 0, amax / 127.5, 1.0)
+            return np.clip(np.round(x / scale).astype(np.int8), -128, 127).astype(np.float32) * scale
         if bits == 4:
             amax = np.max(np.abs(x))
             if amax == 0 or not np.isfinite(amax): return x
@@ -626,6 +633,12 @@ class EinsumTransformer:
     def get_w(self, name, transpose=False):
         if name is None: return None
         if isinstance(name, np.ndarray): return name.T if transpose else name
+
+        # Fast path for inference
+        cache_key = (name, transpose)
+        if not self.training and cache_key in self._weight_cache:
+            return self._weight_cache[cache_key]
+
         t0 = time.time()
         data = self.weights[name]
         if hasattr(self, '_stats') and 'weight_load' in self._stats:
@@ -635,22 +648,27 @@ class EinsumTransformer:
         wb = getattr(self.cfg, "quantization_weight_bits", 0)
         if wb in (4, 8) and not getattr(data, "_is_quantized", False) and "lora" not in str(name).lower():
             data = self._quantize_dequant_weight(data.astype(np.float32), wb)
-            # Mark as quantized and store back in weight manager cache to avoid re-computing
             try:
                 data._is_quantized = True
                 self.weights[name] = data
-            except: pass # Some numpy arrays might not allow extra attributes
+            except: pass
 
-        return data.T if transpose else data
+        res = data.T if transpose else data
 
-    def rms_norm(self, x, w, eps=1e-6, key=None):
+        # Cache for next time if in inference mode
+        if not self.training:
+            self._weight_cache[cache_key] = res
+
+        return res
+
+    def rms_norm(self, x, w, eps=1e-5, key=None):
         t0 = time.time()
         # Use higher precision for RMS calculation to avoid overflow
         x_fp64 = x.astype(np.float64)
-        rms = np.sqrt(np.mean(x_fp64**2, axis=-1, keepdims=True) + eps).astype(x.dtype)
+        rms = np.sqrt(np.mean(x_fp64**2, axis=-1, keepdims=True) + eps).astype(np.float32)
         # Handle cases where rms might be zero or non-finite
-        rms = np.where(np.isfinite(rms) & (rms > 0), rms, eps)
-        norm_x = x / rms
+        rms = np.where(np.isfinite(rms) & (rms > 0), rms, float(eps))
+        norm_x = (x / rms).astype(x.dtype)
         res = norm_x * w
         if hasattr(self, '_stats') and 'norm' in self._stats: self._stats['norm'].append(time.time() - t0)
         if self.training and key is not None: self._activations[key] = {"x": x, "rms": rms, "norm_x": norm_x}
@@ -659,12 +677,14 @@ class EinsumTransformer:
     def swiglu(self, x, W1, W2, W3, key=None):
         t0 = time.time()
 
-        def proj(mat):
-            return np.einsum("btd,df->btf", x, mat, optimize=True)
-
-        futures = [self.executor.submit(proj, W1), self.executor.submit(proj, W2)]
-        a = futures[0].result()
-        b = futures[1].result()
+        # Projections
+        if x.shape[1] == 1:
+            x_flat = x[:, 0, :]
+            a = (x_flat @ W1)[:, None, :]
+            b = (x_flat @ W2)[:, None, :]
+        else:
+            a = x @ W1
+            b = x @ W2
 
         # Numerical stable sigmoid to avoid overflow in np.exp
         # We use a piecewise approach to avoid evaluating np.exp on values that would overflow
@@ -676,7 +696,10 @@ class EinsumTransformer:
 
         swish_b = b * sig_b
         gated = a * swish_b
-        res = np.einsum("btf,fd->btd", gated, W3, optimize=True)
+        if gated.shape[1] == 1:
+            res = (gated[:, 0, :] @ W3)[:, None, :]
+        else:
+            res = gated @ W3
         if hasattr(self, '_stats') and 'ffn_compute' in self._stats:
             self._stats['ffn_compute'].append(time.time() - t0)
         if self.training and key is not None:
@@ -714,7 +737,11 @@ class EinsumTransformer:
             t_load_weight = time.time() - t_l
 
             t_p = time.time()
-            proj = np.einsum("btd,dh->bth", x, W, optimize=True)
+            # Vector-matrix multiply optimization for decode
+            if x.shape[1] == 1:
+                proj = (x[:, 0, :] @ W)[:, None, :]
+            else:
+                proj = x @ W
 
             # Handle LoRA if applicable
             lora_act = None
@@ -724,22 +751,24 @@ class EinsumTransformer:
                 if p.get(lora_a_key):
                     scale = self.lora_alpha / self.lora_rank
                     A, Bl = self.get_w(p[lora_a_key]), self.get_w(p[lora_b_key])
-                    xA = np.einsum("btd,dr->btr", x, A, optimize=True)
-                    proj += scale * np.einsum("btr,rh->bth", xA, Bl, optimize=True)
+                    if x.shape[1] == 1:
+                        xA = x[:, 0, :] @ A
+                        proj += (scale * (xA @ Bl))[:, None, :]
+                    else:
+                        xA = x @ A
+                        proj += scale * (xA @ Bl)
                     if self.training:
                         lora_act = {"xA": xA, "A": A, "B": Bl, "s": scale}
 
             t_proj_time = time.time() - t_p
             return name_key, proj, lora_act, t_load_weight, t_proj_time
 
-        # Run Q, K, V projections in parallel
-        futures = [self.executor.submit(compute_proj, k) for k in ["W_q", "W_k", "W_v"]]
-
+        # Run Q, K, V projections
         results = {}
         t_load_sum = 0
         t_qkv_sum = 0
-        for future in as_completed(futures):
-            name_key, proj, lora_act, t_lw, t_pt = future.result()
+        for k in ["W_q", "W_k", "W_v"]:
+            name_key, proj, lora_act, t_lw, t_pt = compute_proj(k)
             results[name_key] = proj
             if lora_act and self.training:
                 self._activations[f"lora_{name_key[2:]}_{layer_idx}"] = lora_act
@@ -776,16 +805,22 @@ class EinsumTransformer:
         V_t = V.transpose(0, 2, 1, 3)
 
         if inference:
-            # Update or initialize KV cache for iterative decoding
+            # Update or initialize KV cache for iterative decoding (pre-allocated)
             if self.cache[layer_idx]["K"] is None:
-                self.cache[layer_idx]["K"], self.cache[layer_idx]["V"] = K_t, V_t
+                max_len = max(self.cfg.seq_len, self.cur_pos + T + self.cfg.max_new_tokens)
+                self.cache[layer_idx]["K"] = np.zeros((B, K_t.shape[1], max_len, c.d_head), dtype=K_t.dtype)
+                self.cache[layer_idx]["V"] = np.zeros((B, V_t.shape[1], max_len, c.d_head), dtype=V_t.dtype)
+                self.cache[layer_idx]["K"][:, :, :T, :] = K_t
+                self.cache[layer_idx]["V"][:, :, :T, :] = V_t
             else:
-                self.cache[layer_idx]["K"] = np.concatenate([self.cache[layer_idx]["K"], K_t], axis=2)
-                self.cache[layer_idx]["V"] = np.concatenate([self.cache[layer_idx]["V"], V_t], axis=2)
-            K_t, V_t = self.cache[layer_idx]["K"], self.cache[layer_idx]["V"]
+                self.cache[layer_idx]["K"][:, :, self.cur_pos:self.cur_pos+T, :] = K_t
+                self.cache[layer_idx]["V"][:, :, self.cur_pos:self.cur_pos+T, :] = V_t
+            K_t = self.cache[layer_idx]["K"][:, :, :self.cur_pos+T, :]
+            V_t = self.cache[layer_idx]["V"][:, :, :self.cur_pos+T, :]
 
         t_score = time.time()
-        scores = np.einsum("bhid,bhjd->bhij", Q_t, K_t, optimize=True) / np.sqrt(c.d_head)
+        # Batched matrix multiplication for scores
+        scores = (Q_t @ K_t.transpose(0, 1, 3, 2)) / np.sqrt(c.d_head)
         if inference:
             if T == 1: mask = np.ones((1, self.cur_pos + 1))
             else: mask = np.concatenate([np.ones((T, self.cur_pos)), np.tril(np.ones((T, T)))], axis=1)
@@ -796,14 +831,17 @@ class EinsumTransformer:
         self._stats['attn_score'].append(time.time() - t_score)
 
         t_out = time.time()
-        # Multiply attention weights by values: [B, H, T, T] x [B, H, T, D_head] -> [B, H, T, D_head]
-        weighted_v = np.einsum("bhij,bhjd->bhid", attn, V_t, optimize=True)
+        # Multiply attention weights by values
+        weighted_v = attn @ V_t
 
         # Merge heads back into model dimension
         weighted_v_merged = weighted_v.transpose(0, 2, 1, 3).reshape(B, T, c.d_model)
 
         # Output projection
-        res = np.einsum("btd,dh->bth", weighted_v_merged, W_o, optimize=True)
+        if weighted_v_merged.shape[1] == 1:
+            res = (weighted_v_merged[:, 0, :] @ W_o)[:, None, :]
+        else:
+            res = weighted_v_merged @ W_o
         self._stats['attn_out'].append(time.time() - t_out)
         self._stats['attn'].append(time.time() - t0)
         if self.training:
@@ -841,6 +879,10 @@ class EinsumTransformer:
         return out / self.cfg.top_k
 
     def forward(self, tokens, inference=False, verbose=True, training=False, max_layers=None):
+        if not training and not inference:
+            # For pure forward without cache, clear local weight cache if needed
+            # but usually we want to keep it.
+            pass
         """
         Forward pass of the Transformer using pure einsum notation.
 
@@ -963,96 +1005,22 @@ class EinsumTransformer:
             self._memory_stats['fwd_activation_mb'] = (_sum_bytes(self._activations) / (1024 * 1024)) + w_mem
 
         t_head = time.time()
-        res = np.einsum("btd,vd->btv", x, E, optimize=True)
+        if x.shape[1] == 1:
+            res = (x[:, 0, :] @ E.T)[:, None, :]
+        else:
+            res = x @ E.T
         if 'output_head' not in self._stats: self._stats['output_head'] = []
         self._stats['output_head'].append(time.time() - t_head)
-        if self.verbose and not self.training and not is_decode: self._print_stats_table()
+        if self.verbose and not self.training: self._print_stats_table()
         return res
 
     def backward(self, d_logits):
         """
         Backward pass computing all gradients using pure einsum notation.
-
-        HIGH-LEVEL FLOW:
-        ================
-        1. Output Head Backward:
-           - Compute dx from d_logits and E
-           - Compute dE (embedding gradient) from d_logits and final_x
-
-        2. For each layer (N-1 to 0, reverse order):
-           a. FFN Backward (SwiGLU):
-              - Backprop through W3 projection
-              - Backprop through SwiGLU activation (gate * swish derivative)
-              - Compute dW3, dW1, dW2 gradients
-              - Compute dx contribution from FFN
-           b. Norm2 Backward:
-              - Compute d_norm2 (RMSNorm weight gradient)
-              - Backprop through RMSNorm (mean-centered gradient normalization)
-              - Accumulate dx from FFN residual path
-           c. Attention Backward:
-              - Backprop through W_o projection
-              - Backprop through attention output aggregation
-              - Backprop through Softmax (Jacobian: attn * (d_attn - sum(d_attn * attn)))
-              - Backprop through attention scores (QK^T / sqrt(d_head))
-              - Handle GQA: sum gradients across query groups for K and V
-              - Backprop through RoPE (inverse rotation via transpose)
-              - Backprop through QKV projections
-              - Compute dW_q, dW_k, dW_v, dW_o gradients
-              - Compute dx contribution from attention
-           d. Norm1 Backward:
-              - Compute d_norm1 gradient
-              - Backprop through RMSNorm
-              - Accumulate dx from attention residual path
-
-        3. Embedding Backward:
-           - Accumulate dE from token lookup indices
-
-        KEY EINSUM OPERATIONS (BACKWARD):
-        =================================
-        Output Head:
-          dx = einsum('btv,vd->btd', d_logits, E)
-          dE = einsum('btv,btd->vd', d_logits, final_x)
-
-        FFN (SwiGLU):
-          dW3 = einsum('btf,btd->fd', gated, dffn_out)
-          dgated = einsum('btd,fd->btf', dffn_out, W3)
-          dW1 = einsum('btd,btf->df', x, da)  [da = dgated * swish(b)]
-          dW2 = einsum('btd,btf->df', x, db)  [db = dgated * a * swish'(b)]
-          dx += einsum('btf,df->btd', da, W1) + einsum('btf,df->btd', db, W2)
-
-        RMSNorm:
-          d_norm = einsum('btd,btd->d', dx_norm, norm_x)  [norm_x = x / rms]
-          dx = (w / rms) * (dx_norm - mean(dx_norm * norm_x) * norm_x)
-
-        Attention:
-          dW_o = einsum('btd,bth->dh', weighted_v_merged, dattn_out)
-          dweighted_merged = einsum('bth,dh->btd', dattn_out, W_o)
-          dattn = einsum('bhid,bhjd->bhij', dweighted, V_t)
-          dscores = attn * (dattn - sum(dattn * attn, axis=-1))
-          dQ_t = einsum('bhij,bhjd->bhid', dscores, K_t)
-          dK_t_full = einsum('bhji,bhjd->bhid', dscores, Q_t)
-          dV_t_full = einsum('bhij,bhid->bhjd', attn, dweighted)
-          # GQA: sum across groups
-          dK_t = dK_t_full.reshape(...).sum(axis=group_dim)
-          dV_t = dV_t_full.reshape(...).sum(axis=group_dim)
-          # RoPE inverse
-          dQ, dK = rope_backward(dQ_t), rope_backward(dK_t)
-          dW_q = einsum('btd,bth->dh', x, dQ.reshape(...))
-          dW_k = einsum('btd,bth->dh', x, dK.reshape(...))
-          dW_v = einsum('btd,bth->dh', x, dV.reshape(...))
-          dx += einsum('bth,dh->btd', dQ, W_q) + einsum('bth,dh->btd', dK, W_k) + einsum('bth,dh->btd', dV, W_v)
-
-        GRADIENTS COMPUTED:
-        ===================
-        - E: Embedding weight gradient (vocab_size, d_model)
-        - Per-layer:
-          * W_q, W_k, W_v, W_o: Attention weight gradients (d_model, d_model)
-          * norm1, norm2: RMSNorm weight gradients (d_model,)
-          * W1, W2, W3: FFN weight gradients (d_model, d_ff) or (d_ff, d_model)
+        Ensures correct gradient flow through residual connections.
         """
         t_total = time.time()
 
-        # Record start lengths of layered stats to aggregate them later
         layered_keys = ['bw_layers', 'bw_norm', 'bw_attn', 'bw_ffn', 'bw_attn_out', 'bw_attn_score', 'bw_attn_qkv', 'bw_ffn_compute']
         stat_starts = {k: len(self._stats[k]) for k in layered_keys}
 
@@ -1061,116 +1029,136 @@ class EinsumTransformer:
         final_x = self._activations["final_x"]
 
         t_head = time.time()
-        # Gradient with respect to the final layer activations
-        # [B, T, V] x [V, D] -> [B, T, D]
+        # dL/dx_final [B, T, D]
         dx = np.einsum("btv,vd->btd", d_logits, E, optimize=True)
 
         if not self.use_lora:
-            # Gradient with respect to the output embedding (tied with input embedding)
             self._grads["E"] = np.einsum("btv,btd->vd", d_logits, final_x, optimize=True)
         self._stats['bw_head'].append(time.time() - t_head)
 
         for i in reversed(range(c.n_layers)):
             t_layer_start = time.time()
             p = self.layer_weights[i]
+
+            # 1. FFN Residual Block Backward
+            # x_next = x + swiglu(norm2(x))
+            # dL/dx_in = dL/dx_next + dL/dx_next * d_swiglu/d_norm * d_norm/dx_in
+
+            dy = dx # Gradient at the output of this layer's residual
+
             if not c.use_moe:
                 t_ffn = time.time()
                 t_ffn_compute = time.time()
-                act_ffn, dffn_out = self._activations[f"ffn_{i}"], dx
+                act_ffn = self._activations[f"ffn_{i}"]
                 W1, W2, W3 = [self.get_w(p[k], transpose=True) for k in ["W1", "W2", "W3"]]
-                if not self.use_lora: self._grads[f"W3_{i}"] = np.einsum("btf,btd->fd", act_ffn["gated"], dffn_out, optimize=True)
-                dgated = np.einsum("btd,fd->btf", dffn_out, W3, optimize=True)
+
+                # Gradients for W3 using dL/dffn_out = dy
+                if not self.use_lora:
+                    self._grads[f"W3_{i}"] = np.einsum("btf,btd->fd", act_ffn["gated"], dy, optimize=True)
+
+                # dL/dgated
+                dgated = np.einsum("btd,fd->btf", dy, W3, optimize=True)
                 da = dgated * (act_ffn["b"] * act_ffn["sig_b"])
                 db = dgated * act_ffn["a"] * (act_ffn["sig_b"] * (1 + act_ffn["b"] * (1 - act_ffn["sig_b"])))
+
                 if not self.use_lora:
-                    self._grads[f"W1_{i}"], self._grads[f"W2_{i}"] = np.einsum("btd,btf->df", act_ffn["x"], da, optimize=True), np.einsum("btd,btf->df", act_ffn["x"], db, optimize=True)
-                dx = dx + np.einsum("btf,df->btd", da, W1, optimize=True) + np.einsum("btf,df->btd", db, W2, optimize=True)
+                    self._grads[f"W1_{i}"] = np.einsum("btd,btf->df", act_ffn["x"], da, optimize=True)
+                    self._grads[f"W2_{i}"] = np.einsum("btd,btf->df", act_ffn["x"], db, optimize=True)
+
+                # dx_ffn_in: gradient flowing back to norm2
+                dx_ffn_in = np.einsum("btf,df->btd", da, W1, optimize=True) + np.einsum("btf,df->btd", db, W2, optimize=True)
                 self._stats['bw_ffn_compute'].append(time.time() - t_ffn_compute)
 
                 t_norm2 = time.time()
-                act_norm2, dx_norm2 = self._activations[f"norm2_{i}"], dx
+                act_norm2 = self._activations[f"norm2_{i}"]
                 norm2_w = self.get_w(p["norm2"])
-                if not self.use_lora: self._grads[f"norm2_{i}"] = np.einsum("btd,btd->d", dx_norm2, act_norm2["norm_x"], optimize=True)
-                term1 = dx_norm2 * norm2_w
-                dx = dx + (term1 - np.mean(term1 * act_norm2["norm_x"], axis=-1, keepdims=True) * act_norm2["norm_x"]) / act_norm2["rms"]
+                # Gradient for norm2 weight uses dx_ffn_in
+                if not self.use_lora:
+                    self._grads[f"norm2_{i}"] = np.einsum("btd,btd->d", dx_ffn_in, act_norm2["norm_x"], optimize=True)
+
+                # dx_norm2_in: gradient flowing through norm2 back to x
+                term1 = dx_ffn_in * norm2_w
+                dx_norm2_in = (term1 - np.mean(term1 * act_norm2["norm_x"], axis=-1, keepdims=True) * act_norm2["norm_x"]) / act_norm2["rms"]
+
+                # Update dx for residual: dL/dx_before_ffn = dL/dx_after_ffn + dL/dx_from_ffn_branch
+                dx = dy + dx_norm2_in
                 self._stats['bw_norm'].append(time.time() - t_norm2)
                 self._stats['bw_ffn'].append(time.time() - t_ffn)
 
+            # 2. Attention Residual Block Backward
+            # x_next = x + attn(norm1(x))
+
+            dy = dx # New gradient at the output of attention residual
+
             t_attn = time.time()
-            act_attn, dattn_out = self._activations[f"attn_{i}"], dx
+            act_attn = self._activations[f"attn_{i}"]
             W_o = self.get_w(p["W_o"], transpose=True)
 
             t_bw_attn_out = time.time()
-            if not self.use_lora: self._grads[f"W_o_{i}"] = np.einsum("btd,bth->dh", act_attn["weighted_v_merged"], dattn_out, optimize=True)
-            # Backward through Output Projection and Merge
-            d_weighted_v_merged = np.einsum("bth,dh->btd", dattn_out, W_o, optimize=True)
-            d_weighted_v = d_weighted_v_merged.reshape(dx.shape[0], dx.shape[1], c.n_heads, c.d_head).transpose(0, 2, 1, 3)
+            if not self.use_lora:
+                self._grads[f"W_o_{i}"] = np.einsum("btd,bth->dh", act_attn["weighted_v_merged"], dy, optimize=True)
+
+            # d_weighted_v_merged [B, T, D]
+            d_weighted_v_merged = np.einsum("bth,dh->btd", dy, W_o, optimize=True)
+            d_weighted_v = d_weighted_v_merged.reshape(dy.shape[0], dy.shape[1], c.n_heads, c.d_head).transpose(0, 2, 1, 3)
             self._stats['bw_attn_out'].append(time.time() - t_bw_attn_out)
 
             t_bw_attn_score = time.time()
-            # Backward through Attention Softmax and Weighted Sum
-            # dattn: [B, H, T, T]
             dattn = np.einsum("bhid,bhjd->bhij", d_weighted_v, act_attn["V_t"], optimize=True)
-
-            # Backward through Softmax
             dscores = act_attn["attn"] * (dattn - np.sum(dattn * act_attn["attn"], axis=-1, keepdims=True)) / np.sqrt(c.d_head)
             self._stats['bw_attn_score'].append(time.time() - t_bw_attn_score)
 
             t_bw_attn_qkv = time.time()
-            # Gradients for Q, K, V projections
             dQ_t = np.einsum("bhij,bhjd->bhid", dscores, act_attn["K_t"], optimize=True)
             dK_t_f = np.einsum("bhji,bhjd->bhid", dscores, act_attn["Q_t"], optimize=True)
             dV_t_f = np.einsum("bhij,bhid->bhjd", act_attn["attn"], d_weighted_v, optimize=True)
+
             groups = c.n_heads // c.n_kv_heads
-            dQ, dK = dQ_t.transpose(0, 2, 1, 3), dK_t_f.reshape(dx.shape[0], c.n_kv_heads, groups, -1, c.d_head).sum(2).transpose(0, 2, 1, 3)
-            dV = dV_t_f.reshape(dx.shape[0], c.n_kv_heads, groups, -1, c.d_head).sum(2).transpose(0, 2, 1, 3)
-            # Backward through RoPE
+            dQ, dK = dQ_t.transpose(0, 2, 1, 3), dK_t_f.reshape(dy.shape[0], c.n_kv_heads, groups, -1, c.d_head).sum(2).transpose(0, 2, 1, 3)
+            dV = dV_t_f.reshape(dy.shape[0], c.n_kv_heads, groups, -1, c.d_head).sum(2).transpose(0, 2, 1, 3)
+
             dQ = self._rope_backward(dQ, np.arange(dQ.shape[1]))
             dK = self._rope_backward(dK, np.arange(dK.shape[1]))
 
-            # Reshape gradients and apply clipping for numerical stability
-            dQf = np.clip(dQ.reshape(dx.shape[0], dx.shape[1], -1), -1.0, 1.0)
-            dKf = np.clip(dK.reshape(dx.shape[0], dx.shape[1], -1), -1.0, 1.0)
-            dVf = np.clip(dV.reshape(dx.shape[0], dx.shape[1], -1), -1.0, 1.0)
-            dQ_B = dV_B = None
+            dQf = dQ.reshape(dy.shape[0], dy.shape[1], -1)
+            dKf = dK.reshape(dy.shape[0], dy.shape[1], -1)
+            dVf = dV.reshape(dy.shape[0], dy.shape[1], -1)
+
             if self.use_lora:
                 if f"lora_q_{i}" in self._activations:
                     al = self._activations[f"lora_q_{i}"]
-                    self._grads[f"lora_B_q_{i}"], dQ_B = al["s"] * np.einsum("btr,bth->rh", al["xA"], dQf, optimize=True), np.einsum("bth,rh->btr", dQf, al["B"], optimize=True)
+                    self._grads[f"lora_B_q_{i}"] = al["s"] * np.einsum("btr,bth->rh", al["xA"], dQf, optimize=True)
+                    dQ_B = np.einsum("bth,rh->btr", dQf, al["B"], optimize=True)
                     self._grads[f"lora_A_q_{i}"] = al["s"] * np.einsum("btd,btr->dr", act_attn["x"], dQ_B, optimize=True)
                 if f"lora_v_{i}" in self._activations:
                     al = self._activations[f"lora_v_{i}"]
-                    self._grads[f"lora_B_v_{i}"], dV_B = al["s"] * np.einsum("btr,bth->rh", al["xA"], dVf, optimize=True), np.einsum("bth,rh->btr", dVf, al["B"], optimize=True)
+                    self._grads[f"lora_B_v_{i}"] = al["s"] * np.einsum("btr,bth->rh", al["xA"], dVf, optimize=True)
+                    dV_B = np.einsum("bth,rh->btr", dVf, al["B"], optimize=True)
                     self._grads[f"lora_A_v_{i}"] = al["s"] * np.einsum("btd,btr->dr", act_attn["x"], dV_B, optimize=True)
-            if not self.use_lora:
-                def compute_grad_w(t):
-                    return np.einsum("btd,bth->dh", act_attn["x"], t, optimize=True)
 
-                grad_futures = [self.executor.submit(compute_grad_w, t) for t in [dQf, dKf, dVf]]
-                self._grads[f"W_q_{i}"] = grad_futures[0].result()
-                self._grads[f"W_k_{i}"] = grad_futures[1].result()
-                self._grads[f"W_v_{i}"] = grad_futures[2].result()
+            if not self.use_lora:
+                self._grads[f"W_q_{i}"] = np.einsum("btd,bth->dh", act_attn["x"], dQf, optimize=True)
+                self._grads[f"W_k_{i}"] = np.einsum("btd,bth->dh", act_attn["x"], dKf, optimize=True)
+                self._grads[f"W_v_{i}"] = np.einsum("btd,bth->dh", act_attn["x"], dVf, optimize=True)
 
             W_q, W_k, W_v = [self.get_w(p[k], transpose=True) for k in ["W_q", "W_k", "W_v"]]
+            dx_attn_in = np.einsum("bth,dh->btd", dQf, W_q, optimize=True) + \
+                         np.einsum("bth,dh->btd", dKf, W_k, optimize=True) + \
+                         np.einsum("bth,dh->btd", dVf, W_v, optimize=True)
 
-            def compute_dx_term(t, W):
-                return np.einsum("bth,dh->btd", t, W, optimize=True)
-
-            dx_futures = [self.executor.submit(compute_dx_term, dQf, W_q),
-                          self.executor.submit(compute_dx_term, dKf, W_k),
-                          self.executor.submit(compute_dx_term, dVf, W_v)]
-            dx = dx + dx_futures[0].result() + dx_futures[1].result() + dx_futures[2].result()
-            if self.use_lora:
-                if dQ_B is not None: dx += self._activations[f"lora_q_{i}"]["s"] * np.einsum("btr,dr->btd", dQ_B, self._activations[f"lora_q_{i}"]["A"], optimize=True)
-                if dV_B is not None: dx += self._activations[f"lora_v_{i}"]["s"] * np.einsum("btr,dr->btd", dV_B, self._activations[f"lora_v_{i}"]["A"], optimize=True)
             self._stats['bw_attn_qkv'].append(time.time() - t_bw_attn_qkv)
 
             t_norm1 = time.time()
-            act_norm1, dx_norm1 = self._activations[f"norm1_{i}"], dx
+            act_norm1 = self._activations[f"norm1_{i}"]
             norm1_w = self.get_w(p["norm1"])
-            if not self.use_lora: self._grads[f"norm1_{i}"] = np.einsum("btd,btd->d", dx_norm1, act_norm1["norm_x"], optimize=True)
-            term1 = dx_norm1 * norm1_w
-            dx = dx + (term1 - np.mean(term1 * act_norm1["norm_x"], axis=-1, keepdims=True) * act_norm1["norm_x"]) / act_norm1["rms"]
+            if not self.use_lora:
+                self._grads[f"norm1_{i}"] = np.einsum("btd,btd->d", dx_attn_in, act_norm1["norm_x"], optimize=True)
+
+            term1 = dx_attn_in * norm1_w
+            dx_norm1_in = (term1 - np.mean(term1 * act_norm1["norm_x"], axis=-1, keepdims=True) * act_norm1["norm_x"]) / act_norm1["rms"]
+
+            # Final dx for this layer (gradient w.r.t layer input)
+            dx = dy + dx_norm1_in
             self._stats['bw_norm'].append(time.time() - t_norm1)
             self._stats['bw_attn'].append(time.time() - t_attn)
             self._stats['bw_layers'].append(time.time() - t_layer_start)
@@ -1245,9 +1233,7 @@ class EinsumTransformer:
 
     def speculative_generate(self, tokens, k=4):
         """
-        Implementation of speculative decoding.
-        A smaller 'draft' model (first few layers of the current model) predicts k tokens,
-        which are then verified in parallel by the full 'target' model.
+        Implementation of speculative decoding with per-sequence batch acceptance.
         """
         print(f"[INFO] Starting speculative decoding (k={k}, draft_layers={self.cfg.draft_layers})...")
         self.clear_cache()
@@ -1256,89 +1242,84 @@ class EinsumTransformer:
         B = tokens.shape[0]
         
         t0 = time.time()
-        # 1. Prefill: Process initial prompt tokens in target model
+        # 1. Prefill
         logits = self.forward(tokens, inference=True, verbose=True)
 
-        # 2. Seed draft model KV cache from target model to avoid redundant prefill
+        # 2. Seed draft model
         for i in range(self.cfg.draft_layers):
-            draft_model.cache[i]["K"] = self.cache[i]["K"]
-            draft_model.cache[i]["V"] = self.cache[i]["V"]
+            if self.cache[i]["K"] is not None:
+                # Copy current cache state to draft
+                draft_model.cache[i]["K"] = self.cache[i]["K"].copy()
+                draft_model.cache[i]["V"] = self.cache[i]["V"].copy()
         draft_model.cur_pos = self.cur_pos
         
-        # 2. Sample the first token after the prompt
         next_token = self.sample_top_k(logits, k=self.cfg.top_k_sample, temperature=self.cfg.temperature)
         ttft = time.time() - t0
 
-        generated = [next_token]
+        generated_batches = [next_token] # List of (B,) arrays
         print(f"\n Decoding Stage")
         print(f"=================")
         print(f"[STREAM] {self.detokenize([next_token[0]])[0]}", end="", flush=True)
 
         t_decode_start = time.time()
-        # 3. Speculative loop: Iterate until max_new_tokens is reached
-        while len(generated) < self.cfg.max_new_tokens:
-            # a. Draft predicts k speculative tokens sequentially
-            d_tokens = []
-            draft_input = generated[-1][:, None]
+        while len(generated_batches) < self.cfg.max_new_tokens:
+            # a. Draft predicts k tokens
+            d_tokens_batches = [] # List of k arrays of shape (B,)
+            draft_input = generated_batches[-1][:, None]
             for _ in range(k):
                 d_logits = draft_model.forward(draft_input, inference=True, verbose=False)
                 d_tok = self.sample_top_k(d_logits, k=self.cfg.top_k_sample, temperature=self.cfg.temperature)
-                d_tokens.append(d_tok)
+                d_tokens_batches.append(d_tok)
                 draft_input = d_tok[:, None]
 
-            # b. Target verifies all k draft tokens + current token in a single parallel pass.
-            # v_input[j] will predict the token for d_tokens[j].
-            # v_input[k] (the last draft token) will predict a "bonus" token.
-            v_input = np.stack([generated[-1]] + d_tokens, axis=1) # Shape (B, k+1)
+            # b. Target verifies
+            v_input = np.stack([generated_batches[-1]] + d_tokens_batches, axis=1) # (B, k+1)
             v_logits = self.forward(v_input, inference=True, verbose=False)
 
-            # c. Verify draft tokens against target model predictions
-            n_accepted = 0
-            next_toks = None
-            for j in range(k):
-                # Sample the target model's prediction for the token at d_tokens[j] position
-                target_toks = self.sample_top_k(v_logits[:, j:j+1, :], k=self.cfg.top_k_sample, temperature=self.cfg.temperature)
+            # c. Per-sequence verification
+            accepted_counts = np.zeros(B, dtype=int)
 
-                # In batched mode, we only accept if ALL batches matched for this step
-                # to keep KV caches aligned across the batch.
-                if np.array_equal(target_toks, d_tokens[j]):
-                    # Draft was correct!
-                    generated.append(d_tokens[j])
-                    print(self.detokenize([d_tokens[j][0]])[0], end="", flush=True)
-                    n_accepted += 1
-                else:
-                    # Mismatch. Accept the target's correction and stop verification.
-                    generated.append(target_toks)
-                    print(f"[{self.detokenize([target_toks[0]])[0]}]", end="", flush=True)
-                    next_toks = target_toks
-                    break
+            # Samples for all verification positions
+            target_samples = []
+            for j in range(k + 1):
+                target_samples.append(self.sample_top_k(v_logits[:, j:j+1, :], k=self.cfg.top_k_sample, temperature=self.cfg.temperature))
+            target_samples = np.stack(target_samples, axis=1) # (B, k+1)
 
-            # If all were accepted, we get a bonus token from the last logit position
-            if n_accepted == k:
-                next_toks = self.sample_top_k(v_logits[:, k:k+1, :], k=self.cfg.top_k_sample, temperature=self.cfg.temperature)
-                generated.append(next_toks)
-                print(self.detokenize([next_toks[0]])[0], end="", flush=True)
+            for b in range(B):
+                for j in range(k):
+                    if target_samples[b, j] == d_tokens_batches[j][b]:
+                        accepted_counts[b] += 1
+                    else:
+                        break
 
-            # d. Rollback target model KV cache
-            # We processed 'k+1' tokens as input.
-            # If all accepted + bonus: n_accepted=k. generated grew by k+1. cache grew by k+1.
-            # We want to keep all k+1 processed inputs in cache. n_to_keep = k+1.
-            # If n_accepted < k: we stopped at j. we accepted d_tokens[0...j-1] and correction for d_tokens[j].
-            # Total new tokens in generated: j+1. New tokens in cache to keep: j+1 (v_input[0...j]).
-            n_to_keep = n_accepted + 1
-            n_target_rollback = (k + 1) - n_to_keep
-            if n_target_rollback > 0:
-                for layer in self.cache:
-                    if layer["K"] is not None:
-                        layer["K"] = layer["K"][:, :, :-n_target_rollback, :]
-                        layer["V"] = layer["V"][:, :, :-n_target_rollback, :]
-                self.cur_pos -= n_target_rollback
+            # To keep things simple in our NumPy "glass box", if B > 1 we roll back to the MINIMUM
+            # accepted across the batch to keep sequences aligned in the same tensor.
+            min_accepted = np.min(accepted_counts)
 
-            # e. Synchronize draft model state with target model
-            # This ensures both models are aligned for the next speculative step.
+            for j in range(min_accepted):
+                generated_batches.append(d_tokens_batches[j])
+                print(self.detokenize([d_tokens_batches[j][0]])[0], end="", flush=True)
+
+            # Correction token for the batch at min_accepted position
+            batch_next = target_samples[:, min_accepted]
+            generated_batches.append(batch_next)
+            if min_accepted < k:
+                print(f"[{self.detokenize([batch_next[0]])[0]}]", end="", flush=True)
+            else:
+                print(self.detokenize([batch_next[0]])[0], end="", flush=True)
+
+            # d. Rollback target cache
+            n_to_keep = min_accepted + 1
+            n_rollback = (k + 1) - n_to_keep
+            if n_rollback > 0:
+                self.cur_pos -= n_rollback
+                # Cache contents will be overwritten in next step
+
+            # e. Sync draft model
             for l in range(self.cfg.draft_layers):
-                draft_model.cache[l]["K"] = self.cache[l]["K"]
-                draft_model.cache[l]["V"] = self.cache[l]["V"]
+                if self.cache[l]["K"] is not None:
+                    draft_model.cache[l]["K"] = self.cache[l]["K"].copy()
+                    draft_model.cache[l]["V"] = self.cache[l]["V"].copy()
             draft_model.cur_pos = self.cur_pos
 
         t_decode_end = time.time()
@@ -1438,6 +1419,10 @@ class EinsumTransformer:
         self._log("="*50 + "\n")
 
     def merge_lora_weights(self):
+        """
+        Merge LoRA adapters into the base weights.
+        This is typically done after training for efficient inference.
+        """
         if not self.use_lora: return
         print("[INFO] Merging LoRA adapters...")
         c = self.cfg
@@ -1445,11 +1430,15 @@ class EinsumTransformer:
         for i in range(c.n_layers):
             p = self.layer_weights[i]
             for k in ["q", "v"]:
-                if p.get(f"lora_A_{k}"):
+                lora_a_key = f"lora_A_{k}"
+                if p.get(lora_a_key):
                     W_name = p[f"W_{k}"]
-                    A, B = self.weights[p[f"lora_A_{k}"]], self.weights[p[f"lora_B_{k}"]]
+                    A, B = self.weights[p[lora_a_key]], self.weights[p[f"lora_B_{k}"]]
+                    # W_base is (out, in). (A @ B).T is (in, out).T -> (out, in).
                     self.weights[W_name] = self.weights[W_name] + scale * (A @ B).T
         self.use_lora = False
+        # Clear weight cache after merge as base weights have changed
+        self._weight_cache.clear()
         print("[INFO] LoRA merge complete (LoRA disabled after merge).")
 
 
@@ -1458,52 +1447,6 @@ class EinsumOptimizer:
         self.model, self.lr, self.grad_clip = model, lr, grad_clip
 
     def step(self):
-        """
-        Optimizer step: Apply gradient descent to update all model weights.
-        HIGH-LEVEL FLOW:
-        ================
-        1. Embedding Update:
-           - E = E - lr * dE
-        
-        2. For each layer (0 to N-1):
-           a. Attention Weight Updates:
-              - W_q = W_q - lr * dW_q^T  [Transpose to match safetensors (out, in) format]
-              - W_k = W_k - lr * dW_k^T
-              - W_v = W_v - lr * dW_v^T
-              - W_o = W_o - lr * dW_o^T
-           b. Normalization Weight Updates:
-              - norm1 = norm1 - lr * d_norm1  [Element-wise, no transpose]
-              - norm2 = norm2 - lr * d_norm2
-           c. FFN Weight Updates:
-              - W1 = W1 - lr * dW1^T  [Transpose to match safetensors format]
-              - W2 = W2 - lr * dW2^T
-              - W3 = W3 - lr * dW3^T
-        
-        GRADIENT DESCENT OPERATION:
-        ===========================
-        Basic SGD update rule:
-          W_new = W_old - learning_rate * gradient
-        
-        TRANSPOSE RATIONALE:
-        ====================
-        - Gradients are computed in (in_features, out_features) based on einsum notation
-        - Safetensors stores weights as (out_features, in_features)
-        - We apply .T to gradients before subtraction to match weight tensor shape
-        - Exception: Normalization weights are 1D vectors, no transpose needed
-        
-        EINSUM INTERPRETATION:
-        ======================
-        While no explicit einsum is used in weight updates, the operation is:
-          W[i,j] = W[i,j] - lr * dW[i,j]  (element-wise subtraction)
-        
-        This could be expressed as einsum('ij,ij->ij', W, ones) - lr * dW,
-        but direct array subtraction is more efficient.
-        
-        WEIGHT PERSISTENCE:
-        ===================
-        Updates are applied in-place to LazyWeightManager.cache, enabling
-        iterative training without reloading weights from disk.
-        """
         m, g, lr = self.model, self.model._grads, self.lr
         t0 = time.time()
 
