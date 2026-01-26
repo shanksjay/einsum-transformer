@@ -841,6 +841,43 @@ class EinsumTransformer:
         return out / self.cfg.top_k
 
     def forward(self, tokens, inference=False, verbose=True, training=False, max_layers=None):
+        """
+        Forward pass of the Transformer using pure einsum notation.
+
+        HIGH-LEVEL FLOW:
+        ================
+        1. Embedding Lookup: tokens -> x via E[tokens]
+        2. For each layer (N layers):
+           a. Pre-Norm 1: x -> x_norm1 via RMSNorm
+           b. Multi-Head Attention (with GQA/MQA support):
+              - QKV Projections: x_norm1 @ W_q/W_k/W_v -> Q, K, V
+              - RoPE: Apply rotary positional embeddings to Q, K
+              - Attention Scores: Q @ K^T / sqrt(d_head) -> scores
+              - Causal Masking: scores * mask
+              - Softmax: exp(scores) / sum(exp(scores)) -> attn
+              - Weighted Aggregation: attn @ V -> weighted_v
+              - Output Projection: weighted_v @ W_o -> attn_out
+           c. Residual Connection: x = x + attn_out
+           d. Pre-Norm 2: x -> x_norm2 via RMSNorm
+           e. Feed-Forward Network (SwiGLU):
+              - Gate: x_norm2 @ W1 -> a
+              - Up: x_norm2 @ W2 -> b
+              - Activation: a * swish(b) -> gated
+              - Down: gated @ W3 -> ffn_out
+           f. Residual Connection: x = x + ffn_out
+        3. Output Head: x @ E^T -> logits
+
+        KEY EINSUM OPERATIONS:
+        ======================
+        Embedding:        E[tokens] -> (B, T, D)
+        QKV Projection:   einsum('btd,dh->bth', x, W_q) -> Q  [B=batch, T=seq, D=d_model, H=n_heads*d_head]
+        Attention Scores: einsum('bhid,bhjd->bhij', Q_t, K_t) -> scores  [h=heads, i,j=positions]
+        Attention Output: einsum('bhij,bhjd->bhid', attn, V_t) -> weighted_v
+        Output Proj:      einsum('btd,dh->bth', weighted_v_merged, W_o) -> attn_out
+        SwiGLU Gate:      einsum('btd,df->btf', x, W1) -> a  [f=d_ff]
+        SwiGLU Down:      einsum('btf,fd->btd', gated, W3) -> ffn_out
+        Output Head:      einsum('btd,vd->btv', x, E) -> logits  [v=vocab_size]
+        """
         self.verbose, self.training = verbose, training
         if not hasattr(self, '_stats'): self._init_stats()
 
@@ -853,6 +890,19 @@ class EinsumTransformer:
         is_decode = inference and any(c["K"] is not None for c in self.cache)
         if inference and not is_decode: self.cur_pos = 0
         t_stage_start = time.time()
+
+        c = self.cfg
+        if self.verbose and not is_decode:
+            self._log("\n" + "="*50)
+            self._log(f"MODEL PROFILING: {c.arch.upper()} {'(TRAINING)' if training else ''}")
+            self._log(f"Input Dimension:  {tokens.shape}")
+            self._log(f"Hidden Dimension: {c.d_model}")
+            self._log(f"Output Dimension: {c.vocab_size}")
+            self._log(f"Layers:           {c.n_layers}")
+            self._log(f"Max Context Len:  {c.seq_len}")
+            self._log("="*50)
+            self._log("[INFO] Starting forward pass...")
+
         t_embed = time.time()
         E = self.get_w(self.E_name)
         x = E[tokens]
@@ -921,8 +971,84 @@ class EinsumTransformer:
 
     def backward(self, d_logits):
         """
-        Implementation of the backward pass (Backpropagation Through Time).
-        Computes gradients for all parameters and activations.
+        Backward pass computing all gradients using pure einsum notation.
+
+        HIGH-LEVEL FLOW:
+        ================
+        1. Output Head Backward:
+           - Compute dx from d_logits and E
+           - Compute dE (embedding gradient) from d_logits and final_x
+
+        2. For each layer (N-1 to 0, reverse order):
+           a. FFN Backward (SwiGLU):
+              - Backprop through W3 projection
+              - Backprop through SwiGLU activation (gate * swish derivative)
+              - Compute dW3, dW1, dW2 gradients
+              - Compute dx contribution from FFN
+           b. Norm2 Backward:
+              - Compute d_norm2 (RMSNorm weight gradient)
+              - Backprop through RMSNorm (mean-centered gradient normalization)
+              - Accumulate dx from FFN residual path
+           c. Attention Backward:
+              - Backprop through W_o projection
+              - Backprop through attention output aggregation
+              - Backprop through Softmax (Jacobian: attn * (d_attn - sum(d_attn * attn)))
+              - Backprop through attention scores (QK^T / sqrt(d_head))
+              - Handle GQA: sum gradients across query groups for K and V
+              - Backprop through RoPE (inverse rotation via transpose)
+              - Backprop through QKV projections
+              - Compute dW_q, dW_k, dW_v, dW_o gradients
+              - Compute dx contribution from attention
+           d. Norm1 Backward:
+              - Compute d_norm1 gradient
+              - Backprop through RMSNorm
+              - Accumulate dx from attention residual path
+
+        3. Embedding Backward:
+           - Accumulate dE from token lookup indices
+
+        KEY EINSUM OPERATIONS (BACKWARD):
+        =================================
+        Output Head:
+          dx = einsum('btv,vd->btd', d_logits, E)
+          dE = einsum('btv,btd->vd', d_logits, final_x)
+
+        FFN (SwiGLU):
+          dW3 = einsum('btf,btd->fd', gated, dffn_out)
+          dgated = einsum('btd,fd->btf', dffn_out, W3)
+          dW1 = einsum('btd,btf->df', x, da)  [da = dgated * swish(b)]
+          dW2 = einsum('btd,btf->df', x, db)  [db = dgated * a * swish'(b)]
+          dx += einsum('btf,df->btd', da, W1) + einsum('btf,df->btd', db, W2)
+
+        RMSNorm:
+          d_norm = einsum('btd,btd->d', dx_norm, norm_x)  [norm_x = x / rms]
+          dx = (w / rms) * (dx_norm - mean(dx_norm * norm_x) * norm_x)
+
+        Attention:
+          dW_o = einsum('btd,bth->dh', weighted_v_merged, dattn_out)
+          dweighted_merged = einsum('bth,dh->btd', dattn_out, W_o)
+          dattn = einsum('bhid,bhjd->bhij', dweighted, V_t)
+          dscores = attn * (dattn - sum(dattn * attn, axis=-1))
+          dQ_t = einsum('bhij,bhjd->bhid', dscores, K_t)
+          dK_t_full = einsum('bhji,bhjd->bhid', dscores, Q_t)
+          dV_t_full = einsum('bhij,bhid->bhjd', attn, dweighted)
+          # GQA: sum across groups
+          dK_t = dK_t_full.reshape(...).sum(axis=group_dim)
+          dV_t = dV_t_full.reshape(...).sum(axis=group_dim)
+          # RoPE inverse
+          dQ, dK = rope_backward(dQ_t), rope_backward(dK_t)
+          dW_q = einsum('btd,bth->dh', x, dQ.reshape(...))
+          dW_k = einsum('btd,bth->dh', x, dK.reshape(...))
+          dW_v = einsum('btd,bth->dh', x, dV.reshape(...))
+          dx += einsum('bth,dh->btd', dQ, W_q) + einsum('bth,dh->btd', dK, W_k) + einsum('bth,dh->btd', dV, W_v)
+
+        GRADIENTS COMPUTED:
+        ===================
+        - E: Embedding weight gradient (vocab_size, d_model)
+        - Per-layer:
+          * W_q, W_k, W_v, W_o: Attention weight gradients (d_model, d_model)
+          * norm1, norm2: RMSNorm weight gradients (d_model,)
+          * W1, W2, W3: FFN weight gradients (d_model, d_ff) or (d_ff, d_model)
         """
         t_total = time.time()
 

@@ -13,7 +13,7 @@
   "use_mqa": false,
   "use_moe": false,
   "// 3": "Runtime & Memory",
-  "batch_size": 4,
+  "batch_size": 1,
   "seq_len": 128,
   "block_size": 16,
   "weight_dtype": "bfloat16",
