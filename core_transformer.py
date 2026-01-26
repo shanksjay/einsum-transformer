@@ -3,8 +3,10 @@ import numpy as np
 import os
 import time
 import copy
+import threading
 from pathlib import Path
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from safetensors.numpy import load_file
 from safetensors import safe_open
 try:
@@ -15,6 +17,12 @@ except ImportError:
 
 class TransformerConfig:
     def __init__(self, cfg):
+        # Basic input validation
+        required_keys = ["batch_size", "seq_len", "vocab_size", "d_model", "n_heads", "d_ff", "n_layers"]
+        for k in required_keys:
+            if k not in cfg:
+                raise ValueError(f"Missing required config key: {k}")
+
         self.arch = cfg.get("arch", "custom")
         self.batch_size = cfg["batch_size"]
         self.seq_len = cfg["seq_len"]
@@ -85,6 +93,7 @@ class TransformerConfig:
 class LazyWeightManager:
     def __init__(self, weight_paths, target_dtype="float32", max_cache_size=32):
         self.handles = {}
+        self.lock = threading.Lock()
         self.tensor_to_shard = {}
         self.target_dtype = target_dtype
         self.max_cache_size = max_cache_size
@@ -103,14 +112,15 @@ class LazyWeightManager:
                 self.tensor_to_shard[key] = path
 
     def __getitem__(self, key):
-        if key in self.persistent_cache:
-            return self.persistent_cache[key]
+        with self.lock:
+            if key in self.persistent_cache:
+                return self.persistent_cache[key]
 
-        if key in self.cache:
-            # Move to end (LRU)
-            val = self.cache.pop(key)
-            self.cache[key] = val
-            return val
+            if key in self.cache:
+                # Move to end (LRU)
+                val = self.cache.pop(key)
+                self.cache[key] = val
+                return val
         
         if key not in self.tensor_to_shard:
             raise KeyError(f"Tensor {key} not found in any shard.")
@@ -141,23 +151,22 @@ class LazyWeightManager:
         else:
             res = data.astype(np.float32)
             
-        self.cache[key] = res
-        # Evict if necessary
-        if self.max_cache_size and len(self.cache) > self.max_cache_size:
-            self.cache.popitem(last=False)
+        with self.lock:
+            self.cache[key] = res
+            # Evict if necessary
+            if self.max_cache_size and len(self.cache) > self.max_cache_size:
+                self.cache.popitem(last=False)
         return res
 
     def __setitem__(self, key, value):
-        # If not backed by a shard, store in persistent cache to avoid eviction
-        if key not in self.tensor_to_shard:
+        with self.lock:
+            # Store modified or new weights in persistent cache to avoid eviction
+            # and ensure training updates are preserved.
             self.persistent_cache[key] = value
-            return
 
-        if key in self.cache:
-            self.cache.pop(key)
-        self.cache[key] = value
-        if self.max_cache_size and len(self.cache) > self.max_cache_size:
-            self.cache.popitem(last=False)
+            # If it was in the LRU cache, remove it as it's now in persistent
+            if key in self.cache:
+                del self.cache[key]
 
     def purge_cache(self):
         print(f"[INFO] Purging weight cache ({len(self.cache)} tensors removed)")
@@ -212,6 +221,7 @@ class EinsumTransformer:
         self._activations = {}
         self._grads = {}
         self.training = False
+        self.executor = ThreadPoolExecutor(max_workers=os.cpu_count() or 4)
         # LoRA configuration defaults
         self.use_lora = getattr(self.cfg, "use_lora", False)
         self.lora_rank = getattr(self.cfg, "lora_rank", 4)
@@ -302,6 +312,7 @@ class EinsumTransformer:
         self.weights = LazyWeightManager(weight_paths, target_dtype=self.cfg.weight_dtype)
         self._init_lora_weights()
         self._bind_weights()
+        self._adjust_cache_size()
         self._validate_loaded_shapes()
         self._print_per_layer_dtype_breakdown()
 
@@ -540,6 +551,28 @@ class EinsumTransformer:
                     layer["lora_A_v"], layer["lora_B_v"] = f"lora_A_v_{i}", f"lora_B_v_{i}"
             self.layer_weights.append(layer)
 
+    def _adjust_cache_size(self):
+        """Adjust the weight manager's cache size based on the model's total number of tensors."""
+        if not isinstance(self.weights, LazyWeightManager):
+            return
+
+        # Count all unique weight names assigned to layers
+        weight_names = {self.E_name}
+        for layer in self.layer_weights:
+            for k, v in layer.items():
+                if v is None: continue
+                if k == "experts":
+                    for exp in v:
+                        for ek, ev in exp.items():
+                            weight_names.add(ev)
+                else:
+                    weight_names.add(v)
+
+        # Set max_cache_size to cover all tensors plus a small buffer
+        new_size = len(weight_names) + 20
+        print(f"[INFO] Adjusting LazyWeightManager max_cache_size: {self.weights.max_cache_size} -> {new_size}")
+        self.weights.max_cache_size = new_size
+
     def _validate_loaded_shapes(self):
         c = self.cfg
         errs = []
@@ -622,8 +655,13 @@ class EinsumTransformer:
 
     def swiglu(self, x, W1, W2, W3, key=None):
         t0 = time.time()
-        a = np.einsum("btd,df->btf", x, W1, optimize=True)
-        b = np.einsum("btd,df->btf", x, W2, optimize=True)
+
+        def proj(mat):
+            return np.einsum("btd,df->btf", x, mat, optimize=True)
+
+        futures = [self.executor.submit(proj, W1), self.executor.submit(proj, W2)]
+        a = futures[0].result()
+        b = futures[1].result()
 
         # Numerical stable sigmoid to avoid overflow in np.exp
         # We use a piecewise approach to avoid evaluating np.exp on values that would overflow
@@ -665,35 +703,54 @@ class EinsumTransformer:
     def attention(self, x, layer_idx, inference=False):
         t0 = time.time()
         c, p = self.cfg, self.layer_weights[layer_idx]
-        t_load = time.time()
-        W_q, W_k, W_v, W_o = [self.get_w(p[k], transpose=True) for k in ["W_q", "W_k", "W_v", "W_o"]]
-        lora_q = lora_v = None
-        if self.use_lora:
-            scale = self.lora_alpha / self.lora_rank
-            if p.get("lora_A_q") is not None:
-                lora_q = (self.get_w(p["lora_A_q"]), self.get_w(p["lora_B_q"]), scale)
-            if p.get("lora_A_v") is not None:
-                lora_v = (self.get_w(p["lora_A_v"]), self.get_w(p["lora_B_v"]), scale)
-        self._stats['attn_load'].append(time.time() - t_load)
-        
-        t_qkv = time.time()
         B, T = x.shape[0], x.shape[1]
-        Q_proj = np.einsum("btd,dh->bth", x, W_q, optimize=True)
-        if lora_q:
-            A, Bl, s = lora_q
-            xA = np.einsum("btd,dr->btr", x, A, optimize=True)
-            Q_proj += s * np.einsum("btr,rh->bth", xA, Bl, optimize=True)
-            if self.training: self._activations[f"lora_q_{layer_idx}"] = {"xA": xA, "A": A, "B": Bl, "s": s}
-        Q = Q_proj.reshape(B, T, c.n_heads, c.d_head)
-        K = np.einsum("btd,dh->bth", x, W_k, optimize=True).reshape(B, T, c.n_kv_heads, c.d_head)
-        V_proj = np.einsum("btd,dh->bth", x, W_v, optimize=True)
-        if lora_v:
-            A, Bl, s = lora_v
-            xA = np.einsum("btd,dr->btr", x, A, optimize=True)
-            V_proj += s * np.einsum("btr,rh->bth", xA, Bl, optimize=True)
-            if self.training: self._activations[f"lora_v_{layer_idx}"] = {"xA": xA, "A": A, "B": Bl, "s": s}
-        V = V_proj.reshape(B, T, c.n_kv_heads, c.d_head)
-        self._stats['attn_qkv'].append(time.time() - t_qkv)
+
+        def compute_proj(name_key):
+            t_l = time.time()
+            W = self.get_w(p[name_key], transpose=True)
+            t_load_weight = time.time() - t_l
+
+            t_p = time.time()
+            proj = np.einsum("btd,dh->bth", x, W, optimize=True)
+
+            # Handle LoRA if applicable
+            lora_act = None
+            if self.use_lora:
+                lora_a_key = f"lora_A_{name_key[2:]}" # e.g. W_q -> lora_A_q
+                lora_b_key = f"lora_B_{name_key[2:]}"
+                if p.get(lora_a_key):
+                    scale = self.lora_alpha / self.lora_rank
+                    A, Bl = self.get_w(p[lora_a_key]), self.get_w(p[lora_b_key])
+                    xA = np.einsum("btd,dr->btr", x, A, optimize=True)
+                    proj += scale * np.einsum("btr,rh->bth", xA, Bl, optimize=True)
+                    if self.training:
+                        lora_act = {"xA": xA, "A": A, "B": Bl, "s": scale}
+
+            t_proj_time = time.time() - t_p
+            return name_key, proj, lora_act, t_load_weight, t_proj_time
+
+        # Run Q, K, V projections in parallel
+        futures = [self.executor.submit(compute_proj, k) for k in ["W_q", "W_k", "W_v"]]
+
+        results = {}
+        t_load_sum = 0
+        t_qkv_sum = 0
+        for future in as_completed(futures):
+            name_key, proj, lora_act, t_lw, t_pt = future.result()
+            results[name_key] = proj
+            if lora_act and self.training:
+                self._activations[f"lora_{name_key[2:]}_{layer_idx}"] = lora_act
+            t_load_sum += t_lw
+            t_qkv_sum += t_pt
+
+        self._stats['attn_load'].append(t_load_sum / 3.0) # Average or total? Usually stats are for the critical path
+        self._stats['attn_qkv'].append(t_qkv_sum / 3.0)
+
+        W_o = self.get_w(p["W_o"], transpose=True)
+
+        Q = results["W_q"].reshape(B, T, c.n_heads, c.d_head)
+        K = results["W_k"].reshape(B, T, c.n_kv_heads, c.d_head)
+        V = results["W_v"].reshape(B, T, c.n_kv_heads, c.d_head)
 
         if c.use_mqa or c.use_gqa:
             repeats = c.n_heads // c.n_kv_heads
@@ -759,12 +816,24 @@ class EinsumTransformer:
         gate_logits = np.einsum("btd,df->btf", x, self.get_w(p["gate"], transpose=True), optimize=True)
         top_indices = np.argsort(gate_logits, axis=-1)[..., -self.cfg.top_k:]
         out = np.zeros_like(x)
+
+        def run_expert(e, b_idx, t_idx):
+            # Pre-fetch weights in worker (safetensors handle is thread-safe, but OrderedDict cache is not)
+            # Actually, to be safe and avoid OrderedDict contention, we'll pre-fetch in main thread if possible,
+            # but here we'll just use the weights.
+            W1, W2, W3 = [self.get_w(p["experts"][e][k], transpose=True) for k in ["W1", "W2", "W3"]]
+            return e, b_idx, t_idx, self.swiglu(x[b_idx, t_idx][None, :, :], W1, W2, W3)
+
+        futures = []
         for e in range(self.cfg.num_experts):
             b_idx, t_idx, k_idx = np.where(top_indices == e)
             if len(b_idx) == 0: continue
-            W1, W2, W3 = [self.get_w(p["experts"][e][k], transpose=True) for k in ["W1", "W2", "W3"]]
-            res_expert = self.swiglu(x[b_idx, t_idx][None, :, :], W1, W2, W3)
+            futures.append(self.executor.submit(run_expert, e, b_idx, t_idx))
+
+        for future in as_completed(futures):
+            e, b_idx, t_idx, res_expert = future.result()
             out[b_idx, t_idx] += res_expert[0]
+
         self._stats['ffn'].append(time.time() - t0)
         return out / self.cfg.top_k
 
@@ -945,9 +1014,23 @@ class EinsumTransformer:
                     self._grads[f"lora_B_v_{i}"], dV_B = al["s"] * np.einsum("btr,bth->rh", al["xA"], dVf, optimize=True), np.einsum("bth,rh->btr", dVf, al["B"], optimize=True)
                     self._grads[f"lora_A_v_{i}"] = al["s"] * np.einsum("btd,btr->dr", act_attn["x"], dV_B, optimize=True)
             if not self.use_lora:
-                self._grads[f"W_q_{i}"], self._grads[f"W_k_{i}"], self._grads[f"W_v_{i}"] = [np.einsum("btd,bth->dh", act_attn["x"], t, optimize=True) for t in [dQf, dKf, dVf]]
+                def compute_grad_w(t):
+                    return np.einsum("btd,bth->dh", act_attn["x"], t, optimize=True)
+
+                grad_futures = [self.executor.submit(compute_grad_w, t) for t in [dQf, dKf, dVf]]
+                self._grads[f"W_q_{i}"] = grad_futures[0].result()
+                self._grads[f"W_k_{i}"] = grad_futures[1].result()
+                self._grads[f"W_v_{i}"] = grad_futures[2].result()
+
             W_q, W_k, W_v = [self.get_w(p[k], transpose=True) for k in ["W_q", "W_k", "W_v"]]
-            dx = dx + np.einsum("bth,dh->btd", dQf, W_q, optimize=True) + np.einsum("bth,dh->btd", dKf, W_k, optimize=True) + np.einsum("bth,dh->btd", dVf, W_v, optimize=True)
+
+            def compute_dx_term(t, W):
+                return np.einsum("bth,dh->btd", t, W, optimize=True)
+
+            dx_futures = [self.executor.submit(compute_dx_term, dQf, W_q),
+                          self.executor.submit(compute_dx_term, dKf, W_k),
+                          self.executor.submit(compute_dx_term, dVf, W_v)]
+            dx = dx + dx_futures[0].result() + dx_futures[1].result() + dx_futures[2].result()
             if self.use_lora:
                 if dQ_B is not None: dx += self._activations[f"lora_q_{i}"]["s"] * np.einsum("btr,dr->btd", dQ_B, self._activations[f"lora_q_{i}"]["A"], optimize=True)
                 if dV_B is not None: dx += self._activations[f"lora_v_{i}"]["s"] * np.einsum("btr,dr->btd", dV_B, self._activations[f"lora_v_{i}"]["A"], optimize=True)
@@ -1055,16 +1138,16 @@ class EinsumTransformer:
                 d_tokens.append(d_tok)
                 draft_input = np.full((1, 1), d_tok)
 
-            # b. Target verifies all k tokens in a single parallel forward pass
-            # We feed the last confirmed token plus k-1 draft tokens.
-            # v_logits[i] will be the prediction for v_input[i].
-            v_input = np.array([generated[-1]] + d_tokens[:-1]).reshape(1, -1)
+            # b. Target verifies all k draft tokens + current token in a single parallel pass.
+            # v_input[j] will predict the token for d_tokens[j].
+            # v_input[k] (the last draft token) will predict a "bonus" token.
+            v_input = np.array([generated[-1]] + d_tokens).reshape(1, -1)
             v_logits = self.forward(v_input, inference=True, verbose=False)
 
             # c. Verify draft tokens against target model predictions
             n_accepted = 0
             for j in range(k):
-                # Sample the target model's prediction for the current position
+                # Sample the target model's prediction for the token at d_tokens[j] position
                 target_tok = self.sample_top_k(v_logits[:, j:j+1, :], k=self.cfg.top_k_sample, temperature=self.cfg.temperature)[0]
 
                 if target_tok == d_tokens[j]:
@@ -1078,19 +1161,26 @@ class EinsumTransformer:
                     print(f"[{self.detokenize([target_tok])[0]}]", end="", flush=True)
                     break
 
+            # If all were accepted, we get a bonus token from the last logit position
+            if n_accepted == k:
+                bonus_tok = self.sample_top_k(v_logits[:, k:k+1, :], k=self.cfg.top_k_sample, temperature=self.cfg.temperature)[0]
+                generated.append(bonus_tok)
+                print(self.detokenize([bonus_tok])[0], end="", flush=True)
+
             # d. Rollback target model KV cache
-            # We processed 'k' tokens as input, but we only want to keep those that were confirmed
-            # (n_accepted) plus the one that produced the correction (1).
-            # If all were accepted, we keep all 'k' processed inputs.
-            if n_accepted < k:
-                n_to_keep = n_accepted + 1
-                n_target_rollback = k - n_to_keep
-                if n_target_rollback > 0:
-                    for layer in self.cache:
-                        if layer["K"] is not None:
-                            layer["K"] = layer["K"][:, :, :-n_target_rollback, :]
-                            layer["V"] = layer["V"][:, :, :-n_target_rollback, :]
-                    self.cur_pos -= n_target_rollback
+            # We processed 'k+1' tokens as input.
+            # If all accepted + bonus: n_accepted=k. generated grew by k+1. cache grew by k+1.
+            # We want to keep all k+1 processed inputs in cache. n_to_keep = k+1.
+            # If n_accepted < k: we stopped at j. we accepted d_tokens[0...j-1] and correction for d_tokens[j].
+            # Total new tokens in generated: j+1. New tokens in cache to keep: j+1 (v_input[0...j]).
+            n_to_keep = n_accepted + 1
+            n_target_rollback = (k + 1) - n_to_keep
+            if n_target_rollback > 0:
+                for layer in self.cache:
+                    if layer["K"] is not None:
+                        layer["K"] = layer["K"][:, :, :-n_target_rollback, :]
+                        layer["V"] = layer["V"][:, :, :-n_target_rollback, :]
+                self.cur_pos -= n_target_rollback
 
             # e. Synchronize draft model state with target model
             # This ensures both models are aligned for the next speculative step.
@@ -1233,27 +1323,37 @@ class EinsumOptimizer:
         m._stats['opt_clip'].append(time.time() - t_clip)
 
         t_update = time.time()
+
+        # Calculate memory and update E in main thread
         step_memory_bytes = 0
         if "E" in g:
             step_memory_bytes += m.weights[m.E_name].nbytes + g["E"].nbytes
             m.weights[m.E_name] -= lr * g["E"]
-        for i in range(m.cfg.n_layers):
+
+        def update_layer(i):
             p = m.layer_weights[i]
+            mem = 0
             for k in ["lora_A_q", "lora_B_q", "lora_A_v", "lora_B_v"]:
                 w_key = f"{k}_{i}"
                 if w_key in m.weights and w_key in g:
-                    step_memory_bytes += m.weights[w_key].nbytes + g[w_key].nbytes
+                    mem += m.weights[w_key].nbytes + g[w_key].nbytes
                     m.weights[w_key] -= lr * g[w_key]
             for k in ["W_q", "W_k", "W_v", "W_o", "W1", "W2", "W3"]:
                 grad_key = f"{k}_{i}"
                 if p.get(k) and grad_key in g:
-                    step_memory_bytes += m.weights[p[k]].nbytes + g[grad_key].nbytes
+                    mem += m.weights[p[k]].nbytes + g[grad_key].nbytes
                     m.weights[p[k]] -= lr * g[grad_key].T
             for k in ["norm1", "norm2"]:
                 grad_key = f"{k}_{i}"
                 if p.get(k) and grad_key in g:
-                    step_memory_bytes += m.weights[p[k]].nbytes + g[grad_key].nbytes
+                    mem += m.weights[p[k]].nbytes + g[grad_key].nbytes
                     m.weights[p[k]] -= lr * g[grad_key]
+            return mem
+
+        futures = [m.executor.submit(update_layer, i) for i in range(m.cfg.n_layers)]
+        for f in as_completed(futures):
+            step_memory_bytes += f.result()
+
         m._stats['opt_update'].append(time.time() - t_update)
 
         w_mem = m.weights.get_cache_memory_mb() if hasattr(m.weights, 'get_cache_memory_mb') else 0
