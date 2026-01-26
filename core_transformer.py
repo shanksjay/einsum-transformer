@@ -462,16 +462,16 @@ class EinsumTransformer:
         rms_after = calc_mem(rms_w, rms_a, q_bytes, a_src_bytes)
 
         # Attention: Q,K,V,O projections + Attention Matrix (B, H, T, T)
-        # We account for input activations (B,T,d) and the attention scores matrix.
+        # We account for input (B,T,d), QKV projections (3*B,T,d), and the attention scores matrix (B,H,T,T).
         attn_w = (2 * d * d + 2 * d_kv * d) * n_layers
-        attn_a = (B * T * d + B * c.n_heads * T * T) * n_layers
+        attn_a = (4 * B * T * d + B * c.n_heads * T * T) * n_layers
         attn_before = calc_mem(attn_w, attn_a, src_bytes, a_src_bytes)
         attn_after = calc_mem(attn_w, attn_a, q_bytes, a_q_bytes)
 
         # FFN: SwiGLU uses 3 projections.
-        # Activations: Input (B,T,d) + Intermediate (B,T,d_ff) * 2 (for gate/up)
+        # Activations: Input (B,T,d) + W1/W2/Gated intermediates (3 * B,T,d_ff)
         ffn_w = 3 * d * d_ff * n_layers
-        ffn_a = (B * T * d + 2 * B * T * d_ff) * n_layers
+        ffn_a = (B * T * d + 3 * B * T * d_ff) * n_layers
         ffn_before = calc_mem(ffn_w, ffn_a, src_bytes, a_src_bytes)
         ffn_after = calc_mem(ffn_w, ffn_a, q_bytes, a_q_bytes)
 
@@ -1070,6 +1070,7 @@ class EinsumTransformer:
     def generate(self, tokens):
         if getattr(self.cfg, 'speculative', False): return self.speculative_generate(tokens)
         self.clear_cache()
+        B = tokens.shape[0]
 
         t0 = time.time()
         # Prefill
@@ -1077,24 +1078,27 @@ class EinsumTransformer:
         next_token = self.sample_top_k(logits, k=self.cfg.top_k_sample, temperature=self.cfg.temperature)
         ttft = time.time() - t0
 
-        generated = [next_token[0]]
+        # generated is a list of arrays, each of shape (B,)
+        generated = [next_token]
 
         print(f"\n Decoding Stage")
         print(f"=================")
+        # Print stream for the first batch element
         print(f"[STREAM] {self.detokenize([next_token[0]])[0]}", end="", flush=True)
 
         t_decode_start = time.time()
         for i in range(self.cfg.max_new_tokens - 1):
-            logits = self.forward(np.full((tokens.shape[0], 1), generated[-1]), inference=True, verbose=False)
+            # Input shape: (B, 1)
+            logits = self.forward(generated[-1][:, None], inference=True, verbose=False)
             next_token = self.sample_top_k(logits, k=self.cfg.top_k_sample, temperature=self.cfg.temperature)
-            generated.append(next_token[0])
+            generated.append(next_token)
             print(self.detokenize([next_token[0]])[0], end="", flush=True)
 
         t_decode_end = time.time()
         duration = t_decode_end - t_decode_start
         tokens_sec = (len(generated) - 1) / duration if duration > 0 else 0
 
-        print(f"\nTime to first Token ({self.detokenize([generated[0]])[0]}) : {ttft:.4f}s")
+        print(f"\nTime to first Token ({self.detokenize([generated[0][0]])[0]}) : {ttft:.4f}s")
         print(f"Output tokens/sec : {tokens_sec:.2f}")
         print()
         return generated
@@ -1123,6 +1127,7 @@ class EinsumTransformer:
         self.clear_cache()
         draft_model = self._get_draft_model()
         draft_model.clear_cache()
+        B = tokens.shape[0]
         
         t0 = time.time()
         # 1. Prefill: Process initial prompt tokens in target model
@@ -1138,7 +1143,7 @@ class EinsumTransformer:
         next_token = self.sample_top_k(logits, k=self.cfg.top_k_sample, temperature=self.cfg.temperature)
         ttft = time.time() - t0
 
-        generated = [next_token[0]]
+        generated = [next_token]
         print(f"\n Decoding Stage")
         print(f"=================")
         print(f"[STREAM] {self.detokenize([next_token[0]])[0]}", end="", flush=True)
@@ -1148,41 +1153,45 @@ class EinsumTransformer:
         while len(generated) < self.cfg.max_new_tokens:
             # a. Draft predicts k speculative tokens sequentially
             d_tokens = []
-            draft_input = np.full((1, 1), generated[-1])
+            draft_input = generated[-1][:, None]
             for _ in range(k):
                 d_logits = draft_model.forward(draft_input, inference=True, verbose=False)
-                d_tok = self.sample_top_k(d_logits, k=self.cfg.top_k_sample, temperature=self.cfg.temperature)[0]
+                d_tok = self.sample_top_k(d_logits, k=self.cfg.top_k_sample, temperature=self.cfg.temperature)
                 d_tokens.append(d_tok)
-                draft_input = np.full((1, 1), d_tok)
+                draft_input = d_tok[:, None]
 
             # b. Target verifies all k draft tokens + current token in a single parallel pass.
             # v_input[j] will predict the token for d_tokens[j].
             # v_input[k] (the last draft token) will predict a "bonus" token.
-            v_input = np.array([generated[-1]] + d_tokens).reshape(1, -1)
+            v_input = np.stack([generated[-1]] + d_tokens, axis=1) # Shape (B, k+1)
             v_logits = self.forward(v_input, inference=True, verbose=False)
 
             # c. Verify draft tokens against target model predictions
             n_accepted = 0
+            next_toks = None
             for j in range(k):
                 # Sample the target model's prediction for the token at d_tokens[j] position
-                target_tok = self.sample_top_k(v_logits[:, j:j+1, :], k=self.cfg.top_k_sample, temperature=self.cfg.temperature)[0]
+                target_toks = self.sample_top_k(v_logits[:, j:j+1, :], k=self.cfg.top_k_sample, temperature=self.cfg.temperature)
 
-                if target_tok == d_tokens[j]:
+                # In batched mode, we only accept if ALL batches matched for this step
+                # to keep KV caches aligned across the batch.
+                if np.array_equal(target_toks, d_tokens[j]):
                     # Draft was correct!
                     generated.append(d_tokens[j])
-                    print(self.detokenize([d_tokens[j]])[0], end="", flush=True)
+                    print(self.detokenize([d_tokens[j][0]])[0], end="", flush=True)
                     n_accepted += 1
                 else:
-                    # Draft was incorrect. Accept the target's correction and stop verification.
-                    generated.append(target_tok)
-                    print(f"[{self.detokenize([target_tok])[0]}]", end="", flush=True)
+                    # Mismatch. Accept the target's correction and stop verification.
+                    generated.append(target_toks)
+                    print(f"[{self.detokenize([target_toks[0]])[0]}]", end="", flush=True)
+                    next_toks = target_toks
                     break
 
             # If all were accepted, we get a bonus token from the last logit position
             if n_accepted == k:
-                bonus_tok = self.sample_top_k(v_logits[:, k:k+1, :], k=self.cfg.top_k_sample, temperature=self.cfg.temperature)[0]
-                generated.append(bonus_tok)
-                print(self.detokenize([bonus_tok])[0], end="", flush=True)
+                next_toks = self.sample_top_k(v_logits[:, k:k+1, :], k=self.cfg.top_k_sample, temperature=self.cfg.temperature)
+                generated.append(next_toks)
+                print(self.detokenize([next_toks[0]])[0], end="", flush=True)
 
             # d. Rollback target model KV cache
             # We processed 'k+1' tokens as input.
@@ -1210,7 +1219,7 @@ class EinsumTransformer:
         duration = t_decode_end - t_decode_start
         tokens_sec = (len(generated) - 1) / duration if duration > 0 else 0
 
-        print(f"\nTime to first Token ({self.detokenize([generated[0]])[0]}) : {ttft:.4f}s")
+        print(f"\nTime to first Token ({self.detokenize([generated[0][0]])[0]}) : {ttft:.4f}s")
         print(f"Output tokens/sec : {tokens_sec:.2f}")
         print()
         return generated
