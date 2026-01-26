@@ -221,6 +221,7 @@ class EinsumTransformer:
         self._activations = {}
         self._grads = {}
         self.training = False
+        self._draft_model = None
         self.executor = ThreadPoolExecutor(max_workers=os.cpu_count() or 4)
         # LoRA configuration defaults
         self.use_lora = getattr(self.cfg, "use_lora", False)
@@ -460,15 +461,17 @@ class EinsumTransformer:
         rms_before = calc_mem(rms_w, rms_a, src_bytes, a_src_bytes)
         rms_after = calc_mem(rms_w, rms_a, q_bytes, a_src_bytes)
 
-        # Attention: Q,O are [d, d]; K,V are [d, d_kv]. Total 4 projections per layer.
+        # Attention: Q,K,V,O projections + Attention Matrix (B, H, T, T)
+        # We account for input activations (B,T,d) and the attention scores matrix.
         attn_w = (2 * d * d + 2 * d_kv * d) * n_layers
-        attn_a = B * T * d * n_layers
+        attn_a = (B * T * d + B * c.n_heads * T * T) * n_layers
         attn_before = calc_mem(attn_w, attn_a, src_bytes, a_src_bytes)
         attn_after = calc_mem(attn_w, attn_a, q_bytes, a_q_bytes)
 
-        # FFN: SwiGLU uses 3 projections (gate, up, down) each of size [d, d_ff]
+        # FFN: SwiGLU uses 3 projections.
+        # Activations: Input (B,T,d) + Intermediate (B,T,d_ff) * 2 (for gate/up)
         ffn_w = 3 * d * d_ff * n_layers
-        ffn_a = B * T * d * n_layers
+        ffn_a = (B * T * d + 2 * B * T * d_ff) * n_layers
         ffn_before = calc_mem(ffn_w, ffn_a, src_bytes, a_src_bytes)
         ffn_after = calc_mem(ffn_w, ffn_a, q_bytes, a_q_bytes)
 
@@ -1096,6 +1099,20 @@ class EinsumTransformer:
         print()
         return generated
 
+    def _get_draft_model(self):
+        if self._draft_model is None or self._draft_model.cfg.n_layers != self.cfg.draft_layers:
+            # Initialize draft model using the first N layers of the target model
+            draft_cfg = copy.deepcopy(self.cfg)
+            draft_cfg.n_layers = self.cfg.draft_layers
+            # Disable speculative in draft to avoid infinite recursion
+            draft_cfg.speculative = False
+            self._draft_model = EinsumTransformer(draft_cfg, _from_weights=self.weights,
+                                            _E_name=self.E_name,
+                                            _layer_weights=self.layer_weights[:self.cfg.draft_layers])
+            # Share the executor to avoid creating too many threads
+            self._draft_model.executor = self.executor
+        return self._draft_model
+
     def speculative_generate(self, tokens, k=4):
         """
         Implementation of speculative decoding.
@@ -1104,18 +1121,18 @@ class EinsumTransformer:
         """
         print(f"[INFO] Starting speculative decoding (k={k}, draft_layers={self.cfg.draft_layers})...")
         self.clear_cache()
-
-        # Initialize draft model using the first N layers of the target model
-        draft_cfg = copy.deepcopy(self.cfg)
-        draft_cfg.n_layers = self.cfg.draft_layers
-        draft_model = EinsumTransformer(draft_cfg, _from_weights=self.weights,
-                                        _E_name=self.E_name,
-                                        _layer_weights=self.layer_weights[:self.cfg.draft_layers])
+        draft_model = self._get_draft_model()
+        draft_model.clear_cache()
         
         t0 = time.time()
-        # 1. Prefill: Process initial prompt tokens in both models
+        # 1. Prefill: Process initial prompt tokens in target model
         logits = self.forward(tokens, inference=True, verbose=True)
-        _ = draft_model.forward(tokens, inference=True, verbose=False)
+
+        # 2. Seed draft model KV cache from target model to avoid redundant prefill
+        for i in range(self.cfg.draft_layers):
+            draft_model.cache[i]["K"] = self.cache[i]["K"]
+            draft_model.cache[i]["V"] = self.cache[i]["V"]
+        draft_model.cur_pos = self.cur_pos
         
         # 2. Sample the first token after the prompt
         next_token = self.sample_top_k(logits, k=self.cfg.top_k_sample, temperature=self.cfg.temperature)
@@ -1185,8 +1202,8 @@ class EinsumTransformer:
             # e. Synchronize draft model state with target model
             # This ensures both models are aligned for the next speculative step.
             for l in range(self.cfg.draft_layers):
-                draft_model.cache[l]["K"] = self.cache[l]["K"].copy()
-                draft_model.cache[l]["V"] = self.cache[l]["V"].copy()
+                draft_model.cache[l]["K"] = self.cache[l]["K"]
+                draft_model.cache[l]["V"] = self.cache[l]["V"]
             draft_model.cur_pos = self.cur_pos
 
         t_decode_end = time.time()

@@ -32,8 +32,5 @@
     "q_proj",
     "v_proj"
   ],
-  "lora_merge_after_training": false,
-  "// 7": "Optimization, Speculative decoding (draft config in optmizations)",
-  "speculative": true,
-  "draft_layers": 7
+  "lora_merge_after_training": false
 }
