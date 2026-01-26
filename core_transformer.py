@@ -165,6 +165,7 @@ class EinsumTransformer:
         self.cache = [{"K": None, "V": None} for _ in range(cfg.n_layers)]
         self._activations = {}
         self._grads = {}
+        self.dequant_cache = {}
         self.training = False
         # LoRA configuration defaults
         self.use_lora = getattr(self.cfg, "use_lora", False)
@@ -587,16 +588,26 @@ class EinsumTransformer:
         if isinstance(name, np.ndarray): return name.T if transpose else name
         
         t0 = time.time()
-        data = self.weights[name]
+
+        wb = getattr(self.cfg, "quantization_weight_bits", 0)
+        use_cache = wb in (4, 8) and "lora" not in str(name).lower() and not self.training
+
+        if use_cache and name in self.dequant_cache:
+            data = self.dequant_cache[name]
+        else:
+            data = self.weights[name]
+            # Mixed-precision weight quantization (simulated: quantize->dequant to float32 for einsum)
+            # Skip LoRA adapters: keep float32 to avoid overflow in A@B and to support training
+            if wb in (4, 8) and "lora" not in str(name).lower():
+                data = self._quantize_dequant_weight(data.astype(np.float32), wb)
+                if not self.training:
+                    self.dequant_cache[name] = data
+
         dt = time.time() - t0
         # weight_load: ~0 when in-memory (dict/cache); non-zero on first load from safetensors
         if hasattr(self, '_stats') and 'weight_load' in self._stats:
             self._stats['weight_load'].append(dt)
-        # Mixed-precision weight quantization (simulated: quantize->dequant to float32 for einsum)
-        # Skip LoRA adapters: keep float32 to avoid overflow in A@B and to support training
-        wb = getattr(self.cfg, "quantization_weight_bits", 0)
-        if wb in (4, 8) and "lora" not in str(name).lower():
-            data = self._quantize_dequant_weight(data.astype(np.float32), wb)
+
         return data.T if transpose else data
 
     def rms_norm(self, x, w, eps=1e-6, key=None):
@@ -997,6 +1008,8 @@ class EinsumTransformer:
 
         self.verbose = verbose
         self.training = training
+        if training:
+            self.dequant_cache = {}
         # Initialize stats if missing; or if not training and fresh forward (e.g. generate prefill). During training, caller inits before the loop.
         if not hasattr(self, '_stats'):
             self._init_stats()
