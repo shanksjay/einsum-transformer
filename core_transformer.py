@@ -1458,6 +1458,52 @@ class EinsumOptimizer:
         self.model, self.lr, self.grad_clip = model, lr, grad_clip
 
     def step(self):
+        """
+        Optimizer step: Apply gradient descent to update all model weights.
+        HIGH-LEVEL FLOW:
+        ================
+        1. Embedding Update:
+           - E = E - lr * dE
+        
+        2. For each layer (0 to N-1):
+           a. Attention Weight Updates:
+              - W_q = W_q - lr * dW_q^T  [Transpose to match safetensors (out, in) format]
+              - W_k = W_k - lr * dW_k^T
+              - W_v = W_v - lr * dW_v^T
+              - W_o = W_o - lr * dW_o^T
+           b. Normalization Weight Updates:
+              - norm1 = norm1 - lr * d_norm1  [Element-wise, no transpose]
+              - norm2 = norm2 - lr * d_norm2
+           c. FFN Weight Updates:
+              - W1 = W1 - lr * dW1^T  [Transpose to match safetensors format]
+              - W2 = W2 - lr * dW2^T
+              - W3 = W3 - lr * dW3^T
+        
+        GRADIENT DESCENT OPERATION:
+        ===========================
+        Basic SGD update rule:
+          W_new = W_old - learning_rate * gradient
+        
+        TRANSPOSE RATIONALE:
+        ====================
+        - Gradients are computed in (in_features, out_features) based on einsum notation
+        - Safetensors stores weights as (out_features, in_features)
+        - We apply .T to gradients before subtraction to match weight tensor shape
+        - Exception: Normalization weights are 1D vectors, no transpose needed
+        
+        EINSUM INTERPRETATION:
+        ======================
+        While no explicit einsum is used in weight updates, the operation is:
+          W[i,j] = W[i,j] - lr * dW[i,j]  (element-wise subtraction)
+        
+        This could be expressed as einsum('ij,ij->ij', W, ones) - lr * dW,
+        but direct array subtraction is more efficient.
+        
+        WEIGHT PERSISTENCE:
+        ===================
+        Updates are applied in-place to LazyWeightManager.cache, enabling
+        iterative training without reloading weights from disk.
+        """
         m, g, lr = self.model, self.model._grads, self.lr
         t0 = time.time()
 
