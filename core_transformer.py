@@ -2,7 +2,11 @@ import re
 import numpy as np
 import os
 import time
+import copy
+import threading
 from pathlib import Path
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from safetensors.numpy import load_file
 from safetensors import safe_open
 try:
@@ -13,6 +17,12 @@ except ImportError:
 
 class TransformerConfig:
     def __init__(self, cfg):
+        # Basic input validation
+        required_keys = ["batch_size", "seq_len", "vocab_size", "d_model", "n_heads", "d_ff", "n_layers"]
+        for k in required_keys:
+            if k not in cfg:
+                raise ValueError(f"Missing required config key: {k}")
+
         self.arch = cfg.get("arch", "custom")
         self.batch_size = cfg["batch_size"]
         self.seq_len = cfg["seq_len"]
@@ -39,6 +49,10 @@ class TransformerConfig:
 
         self.quantized = cfg.get("quantized", False)  # legacy; prefer quantization
         self.prefill_only = cfg.get("prefill_only", False)
+
+        # Speculative decoding
+        self.speculative = cfg.get("speculative", False)
+        self.draft_layers = cfg.get("draft_layers", 2)
 
         # Mixed-precision quantization: "none" | "W8A16" | "W8A8" | "W4A16" | "W4A4" | "W8A4" etc. (W=weight bits, A=activation bits)
         q = cfg.get("quantization", "none")
@@ -77,13 +91,17 @@ class TransformerConfig:
 
 
 class LazyWeightManager:
-    def __init__(self, weight_paths, target_dtype="float32"):
+    def __init__(self, weight_paths, target_dtype="float32", max_cache_size=32):
         self.handles = {}
+        self.lock = threading.Lock()
         self.tensor_to_shard = {}
         self.target_dtype = target_dtype
-        self.cache = {}
+        self.max_cache_size = max_cache_size
+        self.cache = OrderedDict()
+        # Persistent cache for tensors not backed by files (e.g. generated LoRA adapters)
+        self.persistent_cache = {}
         
-        print(f"[INFO] Initializing LazyWeightManager with {len(weight_paths)} shards...")
+        print(f"[INFO] Initializing LazyWeightManager with {len(weight_paths)} shards (max_cache_size={max_cache_size})...")
         for path in weight_paths:
             # safe_open uses mmap, keeping handles open is efficient
             handle = safe_open(path, framework="np")
@@ -94,8 +112,15 @@ class LazyWeightManager:
                 self.tensor_to_shard[key] = path
 
     def __getitem__(self, key):
-        if key in self.cache:
-            return self.cache[key]
+        with self.lock:
+            if key in self.persistent_cache:
+                return self.persistent_cache[key]
+
+            if key in self.cache:
+                # Move to end (LRU)
+                val = self.cache.pop(key)
+                self.cache[key] = val
+                return val
         
         if key not in self.tensor_to_shard:
             raise KeyError(f"Tensor {key} not found in any shard.")
@@ -109,7 +134,6 @@ class LazyWeightManager:
         except TypeError as e:
             if "bfloat16" in str(e):
                 # If numpy doesn't understand bfloat16, we might need ml_dtypes
-                # But safetensors-numpy usually handles it if ml_dtypes is registered
                 print(f"[ERROR] bfloat16 detected but not supported by numpy. Error: {e}")
                 raise
             raise
@@ -127,17 +151,40 @@ class LazyWeightManager:
         else:
             res = data.astype(np.float32)
             
-        self.cache[key] = res
+        with self.lock:
+            self.cache[key] = res
+            # Evict if necessary
+            if self.max_cache_size and len(self.cache) > self.max_cache_size:
+                self.cache.popitem(last=False)
         return res
 
     def __setitem__(self, key, value):
-        self.cache[key] = value
+        with self.lock:
+            # Store modified or new weights in persistent cache to avoid eviction
+            # and ensure training updates are preserved.
+            self.persistent_cache[key] = value
+
+            # If it was in the LRU cache, remove it as it's now in persistent
+            if key in self.cache:
+                del self.cache[key]
+
+    def purge_cache(self):
+        print(f"[INFO] Purging weight cache ({len(self.cache)} tensors removed)")
+        self.cache.clear()
+
+    def get_cache_memory_mb(self):
+        b = sum(v.nbytes for v in self.cache.values() if isinstance(v, np.ndarray))
+        b += sum(v.nbytes for v in self.persistent_cache.values() if isinstance(v, np.ndarray))
+        return b / (1024 * 1024)
 
     def __contains__(self, key):
-        return key in self.tensor_to_shard or key in self.cache
+        return key in self.tensor_to_shard or key in self.cache or key in self.persistent_cache
 
     def keys(self):
-        return list(self.tensor_to_shard.keys()) + [k for k in self.cache if k not in self.tensor_to_shard]
+        k = set(self.tensor_to_shard.keys())
+        k.update(self.cache.keys())
+        k.update(self.persistent_cache.keys())
+        return list(k)
 
 
 class DictWeightManager:
@@ -157,15 +204,25 @@ class DictWeightManager:
     def keys(self):
         return self.cache.keys()
 
+    def purge_cache(self):
+        pass
+
+    def get_cache_memory_mb(self):
+        b = sum(v.nbytes for v in self.cache.values() if isinstance(v, np.ndarray))
+        return b / (1024 * 1024)
+
 
 class EinsumTransformer:
     def __init__(self, cfg: TransformerConfig, *, _from_weights=None, _E_name=None, _layer_weights=None):
         self.cfg = cfg
         self.weights = None  # LazyWeightManager or DictWeightManager
         self.cache = [{"K": None, "V": None} for _ in range(cfg.n_layers)]
+        self.cur_pos = 0
         self._activations = {}
         self._grads = {}
         self.training = False
+        self._draft_model = None
+        self.executor = ThreadPoolExecutor(max_workers=os.cpu_count() or 4)
         # LoRA configuration defaults
         self.use_lora = getattr(self.cfg, "use_lora", False)
         self.lora_rank = getattr(self.cfg, "lora_rank", 4)
@@ -175,10 +232,12 @@ class EinsumTransformer:
 
         if _from_weights is not None:
             if _E_name is None or _layer_weights is None:
-                raise ValueError("_from_weights requires _E_name and _layer_weights")
-            self.weights = DictWeightManager(_from_weights)
-            self.E_name = _E_name
-            self.layer_weights = _layer_weights
+                self.weights = DictWeightManager(_from_weights) if isinstance(_from_weights, dict) else _from_weights
+                self._bind_weights()
+            else:
+                self.weights = DictWeightManager(_from_weights) if isinstance(_from_weights, dict) else _from_weights
+                self.E_name = _E_name
+                self.layer_weights = _layer_weights
             return
 
         if cfg.weight_file:
@@ -195,7 +254,13 @@ class EinsumTransformer:
             print(f"[INFO] No weight_file specified, initializing random weights...")
             self._init_weights_random()
         if getattr(self.cfg, "quantization", "none") != "none":
-            print(f"[INFO] Mixed-precision quantization: {self.cfg.quantization} (W{getattr(self.cfg,'quantization_weight_bits',0)} A{getattr(self.cfg,'quantization_activation_bits',0)})")
+            quant_bits_w = getattr(self.cfg, 'quantization_weight_bits', 0)
+            quant_bits_a = getattr(self.cfg, 'quantization_activation_bits', 0)
+            print(f"[INFO] Mixed-precision quantization: {self.cfg.quantization} (W{quant_bits_w} A{quant_bits_a})")
+
+    def clear_cache(self):
+        self.cache = [{"K": None, "V": None} for _ in range(self.cfg.n_layers)]
+        self.cur_pos = 0
 
     def _load_weights(self, path):
         print(f"[INFO] Attempting to load weights from: {path}")
@@ -248,6 +313,7 @@ class EinsumTransformer:
         self.weights = LazyWeightManager(weight_paths, target_dtype=self.cfg.weight_dtype)
         self._init_lora_weights()
         self._bind_weights()
+        self._adjust_cache_size()
         self._validate_loaded_shapes()
         self._print_per_layer_dtype_breakdown()
 
@@ -260,31 +326,15 @@ class EinsumTransformer:
         r = self.lora_rank
         print(f"[INFO] Initializing LoRA adapters (rank={r}) for modules: {c.lora_target_modules}")
         
-        # We need to manually add these to self.weights.cache (if it exists) or wrap it.
-        # LazyWeightManager might be read-only if it's purely safetensors based.
-        # But our LazyWeightManager implementation (if inspectable) usually has a cache dict.
-        # Let's inspect LazyWeightManager in this file. Ah, I haven't seen it fully.
-        # Assuming we can write to self.weights.
-        # If self.weights is the class from safetensors wrapper, we might need to wrap it.
-        # In _init_weights_random checking line 250: "self.weights = DictWeightManager(weights_dict)"
-        # But here we use "LazyWeightManager".
-        # Let's assume LazyWeightManager has __setitem__ or a cache.
-        # If not, we might crash. But let's try.
-        
         for i in range(c.n_layers):
-            # Q Proj
             if "q_proj" in c.lora_target_modules:
-                # A: (d, r), B: (r, d)
                 A = np.random.randn(c.d_model, r).astype(np.float32) * 0.02
                 B = np.random.randn(r, c.d_model).astype(np.float32) * 0.02
                 self.weights[f"lora_A_q_{i}"] = A
                 self.weights[f"lora_B_q_{i}"] = B
                 
-            # V Proj
             if "v_proj" in c.lora_target_modules:
-                # V is (d_kv, d). A: (d, r), B: (r, d_kv).
-                d_head = c.d_model // c.n_heads
-                d_kv = c.n_kv_heads * d_head
+                d_kv = c.n_kv_heads * c.d_head
                 A = np.random.randn(c.d_model, r).astype(np.float32) * 0.02
                 B = np.random.randn(r, d_kv).astype(np.float32) * 0.02
                 self.weights[f"lora_A_v_{i}"] = A
@@ -295,105 +345,60 @@ class EinsumTransformer:
         c = self.cfg
         print("[INFO] Initializing random weights (no pre-trained model)...")
         
-        # Create a simple dict-based weight manager for random weights
         weights_dict = {}
-        
-        # Embedding weight (stored as vocab x d_model, matching safetensors)
         weights_dict["E"] = np.random.randn(c.vocab_size, c.d_model).astype(np.float32) * 0.02
-        self.E_name = "E"  # Set E_name for compatibility
+        self.E_name = "E"
         
-        # Initialize layer weights
         self.layer_weights = []
         for i in range(c.n_layers):
-            # Attention weights (stored as out x in, matching safetensors format)
-            # W_q: (d_model, d_model)
-            # W_k, W_v: (n_kv_heads * d_head, d_model)
             d_kv = c.n_kv_heads * c.d_head
-            
             weights_dict[f"W_q_{i}"] = np.random.randn(c.d_model, c.d_model).astype(np.float32) * 0.02
             weights_dict[f"W_k_{i}"] = np.random.randn(d_kv, c.d_model).astype(np.float32) * 0.02
             weights_dict[f"W_v_{i}"] = np.random.randn(d_kv, c.d_model).astype(np.float32) * 0.02
             weights_dict[f"W_o_{i}"] = np.random.randn(c.d_model, c.d_model).astype(np.float32) * 0.02
-            # LoRA adapters for q and v projections (only if LoRA is enabled)
+
             if self.use_lora:
                 r = self.lora_rank
-                # Initialize A and B matrices for q_proj
-                # W_q is (d_model, d_model) -> A: (d_model, r), B: (r, d_model)
                 if "q_proj" in self.lora_target_modules:
                     weights_dict[f"lora_A_q_{i}"] = np.random.randn(c.d_model, r).astype(np.float32) * 0.02
                     weights_dict[f"lora_B_q_{i}"] = np.random.randn(r, c.d_model).astype(np.float32) * 0.02
-                    
-                # Initialize A and B matrices for v_proj
-                # W_v is (d_kv, d_model) in safetensors (out, in).
-                # We access it as (d_model, d_kv) (transpose).
-                # LoRA delta matches this (d_model, d_kv).
-                # delta = A @ B. A: (d_model, r). B: (r, d_kv).
                 if "v_proj" in self.lora_target_modules:
                     weights_dict[f"lora_A_v_{i}"] = np.random.randn(c.d_model, r).astype(np.float32) * 0.02
                     weights_dict[f"lora_B_v_{i}"] = np.random.randn(r, d_kv).astype(np.float32) * 0.02
             
-            # FFN weights
-            weights_dict[f"W1_{i}"] = np.random.randn(c.d_ff, c.d_model).astype(np.float32) * 0.02
-            weights_dict[f"W2_{i}"] = np.random.randn(c.d_ff, c.d_model).astype(np.float32) * 0.02
-            weights_dict[f"W3_{i}"] = np.random.randn(c.d_model, c.d_ff).astype(np.float32) * 0.02
+            if c.use_moe:
+                weights_dict[f"gate_{i}"] = np.random.randn(c.num_experts, c.d_model).astype(np.float32) * 0.02
+                experts = []
+                for e in range(c.num_experts):
+                    weights_dict[f"W1_{i}_{e}"] = np.random.randn(c.d_ff, c.d_model).astype(np.float32) * 0.02
+                    weights_dict[f"W2_{i}_{e}"] = np.random.randn(c.d_ff, c.d_model).astype(np.float32) * 0.02
+                    weights_dict[f"W3_{i}_{e}"] = np.random.randn(c.d_model, c.d_ff).astype(np.float32) * 0.02
+                    experts.append({"W1": f"W1_{i}_{e}", "W2": f"W2_{i}_{e}", "W3": f"W3_{i}_{e}"})
+            else:
+                weights_dict[f"W1_{i}"] = np.random.randn(c.d_ff, c.d_model).astype(np.float32) * 0.02
+                weights_dict[f"W2_{i}"] = np.random.randn(c.d_ff, c.d_model).astype(np.float32) * 0.02
+                weights_dict[f"W3_{i}"] = np.random.randn(c.d_model, c.d_ff).astype(np.float32) * 0.02
             
-            # Norm weights
             weights_dict[f"norm1_{i}"] = np.ones(c.d_model).astype(np.float32)
             weights_dict[f"norm2_{i}"] = np.ones(c.d_model).astype(np.float32)
             
             layer = {
-                "W_q": f"W_q_{i}",
-                "W_k": f"W_k_{i}",
-                "W_v": f"W_v_{i}",
-                "W_o": f"W_o_{i}",
-                "W1": f"W1_{i}",
-                "W2": f"W2_{i}",
-                "W3": f"W3_{i}",
-                "norm1": f"norm1_{i}",
-                "norm2": f"norm2_{i}",
-                "experts": None,
-                "gate": None
+                "W_q": f"W_q_{i}", "W_k": f"W_k_{i}", "W_v": f"W_v_{i}", "W_o": f"W_o_{i}",
+                "W1": f"W1_{i}" if not c.use_moe else None,
+                "W2": f"W2_{i}" if not c.use_moe else None,
+                "W3": f"W3_{i}" if not c.use_moe else None,
+                "norm1": f"norm1_{i}", "norm2": f"norm2_{i}",
+                "experts": experts if c.use_moe else None,
+                "gate": f"gate_{i}" if c.use_moe else None
             }
             if self.use_lora:
                 if "q_proj" in self.lora_target_modules:
-                    layer["lora_A_q"] = f"lora_A_q_{i}"
-                    layer["lora_B_q"] = f"lora_B_q_{i}"
+                    layer["lora_A_q"], layer["lora_B_q"] = f"lora_A_q_{i}", f"lora_B_q_{i}"
                 if "v_proj" in self.lora_target_modules:
-                    layer["lora_A_v"] = f"lora_A_v_{i}"
-                    layer["lora_B_v"] = f"lora_B_v_{i}"
+                    layer["lora_A_v"], layer["lora_B_v"] = f"lora_A_v_{i}", f"lora_B_v_{i}"
             self.layer_weights.append(layer)
         
         self.weights = DictWeightManager(weights_dict)
-        
-        # Calculate breakdown
-        embedding_count = 1
-        attention_per_layer = 4  # W_q, W_k, W_v, W_o
-        ffn_per_layer = 3  # W1, W2, W3
-        norm_per_layer = 2  # norm1, norm2
-        lora_per_layer = 0
-        if self.use_lora:
-            if "q_proj" in self.lora_target_modules:
-                lora_per_layer += 2  # lora_A_q, lora_B_q
-            if "v_proj" in self.lora_target_modules:
-                lora_per_layer += 2  # lora_A_v, lora_B_v
-        
-        base_per_layer = attention_per_layer + ffn_per_layer + norm_per_layer
-        total_per_layer = base_per_layer + lora_per_layer
-        total_layers = c.n_layers
-        
-        print(f"[INFO] Random initialization complete: {len(weights_dict)} weight tensors created.")
-        print(f"[INFO] Weight tensor breakdown:")
-        print(f"  Embedding:           {embedding_count} tensor")
-        print(f"  Per Layer ({total_layers} layers):")
-        print(f"    Attention:         {attention_per_layer} tensors/layer × {total_layers} = {attention_per_layer * total_layers}")
-        print(f"    FeedForward:       {ffn_per_layer} tensors/layer × {total_layers} = {ffn_per_layer * total_layers}")
-        print(f"    Normalization:     {norm_per_layer} tensors/layer × {total_layers} = {norm_per_layer * total_layers}")
-        if lora_per_layer > 0:
-            print(f"    LoRA adapters:     {lora_per_layer} tensors/layer × {total_layers} = {lora_per_layer * total_layers}")
-        print(f"    Subtotal per layer: {base_per_layer} tensors/layer × {total_layers} = {base_per_layer * total_layers}")
-        if lora_per_layer > 0:
-            print(f"    With LoRA:         {total_per_layer} tensors/layer × {total_layers} = {total_per_layer * total_layers}")
-        print(f"  Total:               {embedding_count} + {base_per_layer * total_layers} + {lora_per_layer * total_layers} = {len(weights_dict)} tensors")
         self._print_per_layer_dtype_breakdown()
 
     def _print_per_layer_dtype_breakdown(self):
@@ -402,68 +407,89 @@ class EinsumTransformer:
         wb = getattr(c, "quantization_weight_bits", 0)
         ab = getattr(c, "quantization_activation_bits", 0)
         wd = getattr(c, "weight_dtype", "float32")
-        # Shapes
-        V, d, d_ff = c.vocab_size, c.d_model, c.d_ff
-        B, T = c.batch_size, c.seq_len
-        n_layers = c.n_layers
-        d_kv = c.n_kv_heads * (c.d_model // c.n_heads)
+        # Dimensions used for memory calculations:
+        V = c.vocab_size             # Vocabulary size
+        d = c.d_model                # Model dimension (hidden size)
+        d_ff = c.d_ff                # Feed-forward network intermediate dimension
+        B = c.batch_size             # Batch size
+        T = c.seq_len                # Sequence length (context window)
+        n_layers = c.n_layers        # Total number of transformer layers
+        d_kv = c.n_kv_heads * (c.d_model // c.n_heads) # Total dimension for Key/Value heads
 
-        # Arrow: source (original) → target (quantized)
         def weight_str():
-            if wb == 8:
-                return f"{wd}→int8"
-            if wb == 4:
-                return f"{wd}→int4"
+            if wb == 8: return f"{wd}→int8"
+            if wb == 4: return f"{wd}→int4"
             return wd
 
         def act_str():
-            if ab == 16:
-                return "float32→fp16"
-            if ab == 8:
-                return "float32→int8"
-            if ab == 4:
-                return "float32→int4"
+            if ab == 16: return "float32→fp16"
+            if ab == 8: return "float32→int8"
+            if ab == 4: return "float32→int4"
             return "float32"
 
-        def mb(b):
-            return b / (1024 * 1024)
+        def mb(b): return b / (1024 * 1024)
 
-        # Bytes saved per element: float32=4, fp16=2, int8=1, int4=0.5
-        bw = (4 - (1 if wb == 8 else 0.5 if wb == 4 else 4)) if wb in (4, 8) else 0
-        ba = (4 - (2 if ab == 16 else 1 if ab == 8 else 0.5 if ab == 4 else 4)) if ab in (4, 8, 16) else 0
+        # Source (Full precision) byte size
+        src_bytes = 4 # float32
+        if wd == "float16": src_bytes = 2
+        elif wd == "bfloat16": src_bytes = 2
 
-        # Memory saving (bytes then MB) per operation
-        emb_mb = mb(V * d * bw + ((B * T * d * ba) if ba else 0))
-        rms_mb = mb(2 * d * n_layers * bw) if bw else 0
-        attn_pl = (2 * d * d + 2 * d_kv * d) * bw + (B * T * d * ba if ba else 0)
-        attn_mb = mb(attn_pl * n_layers)
-        ffn_pl = 3 * d * d_ff * bw + (B * T * d * ba if ba else 0)
-        ffn_mb = mb(ffn_pl * n_layers)
+        # Quantized weight byte size
+        q_bytes = src_bytes
+        if wb == 8: q_bytes = 1
+        elif wb == 4: q_bytes = 0.5
 
-        def fmt_mb(x):
-            return f"{x:.3f} MB" if x > 0 else "—"
+        # Activation byte size (simulated)
+        a_src_bytes = 4 # float32
+        a_q_bytes = a_src_bytes
+        if ab == 16: a_q_bytes = 2
+        elif ab == 8: a_q_bytes = 1
+        elif ab == 4: a_q_bytes = 0.5
 
-        emb_save = fmt_mb(emb_mb)
-        rms_save = fmt_mb(rms_mb)
-        attn_save = fmt_mb(attn_mb)
-        ffn_save = fmt_mb(ffn_mb)
-        total_mb = emb_mb + rms_mb + attn_mb + ffn_mb
-        total_save = fmt_mb(total_mb)
+        def calc_mem(w_count, a_count, w_b, a_b):
+            return mb(w_count * w_b + a_count * a_b)
 
-        w = weight_str()
-        a = act_str()
-        print(f"[INFO] Per-layer operation breakdown (by tensor datatype, source→target) and memory saving:")
-        print(f"  [NOTE] Mem save = total across all layers (Embedding once; Attn/FFN/RMSNorm summed over {n_layers} layers). Baseline: float32 (4 B/element).")
-        print(f"  {'Operation':<18} {'Weights':<18} {'Activations':<18} {'Mem save':<14}")
-        print(f"  {'-'*18} {'-'*18} {'-'*18} {'-'*14}")
-        print(f"  {'Embedding':<18} {w:<18} {a:<18} {emb_save:<14}")
-        print(f"  {'RMSNorm (×2)':<18} {w:<18} {'float32':<18} {rms_save:<14}")
-        print(f"  {'Attn (Q,K,V,O)':<18} {w:<18} {a:<18} {attn_save:<14}")
-        print(f"  {'FFN (W1,W2,W3)':<18} {w:<18} {a:<18} {ffn_save:<14}")
+        # Embedding: Weights = V * d; Activations = B * T * d
+        emb_w = V * d
+        emb_a = B * T * d
+        emb_before = calc_mem(emb_w, emb_a, src_bytes, a_src_bytes)
+        emb_after = calc_mem(emb_w, emb_a, q_bytes, a_q_bytes)
+
+        # RMSNorm: 2 norms per layer, each with 'd' parameters
+        rms_w = 2 * d * n_layers
+        rms_a = 0 # RMSNorm activations usually small or same precision
+        rms_before = calc_mem(rms_w, rms_a, src_bytes, a_src_bytes)
+        rms_after = calc_mem(rms_w, rms_a, q_bytes, a_src_bytes)
+
+        # Attention: Q,K,V,O projections + Attention Matrix (B, H, T, T)
+        # We account for input (B,T,d), QKV projections (3*B,T,d), and the attention scores matrix (B,H,T,T).
+        attn_w = (2 * d * d + 2 * d_kv * d) * n_layers
+        attn_a = (4 * B * T * d + B * c.n_heads * T * T) * n_layers
+        attn_before = calc_mem(attn_w, attn_a, src_bytes, a_src_bytes)
+        attn_after = calc_mem(attn_w, attn_a, q_bytes, a_q_bytes)
+
+        # FFN: SwiGLU uses 3 projections.
+        # Activations: Input (B,T,d) + W1/W2/Gated intermediates (3 * B,T,d_ff)
+        ffn_w = 3 * d * d_ff * n_layers
+        ffn_a = (B * T * d + 3 * B * T * d_ff) * n_layers
+        ffn_before = calc_mem(ffn_w, ffn_a, src_bytes, a_src_bytes)
+        ffn_after = calc_mem(ffn_w, ffn_a, q_bytes, a_q_bytes)
+
+        def fmt_mb(x): return f"{x:,.3f} MB" if x > 0 else "—"
+
+        print(f"[INFO] Per-layer operation breakdown (by tensor datatype, source→target) and memory usage:")
+        print(f"  {'Operation':<18} {'Weights':<18} {'Activations':<18} {'Before':<14} {'After':<14} {'Mem save':<14}")
+        print(f"  {'-'*18} {'-'*18} {'-'*18} {'-'*14} {'-'*14} {'-'*14}")
+        print(f"  {'Embedding':<18} {weight_str():<18} {act_str():<18} {fmt_mb(emb_before):<14} {fmt_mb(emb_after):<14} {fmt_mb(emb_before - emb_after):<14}")
+        print(f"  {'RMSNorm (×2)':<18} {weight_str():<18} {'float32':<18} {fmt_mb(rms_before):<14} {fmt_mb(rms_after):<14} {fmt_mb(rms_before - rms_after):<14}")
+        print(f"  {'Attn (Q,K,V,O)':<18} {weight_str():<18} {act_str():<18} {fmt_mb(attn_before):<14} {fmt_mb(attn_after):<14} {fmt_mb(attn_before - attn_after):<14}")
+        print(f"  {'FFN (W1,W2,W3)':<18} {weight_str():<18} {act_str():<18} {fmt_mb(ffn_before):<14} {fmt_mb(ffn_after):<14} {fmt_mb(ffn_before - ffn_after):<14}")
         if self.use_lora:
-            print(f"  {'LoRA (A,B)':<18} {'float32':<18} {'-':<18} {'—':<14}")
-        print(f"  {'-'*18} {'-'*18} {'-'*18} {'-'*14}")
-        print(f"  {f'Total (all {n_layers} layers)':<24} {'':<18} {'':<18} {total_save:<14}")
+            print(f"  {'LoRA (A,B)':<18} {'float32':<18} {'-':<18} {'—':<14} {'—':<14} {'—':<14}")
+        print(f"  {'-'*18} {'-'*18} {'-'*18} {'-'*14} {'-'*14} {'-'*14}")
+        total_before = emb_before + rms_before + attn_before + ffn_before
+        total_after = emb_after + rms_after + attn_after + ffn_after
+        print(f"  {'Total (all ' + str(n_layers) + ' layers)':<18} {'':<18} {'':<18} {fmt_mb(total_before):<14} {fmt_mb(total_after):<14} {fmt_mb(total_before - total_after):<14}")
 
     def _bind_weights(self):
         c = self.cfg
@@ -473,6 +499,9 @@ class EinsumTransformer:
                 print(f"[WARN] Missing tensor: {name}")
                 return None
             return name
+
+        def maybe(name):
+            return name if name in self.weights else None
 
         self.E_name = must("model.embed_tokens.weight") or must("transformer.wte.weight")
         self.layer_weights = []
@@ -500,10 +529,10 @@ class EinsumTransformer:
                 "W_k": must(prefix + "self_attn.k_proj.weight"),
                 "W_v": must(prefix + "self_attn.v_proj.weight"),
                 "W_o": must(prefix + "self_attn.o_proj.weight"),
-                "lora_A_q": must(prefix + "self_attn.q_proj.lora_A.weight") if self.use_lora and "q_proj" in self.lora_target_modules else None,
-                "lora_B_q": must(prefix + "self_attn.q_proj.lora_B.weight") if self.use_lora and "q_proj" in self.lora_target_modules else None,
-                "lora_A_v": must(prefix + "self_attn.v_proj.lora_A.weight") if self.use_lora and "v_proj" in self.lora_target_modules else None,
-                "lora_B_v": must(prefix + "self_attn.v_proj.lora_B.weight") if self.use_lora and "v_proj" in self.lora_target_modules else None,
+                "lora_A_q": maybe(prefix + "self_attn.q_proj.lora_A.weight") if self.use_lora and "q_proj" in self.lora_target_modules else None,
+                "lora_B_q": maybe(prefix + "self_attn.q_proj.lora_B.weight") if self.use_lora and "q_proj" in self.lora_target_modules else None,
+                "lora_A_v": maybe(prefix + "self_attn.v_proj.lora_A.weight") if self.use_lora and "v_proj" in self.lora_target_modules else None,
+                "lora_B_v": maybe(prefix + "self_attn.v_proj.lora_B.weight") if self.use_lora and "v_proj" in self.lora_target_modules else None,
                 "W1": W1 if not c.use_moe else None,
                 "W2": W2 if not c.use_moe else None,
                 "W3": W3 if not c.use_moe else None,
@@ -511,359 +540,220 @@ class EinsumTransformer:
                 "norm1": must(prefix + "input_layernorm.weight"),
                 "norm2": must(prefix + "post_attention_layernorm.weight")
             }
-            # If checkpoint has no LoRA but we inited adapters, point to our keys
             if self.use_lora:
-                if layer["lora_A_q"] is None and f"lora_A_q_{i}" in self.weights:
+                if layer["lora_A_q"] is None:
+                    if f"lora_A_q_{i}" not in self.weights:
+                        self.weights[f"lora_A_q_{i}"] = np.random.randn(c.d_model, self.lora_rank).astype(np.float32) * 0.02
+                        self.weights[f"lora_B_q_{i}"] = np.random.randn(self.lora_rank, c.d_model).astype(np.float32) * 0.02
                     layer["lora_A_q"], layer["lora_B_q"] = f"lora_A_q_{i}", f"lora_B_q_{i}"
-                if layer["lora_A_v"] is None and f"lora_A_v_{i}" in self.weights:
+                if layer["lora_A_v"] is None:
+                    if f"lora_A_v_{i}" not in self.weights:
+                        d_kv = c.n_kv_heads * c.d_head
+                        self.weights[f"lora_A_v_{i}"] = np.random.randn(c.d_model, self.lora_rank).astype(np.float32) * 0.02
+                        self.weights[f"lora_B_v_{i}"] = np.random.randn(self.lora_rank, d_kv).astype(np.float32) * 0.02
                     layer["lora_A_v"], layer["lora_B_v"] = f"lora_A_v_{i}", f"lora_B_v_{i}"
             self.layer_weights.append(layer)
 
+    def _adjust_cache_size(self):
+        """Adjust the weight manager's cache size based on the model's total number of tensors."""
+        if not isinstance(self.weights, LazyWeightManager):
+            return
+
+        # Count all unique weight names assigned to layers
+        weight_names = {self.E_name}
+        for layer in self.layer_weights:
+            for k, v in layer.items():
+                if v is None: continue
+                if k == "experts":
+                    for exp in v:
+                        for ek, ev in exp.items():
+                            weight_names.add(ev)
+                else:
+                    weight_names.add(v)
+
+        # Set max_cache_size to cover all tensors plus a small buffer
+        new_size = len(weight_names) + 20
+        print(f"[INFO] Adjusting LazyWeightManager max_cache_size: {self.weights.max_cache_size} -> {new_size}")
+        self.weights.max_cache_size = new_size
+
     def _validate_loaded_shapes(self):
-        """Check that loaded tensor shapes match the config. Prevents subtle bugs from arch mismatch."""
         c = self.cfg
         errs = []
         if self.E_name and self.E_name in self.weights:
             E = self.weights[self.E_name]
-            want = (c.vocab_size, c.d_model)
-            if E.shape != want:
-                errs.append(f"Embedding {self.E_name}: loaded {E.shape} != config (vocab_size={c.vocab_size}, d_model={c.d_model})")
+            if E.shape != (c.vocab_size, c.d_model):
+                errs.append(f"Embedding {self.E_name}: loaded {E.shape} != config ({c.vocab_size}, {c.d_model})")
         if self.layer_weights and self.layer_weights[0].get("W_q") and self.layer_weights[0]["W_q"] in self.weights:
             Wq = self.weights[self.layer_weights[0]["W_q"]]
-            # q_proj is (d_model, d_model)
             if Wq.shape[0] != c.d_model or Wq.shape[1] != c.d_model:
                 errs.append(f"Layer0 W_q: loaded {Wq.shape} != config d_model={c.d_model}")
-        if errs:
-            msg = "Checkpoint architecture does not match config. Use a config that matches the checkpoint (e.g. configs/llama.json for Llama 3.2 3B).\n  " + "\n  ".join(errs)
-            raise ValueError(msg)
+        if errs: raise ValueError("Checkpoint architecture mismatch.\n  " + "\n  ".join(errs))
 
     def get_weights_dict(self):
-        """Return a dict of copies of all weights. Used for Ray workers (--ray-workers) and serialization."""
         return {k: np.asarray(self.weights[k]).copy() for k in self.weights.keys()}
 
     def set_weights_dict(self, d):
-        """Update weights from a dict. Keys must exist. Used when restoring from a snapshot."""
-        for k, v in d.items():
-            self.weights[k] = np.asarray(v).copy() if hasattr(v, "copy") else v
+        for k, v in d.items(): self.weights[k] = np.asarray(v).copy() if hasattr(v, "copy") else v
 
     def _quantize_dequant_weight(self, w, bits):
-        """Simulate weight quantization: quantize to int then dequant to float32. bits in (4, 8)."""
         if bits == 8:
-            scale = np.max(np.abs(w)) / 127.5
-            if scale == 0:
-                return w
-            wi = np.clip(np.round(w / scale).astype(np.int32), -128, 127).astype(np.int8)
-            out = wi.astype(np.float32) * scale
-            return np.clip(np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0), -1e6, 1e6)
+            amax = np.max(np.abs(w))
+            if amax == 0 or not np.isfinite(amax): return w
+            scale = amax / 127.5
+            return np.clip(np.round(w / scale).astype(np.int32), -128, 127).astype(np.float32) * scale
         if bits == 4:
-            scale = np.max(np.abs(w)) / 7.0
-            if scale == 0:
-                return w
-            wi = np.clip(np.round(w / scale).astype(np.int32), -8, 7).astype(np.int8)
-            out = wi.astype(np.float32) * scale
-            return np.clip(np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0), -1e6, 1e6)
+            amax = np.max(np.abs(w))
+            if amax == 0 or not np.isfinite(amax): return w
+            scale = amax / 7.0
+            return np.clip(np.round(w / scale).astype(np.int32), -8, 7).astype(np.float32) * scale
         return w
 
     def _quantize_dequant_act(self, x, bits):
-        """Simulate activation quantization. bits: 16 (fp16), 8 (int8), 4 (int4). Returns float32."""
         if bits == 16:
-            return x.astype(np.float16).astype(np.float32)
+            return np.clip(x, -65504, 65504).astype(np.float16).astype(np.float32)
         if bits == 8:
-            scale = np.max(np.abs(x)) / 127.5
-            if scale == 0:
-                return x
-            xi = np.clip(np.round(x / scale).astype(np.int32), -128, 127).astype(np.int8)
-            return xi.astype(np.float32) * scale
+            amax = np.max(np.abs(x))
+            if amax == 0 or not np.isfinite(amax): return x
+            scale = amax / 127.5
+            return np.clip(np.round(x / scale).astype(np.int32), -128, 127).astype(np.float32) * scale
         if bits == 4:
-            scale = np.max(np.abs(x)) / 7.0
-            if scale == 0:
-                return x
-            xi = np.clip(np.round(x / scale).astype(np.int32), -8, 7).astype(np.int8)
-            return xi.astype(np.float32) * scale
+            amax = np.max(np.abs(x))
+            if amax == 0 or not np.isfinite(amax): return x
+            scale = amax / 7.0
+            return np.clip(np.round(x / scale).astype(np.int32), -8, 7).astype(np.float32) * scale
         return x
 
     def get_w(self, name, transpose=False):
         if name is None: return None
         if isinstance(name, np.ndarray): return name.T if transpose else name
-        
         t0 = time.time()
         data = self.weights[name]
-        dt = time.time() - t0
-        # weight_load: ~0 when in-memory (dict/cache); non-zero on first load from safetensors
         if hasattr(self, '_stats') and 'weight_load' in self._stats:
-            self._stats['weight_load'].append(dt)
-        # Mixed-precision weight quantization (simulated: quantize->dequant to float32 for einsum)
-        # Skip LoRA adapters: keep float32 to avoid overflow in A@B and to support training
+            self._stats['weight_load'].append(time.time() - t0)
+
+        # Check if we should apply (and cache) simulated quantization
         wb = getattr(self.cfg, "quantization_weight_bits", 0)
-        if wb in (4, 8) and "lora" not in str(name).lower():
+        if wb in (4, 8) and not getattr(data, "_is_quantized", False) and "lora" not in str(name).lower():
             data = self._quantize_dequant_weight(data.astype(np.float32), wb)
+            # Mark as quantized and store back in weight manager cache to avoid re-computing
+            try:
+                data._is_quantized = True
+                self.weights[name] = data
+            except: pass # Some numpy arrays might not allow extra attributes
+
         return data.T if transpose else data
 
     def rms_norm(self, x, w, eps=1e-6, key=None):
         t0 = time.time()
-        rms = np.sqrt(np.mean(x**2, axis=-1, keepdims=True) + eps)
+        # Use higher precision for RMS calculation to avoid overflow
+        x_fp64 = x.astype(np.float64)
+        rms = np.sqrt(np.mean(x_fp64**2, axis=-1, keepdims=True) + eps).astype(x.dtype)
+        # Handle cases where rms might be zero or non-finite
+        rms = np.where(np.isfinite(rms) & (rms > 0), rms, eps)
         norm_x = x / rms
         res = norm_x * w
-        if hasattr(self, '_stats') and 'norm' in self._stats:
-            self._stats['norm'].append(time.time() - t0)
-        
-        if self.training and key is not None:
-            self._activations[key] = {"x": x, "rms": rms, "w": w, "norm_x": norm_x}
-            
+        if hasattr(self, '_stats') and 'norm' in self._stats: self._stats['norm'].append(time.time() - t0)
+        if self.training and key is not None: self._activations[key] = {"x": x, "rms": rms, "norm_x": norm_x}
         return res
 
     def swiglu(self, x, W1, W2, W3, key=None):
-        # x: [B, T, D]
-        a = np.einsum("btd,df->btf", x, W1, optimize=True)
-        b = np.einsum("btd,df->btf", x, W2, optimize=True)
-        # Optimized Swish (SiLU) activation
-        # We rely on NumPy handling overflow gracefully (inf -> 0 in 1/inf).
-        # This is ~10x faster than the masked implementation.
-        with np.errstate(over='ignore', invalid='ignore'):
-            sig_b = 1.0 / (1.0 + np.exp(-b))
-            swish_b = b * sig_b
-            gated = a * swish_b
+        t0 = time.time()
+
+        def proj(mat):
+            return np.einsum("btd,df->btf", x, mat, optimize=True)
+
+        futures = [self.executor.submit(proj, W1), self.executor.submit(proj, W2)]
+        a = futures[0].result()
+        b = futures[1].result()
+
+        # Numerical stable sigmoid to avoid overflow in np.exp
+        # We use a piecewise approach to avoid evaluating np.exp on values that would overflow
+        sig_b = np.zeros_like(b)
+        pos_mask = (b >= 0)
+        neg_mask = ~pos_mask
+        sig_b[pos_mask] = 1.0 / (1.0 + np.exp(-b[pos_mask]))
+        sig_b[neg_mask] = np.exp(b[neg_mask]) / (1.0 + np.exp(b[neg_mask]))
+
+        swish_b = b * sig_b
+        gated = a * swish_b
         res = np.einsum("btf,fd->btd", gated, W3, optimize=True)
-        
+        if hasattr(self, '_stats') and 'ffn_compute' in self._stats:
+            self._stats['ffn_compute'].append(time.time() - t0)
         if self.training and key is not None:
-            self._activations[key] = {
-                "x": x, "W1": W1, "W2": W2, "W3": W3,
-                "a": a, "b": b, "sig_b": sig_b, "gated": gated
-            }
-            
+            self._activations[key] = {"x": x, "a": a, "b": b, "sig_b": sig_b, "gated": gated}
         return res
 
     def _log(self, *args, **kwargs):
-        if hasattr(self, 'verbose') and not self.verbose:
-            return
+        if hasattr(self, 'verbose') and not self.verbose: return
         print(*args, **kwargs)
-
-    def _print_stats_table(self, title="TIMING BREAKDOWN (seconds)"):
-        self._log("\n" + "="*50)
-        self._log(title)
-        self._log("-"*50)
-        self._log(f"{'Phase':<20} | {'p50':<10} | {'p99':<10}")
-        self._log("-" * 46)
-        
-        def print_row(name, times):
-            if not times: return
-            p50 = np.percentile(times, 50)
-            p99 = np.percentile(times, 99)
-            self._log(f"{name:<20} | {p50:<10.4f} | {p99:<10.4f}")
-
-        is_backward_table = "BACKWARD" in title.upper()
-
-        if not is_backward_table:
-            # Show embedding and output head if they exist
-            if self._stats.get('embedding'):
-                print_row("Embedding", self._stats['embedding'])
-            print_row("Layer Total", self._stats['layers'])
-            print_row("  Norm", self._stats['norm'])
-            print_row("  Weight Load", self._stats['weight_load'])
-            print_row("  Attention", self._stats['attn'])
-            print_row("    Ld weights", self._stats['attn_load'])
-            print_row("    QKV Proj", self._stats['attn_qkv'])
-            print_row("    RoPE", self._stats['attn_rope'])
-            print_row("    Score/Sftmx", self._stats['attn_score'])
-            print_row("    Out Agg/Proj", self._stats['attn_out'])
-            print_row("  FeedForward", self._stats['ffn'])
-            print_row("    Ld weights", self._stats['ffn_load'])
-            print_row("    Compute", self._stats['ffn_compute'])
-            # Explain ~0 load times: in-memory (random init or cached) vs disk (safetensors lazy-load)
-            wl, al, fl = self._stats.get('weight_load') or [], self._stats.get('attn_load') or [], self._stats.get('ffn_load') or []
-            if (wl and max(wl) < 0.001) or (al and max(al) < 0.001) or (fl and max(fl) < 0.001):
-                self._log("[NOTE] Weight Load / Ld weights ~0: weights are in-memory (random init or cached). With safetensors lazy-load, first access per tensor can be non-zero.")
-            if self._stats.get('output_head'):
-                print_row("Output Head", self._stats['output_head'])
-        
-        # Backward pass stats
-        if any(k.startswith('bw_') and self._stats.get(k) for k in self._stats):
-            if is_backward_table:
-                print_row("Backward Pass", self._stats.get('bw_total'))
-                print_row("  BW Layers", self._stats.get('bw_layers'))
-                print_row("  BW Head", self._stats.get('bw_head'))
-                print_row("  BW Embed", self._stats.get('bw_embed'))
-                print_row("  BW Attention", self._stats.get('bw_attn'))
-                print_row("  BW FeedForward", self._stats.get('bw_ffn'))
-                print_row("  BW Norms", self._stats.get('bw_norm'))
-
-        if not is_backward_table:
-            if self._stats['prefill']:
-                self._log("-" * 46)
-                # Calculate sum of components for verification
-                components_sum = 0
-                if self._stats.get('embedding'):
-                    components_sum += sum(self._stats['embedding'])
-                if self._stats.get('layers'):
-                    components_sum += sum(self._stats['layers'])
-                if self._stats.get('output_head'):
-                    components_sum += sum(self._stats['output_head'])
-                prefill_total = sum(self._stats['prefill'])
-                if abs(components_sum - prefill_total) > 0.01:  # Allow 10ms difference for overhead
-                    self._log(f"[NOTE] Prefill components sum: {components_sum:.4f}s, Total: {prefill_total:.4f}s, Diff: {prefill_total - components_sum:.4f}s (overhead/KV cache)")
-                print_row("Prefill Stage", self._stats['prefill'])
-            
-            if self._stats['decode']:
-                self._log("-" * 46)
-                print_row("Decode Stage", self._stats['decode'])
-            
-            if hasattr(self, '_kv_size_mb') and self._kv_size_mb > 0:
-                self._log("-" * 46)
-                self._log(f"{'KV Cache Size':<20} | {self._kv_size_mb:<10.2f} MB")
-        
-        # Optimizer stats
-        if self._stats.get('opt_step'):
-            self._log("-" * 46)
-            print_row("Optimizer Step", self._stats['opt_step'])
-            opt_mem = self._memory_stats.get('opt_per_step_mb', [])
-            if opt_mem:
-                opt_mem_avg = np.mean(opt_mem)
-                self._log(f"{'  Memory/Step':<20} | {opt_mem_avg:<10.2f} MB")
-            
-        self._log("="*50 + "\n")
 
     def apply_rope(self, x, positions):
         B, T, H, D = x.shape
-        # Ensure cos/sin sequence length matches x's sequence dim T (handles Q vs K shape mismatches)
         pos = np.asarray(positions, dtype=np.float64)
-        if len(pos) > T:
-            pos = pos[:T]
-        elif len(pos) < T:
-            pos = np.concatenate([pos, np.arange(len(pos), T, dtype=pos.dtype)])
+        if len(pos) != T:
+            if len(pos) > T: pos = pos[:T]
+            else: pos = np.concatenate([pos, np.arange(pos[-1]+1, pos[-1]+1 + T - len(pos))])
         inv_freq = 1.0 / (self.cfg.rope_base ** (np.arange(0, D, 2) / D))
         freqs = np.outer(pos, inv_freq)
         cos, sin = np.cos(freqs), np.sin(freqs)
-        
-        # Reshape cos/sin for broadcasting: (T, D/2) -> (1, T, 1, D/2)
-        # Note: x shape is (B, T, H, D)
-        cos = cos[None, :, None, :]
-        sin = sin[None, :, None, :]
-
-        # Split x into pairs (even and odd indices)
-        x1 = x[..., 0::2]
-        x2 = x[..., 1::2]
-        
+        cos, sin = cos[None, :, None, :], sin[None, :, None, :]
+        x1, x2 = x[..., 0::2], x[..., 1::2]
         out = np.empty_like(x)
         out[..., 0::2] = x1 * cos - x2 * sin
         out[..., 1::2] = x1 * sin + x2 * cos
         return out
 
-    def _rope_backward(self, dy, positions):
-        """Backward pass for RoPE: dL/dx = R^T * dL/dy."""
-        B, T, H, D = dy.shape
-        pos = np.asarray(positions, dtype=np.float64)
-        if len(pos) > T:
-            pos = pos[:T]
-        elif len(pos) < T:
-            pos = np.concatenate([pos, np.arange(len(pos), T, dtype=pos.dtype)])
-        inv_freq = 1.0 / (self.cfg.rope_base ** (np.arange(0, D, 2) / D))
-        freqs = np.outer(pos, inv_freq)
-        cos, sin = np.cos(freqs), np.sin(freqs)
-        cos = cos[None, :, None, :]
-        sin = sin[None, :, None, :]
-        
-        dy1, dy2 = dy[..., 0::2], dy[..., 1::2]
-        dx = np.empty_like(dy)
-        # Apply transpose rotation: [cos sin; -sin cos]
-        dx[..., 0::2] = dy1 * cos + dy2 * sin
-        dx[..., 1::2] = -dy1 * sin + dy2 * cos
-        return dx
-
-    def sample_top_k(self, logits, k=50, temperature=1.0):
-        # logits: [B, T, V] - usually we sample from the last token
-        logits = logits[:, -1, :] / (temperature + 1e-9)
-        
-        # Select top k
-        indices_to_remove = logits < np.partition(logits, -k, axis=-1)[..., -k, None]
-        logits[indices_to_remove] = -float('Inf')
-        
-        # Softmax and sample
-        exp_logits = np.exp(logits - np.max(logits, axis=-1, keepdims=True))
-        probs = exp_logits / np.sum(exp_logits, axis=-1, keepdims=True)
-        
-        # Multilingual/simple multinomial sampling
-        next_tokens = []
-        for i in range(probs.shape[0]):
-            token = np.random.choice(len(probs[i]), p=probs[i])
-            next_tokens.append(token)
-        return np.array(next_tokens)
-
-    def detokenize(self, token_ids):
-        # Placeholder de-tokenizer
-        return [f"<token_{tid}>" for tid in token_ids]
-
     def attention(self, x, layer_idx, inference=False):
         t0 = time.time()
-        self._log(f"  [Layer {layer_idx}] Entering Attention...")
-        c = self.cfg
-        p = self.layer_weights[layer_idx]
-        
-        t_load = time.time()
-        W_q, W_k, W_v, W_o = [self.get_w(p[k], transpose=True) for k in ["W_q", "W_k", "W_v", "W_o"]]
-        
-        # Apply LoRA adapters if training, LoRA is enabled, and adapters exist for this layer
-        if self.training and self.use_lora:
-            r = self.lora_rank
-            alpha = self.lora_alpha
-            scale = alpha / r
-            
-            if "q_proj" in self.lora_target_modules and p.get("lora_A_q") is not None:
-                A_q = self.get_w(p["lora_A_q"])
-                B_q = self.get_w(p["lora_B_q"])
-                # W_q is already transposed (d_model, d_model), so we need (B @ A).T which is A^T @ B^T
-                # In our storage: A is (d_model, r), B is (r, d_model). 
-                # W = W0 + BA.
-                # Here W_q is used as x @ W_q. W_q shape is (d_model, d_model).
-                # Normal linear is x @ W^T in torch, but here we store W as (out, in) and transpose to (in, out).
-                # So we want to add (B @ A)^T to the weight matrix used for multiplication.
-                # (B @ A)^T = A^T @ B^T.
-                # A: (d, r), B: (r, d).
-                # A.T: (r, d), B.T: (d, r).
-                # Wait, safetensors stores weights as (out, in).
-                # Our W_q variable here is transposed: (in, out) = (d_model, d_model).
-                # Regular forward: x @ W_q. 
-                # LoRA forward: x @ (W_q + s * (B @ A)^T) = x @ W_q + s * x @ A @ B.
-                # Let's do it explicitly: x @ A @ B seems easier and more efficient than updating W_q full matrix.
-                # But to keep code simple for now, we'll update W_q directly:
-                # W_q_new = W_q + s * (A @ B).T ?
-                # A is (d, r), B is (r, d). A @ B is (d, d).
-                # If we do (A @ B), it matches W_q shape (d, d) if W_q is (in, out).
-                # Let's verify shapes. get_w returns name or array. If array, it returns transpose if transpose=True.
-                # In _bind_weights, we just store names.
-                # In init, we stored A as (d, r) and B as (r, d).
-                # If we want W + B@A, and W is (d,d), then B@A is (r,d)@(d,r)? No.
-                # Standard LoRA: W + B@A. W is (d_out, d_in). B is (d_out, r), A is (r, d_in).
-                # Here W_q via get_w(..., transpose=True) is (d_model, d_model) -> (d_in, d_out).
-                # So we want W_q + (B @ A).T = W_q + A.T @ B.T
-                # Let's stick to the shapes we initialized:
-                # A: (d_model, r), B: (r, d_model).
-                # Product A @ B is (d_model, d_model).
-                # This matches W_q (d_in, d_out) directly if we assume A corresponds to input side?
-                # Actually standard LoRA is B(A(x)).
-                # x: (B, T, d). A: (d, r) -> x@A: (B, T, r). B: (r, d). x@A@B: (B, T, d).
-                # So effectively we are adding A @ B to the weight matrix W (if x @ W).
-                # So yes, W_q += scale * (A @ B). Sanitize A,B and delta to avoid overflow/div0 in matmul.
-                A_q = np.clip(np.nan_to_num(np.asarray(A_q, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0), -50.0, 50.0)
-                B_q = np.clip(np.nan_to_num(np.asarray(B_q, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0), -50.0, 50.0)
-                delta_q = np.clip(np.nan_to_num(A_q @ B_q, nan=0.0, posinf=0.0, neginf=0.0), -1e4, 1e4)
-                W_q = W_q + scale * delta_q
-
-            if "v_proj" in self.lora_target_modules and p.get("lora_A_v") is not None:
-                A_v = self.get_w(p["lora_A_v"])
-                B_v = self.get_w(p["lora_B_v"])
-                A_v = np.clip(np.nan_to_num(np.asarray(A_v, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0), -50.0, 50.0)
-                B_v = np.clip(np.nan_to_num(np.asarray(B_v, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0), -50.0, 50.0)
-                delta_v = np.clip(np.nan_to_num(A_v @ B_v, nan=0.0, posinf=0.0, neginf=0.0), -1e4, 1e4)
-                W_v = W_v + scale * delta_v
-
-        self._stats['attn_load'].append(time.time() - t_load)
-        
-        t_qkv = time.time()
+        c, p = self.cfg, self.layer_weights[layer_idx]
         B, T = x.shape[0], x.shape[1]
-        Q = np.einsum("btd,dh->bth", x, W_q, optimize=True).reshape(B, T, c.n_heads, c.d_head)
-        K = np.einsum("btd,dh->bth", x, W_k, optimize=True).reshape(B, T, c.n_kv_heads, c.d_head)
-        V = np.einsum("btd,dh->bth", x, W_v, optimize=True).reshape(B, T, c.n_kv_heads, c.d_head)
-        self._stats['attn_qkv'].append(time.time() - t_qkv)
+
+        def compute_proj(name_key):
+            t_l = time.time()
+            W = self.get_w(p[name_key], transpose=True)
+            t_load_weight = time.time() - t_l
+
+            t_p = time.time()
+            proj = np.einsum("btd,dh->bth", x, W, optimize=True)
+
+            # Handle LoRA if applicable
+            lora_act = None
+            if self.use_lora:
+                lora_a_key = f"lora_A_{name_key[2:]}" # e.g. W_q -> lora_A_q
+                lora_b_key = f"lora_B_{name_key[2:]}"
+                if p.get(lora_a_key):
+                    scale = self.lora_alpha / self.lora_rank
+                    A, Bl = self.get_w(p[lora_a_key]), self.get_w(p[lora_b_key])
+                    xA = np.einsum("btd,dr->btr", x, A, optimize=True)
+                    proj += scale * np.einsum("btr,rh->bth", xA, Bl, optimize=True)
+                    if self.training:
+                        lora_act = {"xA": xA, "A": A, "B": Bl, "s": scale}
+
+            t_proj_time = time.time() - t_p
+            return name_key, proj, lora_act, t_load_weight, t_proj_time
+
+        # Run Q, K, V projections in parallel
+        futures = [self.executor.submit(compute_proj, k) for k in ["W_q", "W_k", "W_v"]]
+
+        results = {}
+        t_load_sum = 0
+        t_qkv_sum = 0
+        for future in as_completed(futures):
+            name_key, proj, lora_act, t_lw, t_pt = future.result()
+            results[name_key] = proj
+            if lora_act and self.training:
+                self._activations[f"lora_{name_key[2:]}_{layer_idx}"] = lora_act
+            t_load_sum += t_lw
+            t_qkv_sum += t_pt
+
+        self._stats['attn_load'].append(t_load_sum / 3.0) # Average or total? Usually stats are for the critical path
+        self._stats['attn_qkv'].append(t_qkv_sum / 3.0)
+
+        W_o = self.get_w(p["W_o"], transpose=True)
+
+        Q = results["W_q"].reshape(B, T, c.n_heads, c.d_head)
+        K = results["W_k"].reshape(B, T, c.n_kv_heads, c.d_head)
+        V = results["W_v"].reshape(B, T, c.n_kv_heads, c.d_head)
 
         if c.use_mqa or c.use_gqa:
             repeats = c.n_heads // c.n_kv_heads
@@ -871,13 +761,22 @@ class EinsumTransformer:
             V = np.repeat(V, repeats, axis=2)
 
         t_rope = time.time()
-        pos = np.arange(Q.shape[1])
-        self._log(f"    [RoPE] dim={Q.shape[-1]}, seq_len={len(pos)}")
+        pos = np.arange(self.cur_pos, self.cur_pos + T) if inference else np.arange(T)
         Q, K = self.apply_rope(Q, pos), self.apply_rope(K, pos)
         self._stats['attn_rope'].append(time.time() - t_rope)
 
-        Q_t, K_t, V_t = [t.transpose(0, 2, 1, 3) for t in [Q, K, V]]
+        # Transpose to [Batch, Heads, SeqLen, HeadDim]
+        # Convention:
+        # B       - Batch size: number of independent sequences processed in parallel
+        # H       - Heads: number of attention heads
+        # T       - SeqLen: number of tokens in the sequence (time dimension)
+        # D_head  - HeadDim: dimension of each individual attention head
+        Q_t = Q.transpose(0, 2, 1, 3)
+        K_t = K.transpose(0, 2, 1, 3)
+        V_t = V.transpose(0, 2, 1, 3)
+
         if inference:
+            # Update or initialize KV cache for iterative decoding
             if self.cache[layer_idx]["K"] is None:
                 self.cache[layer_idx]["K"], self.cache[layer_idx]["V"] = K_t, V_t
             else:
@@ -887,73 +786,64 @@ class EinsumTransformer:
 
         t_score = time.time()
         scores = np.einsum("bhid,bhjd->bhij", Q_t, K_t, optimize=True) / np.sqrt(c.d_head)
-        mask = np.tril(np.ones(scores.shape[-2:], dtype=np.float32))
+        if inference:
+            if T == 1: mask = np.ones((1, self.cur_pos + 1))
+            else: mask = np.concatenate([np.ones((T, self.cur_pos)), np.tril(np.ones((T, T)))], axis=1)
+        else: mask = np.tril(np.ones((T, T)))
         scores = scores * mask - 1e9 * (1 - mask)
-        
-        # Softmax
         attn_exp = np.exp(scores - scores.max(axis=-1, keepdims=True))
         attn = attn_exp / attn_exp.sum(axis=-1, keepdims=True)
         self._stats['attn_score'].append(time.time() - t_score)
 
         t_out = time.time()
+        # Multiply attention weights by values: [B, H, T, T] x [B, H, T, D_head] -> [B, H, T, D_head]
         weighted_v = np.einsum("bhij,bhjd->bhid", attn, V_t, optimize=True)
+
+        # Merge heads back into model dimension
         weighted_v_merged = weighted_v.transpose(0, 2, 1, 3).reshape(B, T, c.d_model)
+
+        # Output projection
         res = np.einsum("btd,dh->bth", weighted_v_merged, W_o, optimize=True)
         self._stats['attn_out'].append(time.time() - t_out)
-        
         self._stats['attn'].append(time.time() - t0)
-        
         if self.training:
             self._activations[f"attn_{layer_idx}"] = {
-                "x": x, "W_q": W_q, "W_k": W_k, "W_v": W_v, "W_o": W_o,
-                "Q": Q, "K": K, "V": V, "Q_t": Q_t, "K_t": K_t, "V_t": V_t,
-                "attn": attn, "weighted_v": weighted_v, "weighted_v_merged": weighted_v_merged
+                "x": x, "Q_t": Q_t, "K_t": K_t, "V_t": V_t,
+                "attn": attn, "weighted_v_merged": weighted_v_merged
             }
-            
         return res
 
     def moe_ffn(self, x, layer_idx):
         t0 = time.time()
-        self._log(f"  [Layer {layer_idx}] Entering MoE FFN...")
         p = self.layer_weights[layer_idx]
-        gate = self.get_w(p["gate"], transpose=True)
-        gate_logits = np.einsum("btd,df->btf", x, gate, optimize=True)
-        top = np.argsort(gate_logits, axis=-1)[..., -self.cfg.top_k:]
+        gate_logits = np.einsum("btd,df->btf", x, self.get_w(p["gate"], transpose=True), optimize=True)
+        top_indices = np.argsort(gate_logits, axis=-1)[..., -self.cfg.top_k:]
         out = np.zeros_like(x)
-        for i in range(self.cfg.top_k):
-            expert_idx = top[..., i]
-            for e in range(self.cfg.num_experts):
-                mask = (expert_idx == e)[..., None]
-                exp = p["experts"][e]
-                W1, W2, W3 = [self.get_w(exp[k], transpose=True) for k in ["W1", "W2", "W3"]]
-                out += mask * self.swiglu(x, W1, W2, W3)
-        
-        res = out / self.cfg.top_k
-        if not hasattr(self, '_stats'): self._stats = {}
-        if 'ffn' not in self._stats: self._stats['ffn'] = []
+
+        def run_expert(e, b_idx, t_idx):
+            # Pre-fetch weights in worker (safetensors handle is thread-safe, but OrderedDict cache is not)
+            # Actually, to be safe and avoid OrderedDict contention, we'll pre-fetch in main thread if possible,
+            # but here we'll just use the weights.
+            W1, W2, W3 = [self.get_w(p["experts"][e][k], transpose=True) for k in ["W1", "W2", "W3"]]
+            return e, b_idx, t_idx, self.swiglu(x[b_idx, t_idx][None, :, :], W1, W2, W3)
+
+        futures = []
+        for e in range(self.cfg.num_experts):
+            b_idx, t_idx, k_idx = np.where(top_indices == e)
+            if len(b_idx) == 0: continue
+            futures.append(self.executor.submit(run_expert, e, b_idx, t_idx))
+
+        for future in as_completed(futures):
+            e, b_idx, t_idx, res_expert = future.result()
+            out[b_idx, t_idx] += res_expert[0]
+
         self._stats['ffn'].append(time.time() - t0)
-        return res
+        return out / self.cfg.top_k
 
-    def _init_stats(self):
-        self._stats = {
-            'attn': [], 'ffn': [], 'layers': [], 'norm': [], 'weight_load': [],
-            'attn_load': [], 'attn_qkv': [], 'attn_rope': [], 'attn_score': [], 'attn_out': [],
-            'ffn_load': [], 'ffn_compute': [],
-            'prefill': [], 'decode': [],
-            'bw_total': [], 'bw_layers': [], 'bw_attn': [], 'bw_ffn': [], 'bw_norm': [], 'bw_head': [], 'bw_embed': [],
-            'bw_grad_mem_calc': [],  # Time spent calculating gradient memory
-            'opt_step': []  # Optimizer step timing
-        }
-        self._memory_stats = {
-            'grad_total_mb': 0,  # Total gradient memory
-            'grad_breakdown': {},  # Per-weight gradient memory
-            'opt_per_step_mb': []  # Optimizer memory per step
-        }
-
-    def forward(self, tokens, inference=False, verbose=True, training=False):
+    def forward(self, tokens, inference=False, verbose=True, training=False, max_layers=None):
         """
         Forward pass of the Transformer using pure einsum notation.
-        
+
         HIGH-LEVEL FLOW:
         ================
         1. Embedding Lookup: tokens -> x via E[tokens]
@@ -976,7 +866,7 @@ class EinsumTransformer:
               - Down: gated @ W3 -> ffn_out
            f. Residual Connection: x = x + ffn_out
         3. Output Head: x @ E^T -> logits
-        
+
         KEY EINSUM OPERATIONS:
         ======================
         Embedding:        E[tokens] -> (B, T, D)
@@ -987,218 +877,108 @@ class EinsumTransformer:
         SwiGLU Gate:      einsum('btd,df->btf', x, W1) -> a  [f=d_ff]
         SwiGLU Down:      einsum('btf,fd->btd', gated, W3) -> ffn_out
         Output Head:      einsum('btd,vd->btv', x, E) -> logits  [v=vocab_size]
-        
-        ACTIVATIONS SAVED (if training=True):
-        =====================================
-        - tokens, E, final_x
-        - Per-layer: norm1, norm2, attn (x, W_q/k/v/o, Q/K/V, Q_t/K_t/V_t, attn, weighted_v)
-        - Per-layer: ffn (x, W1/2/3, a, b, sig_b, gated)
         """
+        self.verbose, self.training = verbose, training
+        if not hasattr(self, '_stats'): self._init_stats()
 
-        self.verbose = verbose
-        self.training = training
-        # Initialize stats if missing; or if not training and fresh forward (e.g. generate prefill). During training, caller inits before the loop.
-        if not hasattr(self, '_stats'):
-            self._init_stats()
-        elif not self.training and verbose and not any(c["K"] is not None for c in self.cache):
-            self._init_stats()
-            
-        if training:
-            self._activations = {"tokens": tokens}
-            self._grads = {}
-            
+        # Record start lengths of layered stats to aggregate them later
+        layered_keys = ['layers', 'norm', 'weight_load', 'attn', 'attn_load', 'attn_qkv',
+                        'attn_rope', 'attn_score', 'attn_out', 'ffn', 'ffn_load', 'ffn_compute']
+        stat_starts = {k: len(self._stats[k]) for k in layered_keys}
+
+        if training: self._activations, self._grads = {"tokens": tokens}, {}
+        is_decode = inference and any(c["K"] is not None for c in self.cache)
+        if inference and not is_decode: self.cur_pos = 0
         t_stage_start = time.time()
-        c = self.cfg
-        self._log("\n" + "="*50)
-        self._log(f"MODEL PROFILING: {c.arch.upper()} {'(TRAINING)' if training else ''}")
-        self._log(f"Input Dimension:  {tokens.shape}")
-        self._log(f"Hidden Dimension: {c.d_model}")
-        self._log(f"Output Dimension: {c.vocab_size}")
-        self._log(f"Layers:           {c.n_layers}")
-        self._log(f"Max Context Len:  {c.seq_len}")
-        self._log("="*50)
 
-        self._log("[INFO] Starting forward pass...")
+        c = self.cfg
+        if self.verbose and not is_decode:
+            self._log("\n" + "="*50)
+            self._log(f"MODEL PROFILING: {c.arch.upper()} {'(TRAINING)' if training else ''}")
+            self._log(f"Input Dimension:  {tokens.shape}")
+            self._log(f"Hidden Dimension: {c.d_model}")
+            self._log(f"Output Dimension: {c.vocab_size}")
+            self._log(f"Layers:           {c.n_layers}")
+            self._log(f"Max Context Len:  {c.seq_len}")
+            self._log("="*50)
+            self._log("[INFO] Starting forward pass...")
+
         t_embed = time.time()
         E = self.get_w(self.E_name)
         x = E[tokens]
-        if 'embedding' not in self._stats:
-            self._stats['embedding'] = []
+        if 'embedding' not in self._stats: self._stats['embedding'] = []
         self._stats['embedding'].append(time.time() - t_embed)
-        self._log(f"[INFO] Embedded tokens, shape: {x.shape}")
         ab = getattr(self.cfg, "quantization_activation_bits", 0)
-        if ab in (4, 8, 16):
-            x = self._quantize_dequant_act(x.astype(np.float32), ab)
-        if training:
-            self._activations["embedding"] = x
-            self._activations["E"] = E
+        if ab in (4, 8, 16): x = self._quantize_dequant_act(x.astype(np.float32), ab)
+        if training: self._activations["embedding"] = x
         
-        # Identify stage: PREFILL if no cache, DECODE if cache exists
-        is_decode = inference and any(c["K"] is not None for c in self.cache)
-        stage = "DECODE" if is_decode else "PREFILL"
-        self._log(f"\n[STAGE: {stage}]")
-        
-        for i in range(self.cfg.n_layers):
+        n_layers = max_layers if max_layers is not None else self.cfg.n_layers
+
+        # Track aggregate time for all layers in this step
+        t_layers_step = 0
+
+        for i in range(n_layers):
             t_layer_start = time.time()
-            self._log(f"[INFO] Computing Layer {i}...")
             p = self.layer_weights[i]
-            
             x_norm = self.rms_norm(x, self.get_w(p["norm1"]), key=f"norm1_{i}")
-            if ab in (4, 8, 16):
-                x_norm = self._quantize_dequant_act(x_norm.astype(np.float32), ab)
-            attn_out = self.attention(x_norm, i, inference)
-            x = x + attn_out
-            
+            if ab in (4, 8, 16): x_norm = self._quantize_dequant_act(x_norm.astype(np.float32), ab)
+            x = x + self.attention(x_norm, i, inference)
             x_norm = self.rms_norm(x, self.get_w(p["norm2"]), key=f"norm2_{i}")
-            if ab in (4, 8, 16):
-                x_norm = self._quantize_dequant_act(x_norm.astype(np.float32), ab)
-            if self.cfg.use_moe:
-                x = x + self.moe_ffn(x_norm, i)
+            if ab in (4, 8, 16): x_norm = self._quantize_dequant_act(x_norm.astype(np.float32), ab)
+            if self.cfg.use_moe: x = x + self.moe_ffn(x_norm, i)
             else:
-                self._log(f"  [Layer {i}] Entering FeedForward...")
                 t_ffn_start = time.time()
-                
                 t_fload = time.time()
                 W1, W2, W3 = [self.get_w(p[k], transpose=True) for k in ["W1", "W2", "W3"]]
                 self._stats['ffn_load'].append(time.time() - t_fload)
-                
-                t_fcomp = time.time()
                 ffn_out = self.swiglu(x_norm, W1, W2, W3, key=f"ffn_{i}")
                 x = x + ffn_out
-                self._stats['ffn_compute'].append(time.time() - t_fcomp)
-                
                 self._stats['ffn'].append(time.time() - t_ffn_start)
-            self._stats['layers'].append(time.time() - t_layer_start)
-        
-        # Helper function to calculate KV cache size
-        def _calculate_kv_cache_size():
-            total_elements = 0
-            for c in self.cache:
-                if c["K"] is not None:
-                    total_elements += c["K"].size + c["V"].size
-            return (total_elements * 4) / (1024 * 1024), total_elements
-        
-        if stage == "PREFILL":
-            # Calculate KV cache size
-            # Formula: Total Elements = n_layers × 2 × batch_size × num_heads_in_cache × seq_len × d_head
-            # Where:
-            #   - n_layers: number of transformer layers
-            #   - 2: accounts for both K and V caches
-            #   - batch_size: batch dimension
-            #   - num_heads_in_cache: n_heads (not n_kv_heads!) because K/V are repeated for GQA/MQA
-            #   - seq_len: sequence length
-            #   - d_head: dimension per head (d_model // n_heads)
-            # 
-            # KV Cache shape per layer: (batch_size, n_heads, seq_len, d_head)
-            # Note: Even with GQA, K and V are repeated to n_heads before caching (see attention method)
-            # After transpose in attention: K_t and V_t have shape (batch_size, n_heads, seq_len, d_head)
-            # Memory: elements × 4 bytes (float32) = size in bytes
-            size_mb, total_elements = _calculate_kv_cache_size()
-            if size_mb > 0:
-                # Log with formula breakdown for verification
-                # IMPORTANT: Use n_heads, not n_kv_heads, because K/V are repeated for GQA/MQA
-                num_heads_in_cache = self.cfg.n_heads  # After repeat operation in attention()
-                expected_elements = self.cfg.n_layers * 2 * self.cfg.batch_size * num_heads_in_cache * self.cfg.seq_len * (self.cfg.d_model // self.cfg.n_heads)
-                expected_mb = (expected_elements * 4) / (1024 * 1024)
-                self._log(f"[TELEMETRY] KV Cache Generated. Size: {size_mb:.2f} MB ({total_elements} elements)")
-                self._log(f"[TELEMETRY] Expected (formula): {expected_mb:.2f} MB ({expected_elements} elements)")
-                self._log(f"[TELEMETRY] Formula: n_layers({self.cfg.n_layers}) × 2 × batch({self.cfg.batch_size}) × heads_in_cache({num_heads_in_cache}) × seq_len({self.cfg.seq_len}) × d_head({self.cfg.d_model // self.cfg.n_heads})")
-                if abs(total_elements - expected_elements) > 1:  # Allow 1 element rounding difference
-                    self._log(f"[WARNING] Mismatch detected! Actual: {total_elements}, Expected: {expected_elements}, Diff: {total_elements - expected_elements}")
-            self._kv_size_mb = size_mb
-            self._stats['prefill'].append(time.time() - t_stage_start)
-        else:
-            self._stats['decode'].append(time.time() - t_stage_start)
 
-        self._log("[INFO] Final layers complete. Computing output head...")
-        t_head = time.time()
+            t_layer = time.time() - t_layer_start
+            self._stats['layers'].append(t_layer)
+            t_layers_step += t_layer
+
+        self._stats['layers_step'].append(t_layers_step)
+
+        # Aggregate layered stats for this forward pass
+        for k in layered_keys:
+            if k == 'layers': continue # handled above as layers_step
+            self._stats[k + '_step'].append(sum(self._stats[k][stat_starts[k]:]))
+
+        if inference: self.cur_pos += tokens.shape[1]
+        if not is_decode and inference: self._stats['prefill'].append(time.time() - t_stage_start)
+        elif is_decode: self._stats['decode'].append(time.time() - t_stage_start)
+
         if training:
             self._activations["final_x"] = x
+            # Calculate activation memory footprint correctly
+            def _sum_bytes(d):
+                b = 0
+                for v in d.values():
+                    if isinstance(v, np.ndarray): b += v.nbytes
+                    elif isinstance(v, dict): b += _sum_bytes(v)
+                return b
+            w_mem = self.weights.get_cache_memory_mb() if hasattr(self.weights, 'get_cache_memory_mb') else 0
+            self._memory_stats['fwd_activation_mb'] = (_sum_bytes(self._activations) / (1024 * 1024)) + w_mem
+
+        t_head = time.time()
         res = np.einsum("btd,vd->btv", x, E, optimize=True)
-        if 'output_head' not in self._stats:
-            self._stats['output_head'] = []
+        if 'output_head' not in self._stats: self._stats['output_head'] = []
         self._stats['output_head'].append(time.time() - t_head)
-        self._log(f"[INFO] Logits computed, shape: {res.shape}")
-
-        # Note: Sampling and detokenization are handled in generate() method for streaming
-
-        if training and hasattr(self, '_memory_stats'):
-            def _nbytes(v):
-                if hasattr(v, 'nbytes'): return v.nbytes
-                if isinstance(v, dict): return sum(_nbytes(x) for x in v.values())
-                return 0
-            self._memory_stats['fwd_activation_mb'] = sum(_nbytes(v) for v in self._activations.values()) / (1024 * 1024)
-
-        if self.verbose and not self.training:
-            self._print_stats_table()
-
+        if self.verbose and not self.training and not is_decode: self._print_stats_table()
         return res
-
-    def merge_lora_weights(self):
-        """
-        Merge LoRA adapters into base weights for all layers.
-        Used for efficient inference or saving a consolidated checkpoint.
-        W_new = W_old + (alpha / r) * (A @ B).T   (Note: stored as A, B; W used as transpose in attention)
-        Actually, in attention we did W + scale * (A @ B).
-        But weights are stored in self.weights[name] as (out, in).
-        get_w(transpose=True) returns (in, out).
-        A: (in, r), B: (r, out). A @ B -> (in, out).
-        So we want W_stored += scale * (A @ B).T  -> (out, in).
-        """
-        if not self.use_lora or not self.lora_target_modules:
-            print("[INFO] LoRA is disabled or no LoRA modules to merge.")
-            return
-
-        print("[INFO] Merging LoRA adapters into base weights...")
-        c = self.cfg
-        r = self.lora_rank
-        alpha = self.lora_alpha
-        scale = alpha / r
-
-        for i in range(c.n_layers):
-            p = self.layer_weights[i]
-            
-            # Merge Q
-            if "q_proj" in self.lora_target_modules and p.get("lora_A_q") in self.weights:
-                W_q_name = p["W_q"]
-                W_q_stored = self.weights[W_q_name] # (out, in)
-                
-                A_q_name = p["lora_A_q"]
-                B_q_name = p["lora_B_q"]
-                A_q = self.weights[A_q_name] # (in, r)
-                B_q = self.weights[B_q_name] # (r, out)
-                
-                # Update: W_new = W + scale * (A @ B).T
-                delta = (A_q @ B_q).T
-                self.weights[W_q_name] = W_q_stored + scale * delta
-                print(f"[INFO] Merged LoRA into {W_q_name}")
-
-            # Merge V
-            if "v_proj" in self.lora_target_modules and p.get("lora_A_v") in self.weights:
-                W_v_name = p["W_v"]
-                W_v_stored = self.weights[W_v_name]
-                
-                A_v_name = p["lora_A_v"]
-                B_v_name = p["lora_B_v"]
-                A_v = self.weights[A_v_name]
-                B_v = self.weights[B_v_name]
-                
-                delta = (A_v @ B_v).T
-                self.weights[W_v_name] = W_v_stored + scale * delta
-                print(f"[INFO] Merged LoRA into {W_v_name}")
-        
-        print("[INFO] LoRA merge complete.")
 
     def backward(self, d_logits):
         """
         Backward pass computing all gradients using pure einsum notation.
-        
+
         HIGH-LEVEL FLOW:
         ================
         1. Output Head Backward:
            - Compute dx from d_logits and E
            - Compute dE (embedding gradient) from d_logits and final_x
-        
+
         2. For each layer (N-1 to 0, reverse order):
            a. FFN Backward (SwiGLU):
               - Backprop through W3 projection
@@ -1223,27 +1003,27 @@ class EinsumTransformer:
               - Compute d_norm1 gradient
               - Backprop through RMSNorm
               - Accumulate dx from attention residual path
-        
+
         3. Embedding Backward:
            - Accumulate dE from token lookup indices
-        
+
         KEY EINSUM OPERATIONS (BACKWARD):
         =================================
         Output Head:
           dx = einsum('btv,vd->btd', d_logits, E)
           dE = einsum('btv,btd->vd', d_logits, final_x)
-        
+
         FFN (SwiGLU):
           dW3 = einsum('btf,btd->fd', gated, dffn_out)
           dgated = einsum('btd,fd->btf', dffn_out, W3)
           dW1 = einsum('btd,btf->df', x, da)  [da = dgated * swish(b)]
           dW2 = einsum('btd,btf->df', x, db)  [db = dgated * a * swish'(b)]
           dx += einsum('btf,df->btd', da, W1) + einsum('btf,df->btd', db, W2)
-        
+
         RMSNorm:
           d_norm = einsum('btd,btd->d', dx_norm, norm_x)  [norm_x = x / rms]
           dx = (w / rms) * (dx_norm - mean(dx_norm * norm_x) * norm_x)
-        
+
         Attention:
           dW_o = einsum('btd,bth->dh', weighted_v_merged, dattn_out)
           dweighted_merged = einsum('bth,dh->btd', dattn_out, W_o)
@@ -1261,7 +1041,7 @@ class EinsumTransformer:
           dW_k = einsum('btd,bth->dh', x, dK.reshape(...))
           dW_v = einsum('btd,bth->dh', x, dV.reshape(...))
           dx += einsum('bth,dh->btd', dQ, W_q) + einsum('bth,dh->btd', dK, W_k) + einsum('bth,dh->btd', dV, W_v)
-        
+
         GRADIENTS COMPUTED:
         ===================
         - E: Embedding weight gradient (vocab_size, d_model)
@@ -1270,315 +1050,416 @@ class EinsumTransformer:
           * norm1, norm2: RMSNorm weight gradients (d_model,)
           * W1, W2, W3: FFN weight gradients (d_model, d_ff) or (d_ff, d_model)
         """
-
         t_total = time.time()
-        self._log("\n" + "="*50)
-        self._log("BACKPROPAGATION PHASE")
-        self._log("="*50)
-        self._log("Starting manual backward pass...")
+
+        # Record start lengths of layered stats to aggregate them later
+        layered_keys = ['bw_layers', 'bw_norm', 'bw_attn', 'bw_ffn', 'bw_attn_out', 'bw_attn_score', 'bw_attn_qkv', 'bw_ffn_compute']
+        stat_starts = {k: len(self._stats[k]) for k in layered_keys}
+
         c = self.cfg
-        
-        E = self._activations["E"]
+        E = self.get_w(self.E_name)
         final_x = self._activations["final_x"]
-        
-        # 1. Output Head Backward
+
         t_head = time.time()
-        # res = x @ E.T
+        # Gradient with respect to the final layer activations
+        # [B, T, V] x [V, D] -> [B, T, D]
         dx = np.einsum("btv,vd->btd", d_logits, E, optimize=True)
+
         if not self.use_lora:
+            # Gradient with respect to the output embedding (tied with input embedding)
             self._grads["E"] = np.einsum("btv,btd->vd", d_logits, final_x, optimize=True)
         self._stats['bw_head'].append(time.time() - t_head)
-        
-        # 2. Iterate layers backward (N-1 to 0)
+
         for i in reversed(range(c.n_layers)):
-            t_layer = time.time()
-            self._log(f"[INFO] Backprop through Layer {i}...")
-            
-            # --- FFN Backward ---
+            t_layer_start = time.time()
+            p = self.layer_weights[i]
             if not c.use_moe:
                 t_ffn = time.time()
-                act_ffn = self._activations[f"ffn_{i}"]
-                dffn_out = dx # Residual path
-                
-                # swiglu: res = (W1*x * sig(W2*x)) * W3
-                # swiglu: res = (W1*x * sig(W2*x)) * W3
-                # dW3 = gated^T * d_out
-                # If LoRA is active, we freeze FFN weights (skip saving dW).
-                if not self.use_lora:
-                    self._grads[f"W3_{i}"] = np.einsum("btf,btd->fd", act_ffn["gated"], dffn_out, optimize=True)
-                
-                dgated = np.einsum("btd,fd->btf", dffn_out, act_ffn["W3"], optimize=True)
-                
-                # gated = a * swish(b). da = d_gated * swish(b), dswish = d_gated * a
+                t_ffn_compute = time.time()
+                act_ffn, dffn_out = self._activations[f"ffn_{i}"], dx
+                W1, W2, W3 = [self.get_w(p[k], transpose=True) for k in ["W1", "W2", "W3"]]
+                if not self.use_lora: self._grads[f"W3_{i}"] = np.einsum("btf,btd->fd", act_ffn["gated"], dffn_out, optimize=True)
+                dgated = np.einsum("btd,fd->btf", dffn_out, W3, optimize=True)
                 da = dgated * (act_ffn["b"] * act_ffn["sig_b"])
                 db = dgated * act_ffn["a"] * (act_ffn["sig_b"] * (1 + act_ffn["b"] * (1 - act_ffn["sig_b"])))
-                
                 if not self.use_lora:
-                    self._grads[f"W1_{i}"] = np.einsum("btd,btf->df", act_ffn["x"], da, optimize=True)
-                    self._grads[f"W2_{i}"] = np.einsum("btd,btf->df", act_ffn["x"], db, optimize=True)
-                
-                df_x = np.einsum("btf,df->btd", da, act_ffn["W1"], optimize=True) + np.einsum("btf,df->btd", db, act_ffn["W2"], optimize=True)
+                    self._grads[f"W1_{i}"], self._grads[f"W2_{i}"] = np.einsum("btd,btf->df", act_ffn["x"], da, optimize=True), np.einsum("btd,btf->df", act_ffn["x"], db, optimize=True)
+                dx = dx + np.einsum("btf,df->btd", da, W1, optimize=True) + np.einsum("btf,df->btd", db, W2, optimize=True)
+                self._stats['bw_ffn_compute'].append(time.time() - t_ffn_compute)
+
+                t_norm2 = time.time()
+                act_norm2, dx_norm2 = self._activations[f"norm2_{i}"], dx
+                norm2_w = self.get_w(p["norm2"])
+                if not self.use_lora: self._grads[f"norm2_{i}"] = np.einsum("btd,btd->d", dx_norm2, act_norm2["norm_x"], optimize=True)
+                term1 = dx_norm2 * norm2_w
+                dx = dx + (term1 - np.mean(term1 * act_norm2["norm_x"], axis=-1, keepdims=True) * act_norm2["norm_x"]) / act_norm2["rms"]
+                self._stats['bw_norm'].append(time.time() - t_norm2)
                 self._stats['bw_ffn'].append(time.time() - t_ffn)
-                
-                # Norm2 backward
-                t_norm = time.time()
-                act_norm2 = self._activations[f"norm2_{i}"]
-                dx_norm2 = df_x
-                if not self.use_lora:
-                    self._grads[f"norm2_{i}"] = np.einsum("btd,btd->d", dx_norm2, act_norm2["norm_x"], optimize=True)
-                
-                # dL/dx = (gamma/rms) * (dL/dy - mean(dL/dy * norm_x) * norm_x)
-                term1 = dx_norm2 * act_norm2["w"]
-                term2 = np.mean(term1 * act_norm2["norm_x"], axis=-1, keepdims=True) * act_norm2["norm_x"]
-                dx = dx + (term1 - term2) / act_norm2["rms"] # Add ffn grad to residual dx
-                self._stats['bw_norm'].append(time.time() - t_norm)
-            
-            # --- Attention Backward ---
+
             t_attn = time.time()
-            act_attn = self._activations[f"attn_{i}"]
-            dattn_out = dx # Residual path
-            
-            # dW_o
-            if not self.use_lora:
-                self._grads[f"W_o_{i}"] = np.einsum("btd,bth->dh", act_attn["weighted_v_merged"], dattn_out, optimize=True)
-            dweighted_merged = np.einsum("bth,dh->btd", dattn_out, act_attn["W_o"], optimize=True)
-            B_bw, T_bw = dweighted_merged.shape[0], dweighted_merged.shape[1]
-            dweighted = dweighted_merged.reshape(B_bw, T_bw, c.n_heads, c.d_head).transpose(0, 2, 1, 3)
-            
-            # Weighted_v = attn @ V_t
-            # d_attn = d_weighted @ V_t.T
-            # d_V_t = attn.T @ d_weighted
-            dattn = np.einsum("bhid,bhjd->bhij", dweighted, act_attn["V_t"], optimize=True)
-            # Softmax backward
-            # d_scores = d_attn * attn - (d_attn * attn).sum(-1) * attn
-            dscores = act_attn["attn"] * (dattn - np.sum(dattn * act_attn["attn"], axis=-1, keepdims=True))
-            dscores = dscores / np.sqrt(c.d_head)
-            
-            # GQA Handling: act_attn["K_t"] and act_attn["V_t"] are already repeated in forward (B, n_heads, T, D)
-            # act_attn["attn"] is (B, n_heads, T, T)
-            # dweighted is (B, n_heads, T, D)
-            
-            # d_V_t_full = attn.T @ d_weighted
-            dV_t_full = np.einsum("bhij,bhid->bhjd", act_attn["attn"], dweighted, optimize=True)
-            
-            # d_Q_t = d_scores @ K_t_full
-            # d_K_t_full = d_scores.T @ Q_t
+            act_attn, dattn_out = self._activations[f"attn_{i}"], dx
+            W_o = self.get_w(p["W_o"], transpose=True)
+
+            t_bw_attn_out = time.time()
+            if not self.use_lora: self._grads[f"W_o_{i}"] = np.einsum("btd,bth->dh", act_attn["weighted_v_merged"], dattn_out, optimize=True)
+            # Backward through Output Projection and Merge
+            d_weighted_v_merged = np.einsum("bth,dh->btd", dattn_out, W_o, optimize=True)
+            d_weighted_v = d_weighted_v_merged.reshape(dx.shape[0], dx.shape[1], c.n_heads, c.d_head).transpose(0, 2, 1, 3)
+            self._stats['bw_attn_out'].append(time.time() - t_bw_attn_out)
+
+            t_bw_attn_score = time.time()
+            # Backward through Attention Softmax and Weighted Sum
+            # dattn: [B, H, T, T]
+            dattn = np.einsum("bhid,bhjd->bhij", d_weighted_v, act_attn["V_t"], optimize=True)
+
+            # Backward through Softmax
+            dscores = act_attn["attn"] * (dattn - np.sum(dattn * act_attn["attn"], axis=-1, keepdims=True)) / np.sqrt(c.d_head)
+            self._stats['bw_attn_score'].append(time.time() - t_bw_attn_score)
+
+            t_bw_attn_qkv = time.time()
+            # Gradients for Q, K, V projections
             dQ_t = np.einsum("bhij,bhjd->bhid", dscores, act_attn["K_t"], optimize=True)
-            dK_t_full = np.einsum("bhji,bhjd->bhid", dscores, act_attn["Q_t"], optimize=True)
-            
-            # Sum across GQA groups
+            dK_t_f = np.einsum("bhji,bhjd->bhid", dscores, act_attn["Q_t"], optimize=True)
+            dV_t_f = np.einsum("bhij,bhid->bhjd", act_attn["attn"], d_weighted_v, optimize=True)
             groups = c.n_heads // c.n_kv_heads
-            dK_t = dK_t_full.reshape(B_bw, c.n_kv_heads, groups, dK_t_full.shape[2], c.d_head).sum(2)
-            dV_t = dV_t_full.reshape(B_bw, c.n_kv_heads, groups, dV_t_full.shape[2], c.d_head).sum(2)
-            
-            # Transpose back to (B, T, H, D)
-            dQ = dQ_t.transpose(0, 2, 1, 3)
-            dK = dK_t.transpose(0, 2, 1, 3)
-            dV = dV_t.transpose(0, 2, 1, 3)
-            
-            # RoPE backward (rotate inverse)
-            # Since RoPE is an orthogonal rotation, its backward is the inverse rotation (negative angles)
-            pos = np.arange(dQ.shape[2])
-            dQ = self._rope_backward(dQ, pos)
-            dK = self._rope_backward(dK, pos)
-            
-            # Grad Projections
-            # Compute full weight gradients (dW_eff) first
-            # If LoRA is active, we need dW_eff for adapters, but we ONLY store adapters.
-            # If LoRA is NOT active, we store dW_eff.
-            
-            # Clip dQ, dK, dV gradients to prevent explosion during backprop loop
-            clip_val = 1.0 # Standard clipping value
-            dQ = np.clip(dQ, -clip_val, clip_val)
-            dK = np.clip(dK, -clip_val, clip_val)
-            dV = np.clip(dV, -clip_val, clip_val)
+            dQ, dK = dQ_t.transpose(0, 2, 1, 3), dK_t_f.reshape(dx.shape[0], c.n_kv_heads, groups, -1, c.d_head).sum(2).transpose(0, 2, 1, 3)
+            dV = dV_t_f.reshape(dx.shape[0], c.n_kv_heads, groups, -1, c.d_head).sum(2).transpose(0, 2, 1, 3)
+            # Backward through RoPE
+            dQ = self._rope_backward(dQ, np.arange(dQ.shape[1]))
+            dK = self._rope_backward(dK, np.arange(dK.shape[1]))
 
-            # Q Grads
-            # Q Grads
-            dW_q_eff = np.einsum("btd,bth->dh", act_attn["x"], dQ.reshape(dQ.shape[0], -1, act_attn["W_q"].shape[1]), optimize=True)
-            if self.use_lora and "q_proj" in self.lora_target_modules and f"lora_A_q_{i}" in self.weights:
-                r = self.lora_rank
-                scale = self.lora_alpha / r
-                A_q = self.weights[f"lora_A_q_{i}"]
-                B_q = self.weights[f"lora_B_q_{i}"]
-                
-                # Suppress harmless warnings (we handle NaNs/Infs explicitly)
-                with np.errstate(all='ignore'):
-                    # Sanitize intermediates
-                    dW_q_eff = np.nan_to_num(dW_q_eff, nan=0.0, posinf=clip_val, neginf=-clip_val)
-                    # Double check A and B stability (though they should be stable)
-                    A_q = np.nan_to_num(A_q, nan=0.0, posinf=clip_val, neginf=-clip_val)
-                    B_q = np.nan_to_num(B_q, nan=0.0, posinf=clip_val, neginf=-clip_val)
-                    
-                    dA = (dW_q_eff @ B_q.T) * scale
-                    dB = (A_q.T @ dW_q_eff) * scale
-                    
-                    # Sanitize final gradients
-                    self._grads[f"lora_A_q_{i}"] = np.nan_to_num(dA, nan=0.0, posinf=clip_val, neginf=-clip_val)
-                    self._grads[f"lora_B_q_{i}"] = np.nan_to_num(dB, nan=0.0, posinf=clip_val, neginf=-clip_val)
-                
-            elif not self.use_lora: # Only store if full fine tune
-                self._grads[f"W_q_{i}"] = dW_q_eff
-
-            # K Grads (Never LoRA target in this config, but might be frozen)
-            dW_k_eff = np.einsum("btd,bth->dh", act_attn["x"], dK.reshape(dK.shape[0], -1, act_attn["W_k"].shape[1]), optimize=True)
+            # Reshape gradients and apply clipping for numerical stability
+            dQf = np.clip(dQ.reshape(dx.shape[0], dx.shape[1], -1), -1.0, 1.0)
+            dKf = np.clip(dK.reshape(dx.shape[0], dx.shape[1], -1), -1.0, 1.0)
+            dVf = np.clip(dV.reshape(dx.shape[0], dx.shape[1], -1), -1.0, 1.0)
+            dQ_B = dV_B = None
+            if self.use_lora:
+                if f"lora_q_{i}" in self._activations:
+                    al = self._activations[f"lora_q_{i}"]
+                    self._grads[f"lora_B_q_{i}"], dQ_B = al["s"] * np.einsum("btr,bth->rh", al["xA"], dQf, optimize=True), np.einsum("bth,rh->btr", dQf, al["B"], optimize=True)
+                    self._grads[f"lora_A_q_{i}"] = al["s"] * np.einsum("btd,btr->dr", act_attn["x"], dQ_B, optimize=True)
+                if f"lora_v_{i}" in self._activations:
+                    al = self._activations[f"lora_v_{i}"]
+                    self._grads[f"lora_B_v_{i}"], dV_B = al["s"] * np.einsum("btr,bth->rh", al["xA"], dVf, optimize=True), np.einsum("bth,rh->btr", dVf, al["B"], optimize=True)
+                    self._grads[f"lora_A_v_{i}"] = al["s"] * np.einsum("btd,btr->dr", act_attn["x"], dV_B, optimize=True)
             if not self.use_lora:
-                self._grads[f"W_k_{i}"] = dW_k_eff
+                def compute_grad_w(t):
+                    return np.einsum("btd,bth->dh", act_attn["x"], t, optimize=True)
 
-            # V Grads
-            dW_v_eff = np.einsum("btd,bth->dh", act_attn["x"], dV.reshape(dV.shape[0], -1, act_attn["W_v"].shape[1]), optimize=True)
-            if self.use_lora and "v_proj" in self.lora_target_modules and f"lora_A_v_{i}" in self.weights:
-                r = self.lora_rank
-                scale = self.lora_alpha / r
-                A_v = self.weights[f"lora_A_v_{i}"]
-                B_v = self.weights[f"lora_B_v_{i}"]
-                
-                with np.errstate(all='ignore'):
-                    dW_v_eff = np.nan_to_num(dW_v_eff, nan=0.0, posinf=clip_val, neginf=-clip_val)
-                    A_v = np.nan_to_num(A_v, nan=0.0, posinf=clip_val, neginf=-clip_val)
-                    B_v = np.nan_to_num(B_v, nan=0.0, posinf=clip_val, neginf=-clip_val)
-                    
-                    dA = (dW_v_eff @ B_v.T) * scale
-                    dB = (A_v.T @ dW_v_eff) * scale
-                    
-                    self._grads[f"lora_A_v_{i}"] = np.nan_to_num(dA, nan=0.0, posinf=clip_val, neginf=-clip_val)
-                    self._grads[f"lora_B_v_{i}"] = np.nan_to_num(dB, nan=0.0, posinf=clip_val, neginf=-clip_val)
+                grad_futures = [self.executor.submit(compute_grad_w, t) for t in [dQf, dKf, dVf]]
+                self._grads[f"W_q_{i}"] = grad_futures[0].result()
+                self._grads[f"W_k_{i}"] = grad_futures[1].result()
+                self._grads[f"W_v_{i}"] = grad_futures[2].result()
 
-            elif not self.use_lora:
-                self._grads[f"W_v_{i}"] = dW_v_eff
-            
-            da_x = np.einsum("bth,dh->btd", dQ.reshape(dQ.shape[0], -1, act_attn["W_q"].shape[1]), act_attn["W_q"], optimize=True) + \
-                   np.einsum("bth,dh->btd", dK.reshape(dK.shape[0], -1, act_attn["W_k"].shape[1]), act_attn["W_k"], optimize=True) + \
-                   np.einsum("bth,dh->btd", dV.reshape(dV.shape[0], -1, act_attn["W_v"].shape[1]), act_attn["W_v"], optimize=True)
+            W_q, W_k, W_v = [self.get_w(p[k], transpose=True) for k in ["W_q", "W_k", "W_v"]]
+
+            def compute_dx_term(t, W):
+                return np.einsum("bth,dh->btd", t, W, optimize=True)
+
+            dx_futures = [self.executor.submit(compute_dx_term, dQf, W_q),
+                          self.executor.submit(compute_dx_term, dKf, W_k),
+                          self.executor.submit(compute_dx_term, dVf, W_v)]
+            dx = dx + dx_futures[0].result() + dx_futures[1].result() + dx_futures[2].result()
+            if self.use_lora:
+                if dQ_B is not None: dx += self._activations[f"lora_q_{i}"]["s"] * np.einsum("btr,dr->btd", dQ_B, self._activations[f"lora_q_{i}"]["A"], optimize=True)
+                if dV_B is not None: dx += self._activations[f"lora_v_{i}"]["s"] * np.einsum("btr,dr->btd", dV_B, self._activations[f"lora_v_{i}"]["A"], optimize=True)
+            self._stats['bw_attn_qkv'].append(time.time() - t_bw_attn_qkv)
+
+            t_norm1 = time.time()
+            act_norm1, dx_norm1 = self._activations[f"norm1_{i}"], dx
+            norm1_w = self.get_w(p["norm1"])
+            if not self.use_lora: self._grads[f"norm1_{i}"] = np.einsum("btd,btd->d", dx_norm1, act_norm1["norm_x"], optimize=True)
+            term1 = dx_norm1 * norm1_w
+            dx = dx + (term1 - np.mean(term1 * act_norm1["norm_x"], axis=-1, keepdims=True) * act_norm1["norm_x"]) / act_norm1["rms"]
+            self._stats['bw_norm'].append(time.time() - t_norm1)
             self._stats['bw_attn'].append(time.time() - t_attn)
-            
-            # Norm1 backward
-            t_norm = time.time()
-            act_norm1 = self._activations[f"norm1_{i}"]
-            dx_norm1 = da_x
-            
-            if not self.use_lora:
-                self._grads[f"norm1_{i}"] = np.einsum("btd,btd->d", dx_norm1, act_norm1["norm_x"], optimize=True)
-            
-            term1 = dx_norm1 * act_norm1["w"]
-            term2 = np.mean(term1 * act_norm1["norm_x"], axis=-1, keepdims=True) * act_norm1["norm_x"]
-            dx = dx + (term1 - term2) / act_norm1["rms"]
-            self._stats['bw_norm'].append(time.time() - t_norm)
-            
-            self._stats['bw_layers'].append(time.time() - t_layer)
-        
-        # 3. Embedding Backward
+            self._stats['bw_layers'].append(time.time() - t_layer_start)
+
         t_embed = time.time()
-        # self._grads["E"] is already partially set from head. Add embedding lookup grad.
-        # token lookup: dx = E[tokens] -> dE[tokens] += dx
         if not self.use_lora:
-            tokens = self._activations["tokens"]
-            for b in range(dx.shape[0]):
-                for t in range(dx.shape[1]):
-                    self._grads["E"][tokens[b, t]] += dx[b, t]
+            # Gradient for the input embedding (accumulated via add.at for multi-token indices)
+            np.add.at(self._grads["E"], self._activations["tokens"], dx)
         self._stats['bw_embed'].append(time.time() - t_embed)
-                
-        # IMPORTANT: Record backward pass time BEFORE gradient memory calculation
+
+        # Aggregate layered stats for this backward pass
+        for k in layered_keys:
+            self._stats[k + '_step'].append(sum(self._stats[k][stat_starts[k]:]))
+
+        # Calculate gradient memory footprint
+        total_grad_bytes = sum(g.nbytes for g in self._grads.values() if isinstance(g, np.ndarray))
+        w_mem = self.weights.get_cache_memory_mb() if hasattr(self.weights, 'get_cache_memory_mb') else 0
+        self._memory_stats['grad_total_mb'] = (total_grad_bytes / (1024 * 1024)) + w_mem
+
         self._stats['bw_total'].append(time.time() - t_total)
-        
-        # Calculate gradient memory footprint (this can be expensive for large models)
-        t_grad_mem = time.time()
-        total_grad_bytes = 0
-        grad_count = 0
-        for key, grad in self._grads.items():
-            grad_bytes = grad.nbytes
-            total_grad_bytes += grad_bytes
-            grad_count += 1
-            self._memory_stats['grad_breakdown'][key] = grad_bytes / (1024 * 1024)  # Convert to MB
-        
-        self._memory_stats['grad_total_mb'] = total_grad_bytes / (1024 * 1024)
-        grad_mem_time = time.time() - t_grad_mem
-        self._stats['bw_grad_mem_calc'].append(grad_mem_time)
-        
-        self._log(f"[INFO] Backward pass complete. Total gradient memory: {self._memory_stats['grad_total_mb']:.2f} MB ({grad_count} tensors)")
-        self._log(f"[INFO] Gradient memory calculation took: {grad_mem_time:.3f}s")
-        self._log(f"[NOTE] Gradients are fully allocated arrays (unlike lazy-loaded weights), so this represents actual RAM usage")
-        
-        if self.verbose and not self.training:
-            self._print_stats_table(title="BACKWARD PASS TIMING BREAKDOWN (seconds)")
-            
         return self._grads
 
     def generate(self, tokens):
-        """Full generation flow: Prefill -> Iterative Decode."""
-        print(f"\n" + "#"*50)
-        print(f"GENERATION MODE: {self.cfg.max_new_tokens} tokens")
-        print("#"*50)
-        
-        # 1. Prefill/Prompt evaluation
-        # verbose=True handles clearing stats and printing prefill session table
+        if getattr(self.cfg, 'speculative', False): return self.speculative_generate(tokens)
+        self.clear_cache()
+        B = tokens.shape[0]
+
+        t0 = time.time()
+        # Prefill
         logits = self.forward(tokens, inference=True, verbose=True)
-        
-        # Reset stats specifically for decode phase accumulation
-        self._init_stats()
-        
-        # Sample first token from prefill
         next_token = self.sample_top_k(logits, k=self.cfg.top_k_sample, temperature=self.cfg.temperature)
-        generated_tokens = [next_token[0]]
-        
-        # Stream first token from prefill
-        token_str = self.detokenize([next_token[0]])[0]
-        print(f"\n[STREAM] ", end="", flush=True)
-        print(token_str, end="", flush=True)
-        
-        print(f"\n" + "-"*50)
-        print("INTERATIVE DECODE PHASE")
-        print("-" * 50)
-        print("[STREAM] ", end="", flush=True)  # Start streaming line for decode phase
-        
-        # 2. Iterative Decode
+        ttft = time.time() - t0
+
+        # generated is a list of arrays, each of shape (B,)
+        generated = [next_token]
+
+        print(f"\n Decoding Stage")
+        print(f"=================")
+        # Print stream for the first batch element
+        print(f"[STREAM] {self.detokenize([next_token[0]])[0]}", end="", flush=True)
+
+        t_decode_start = time.time()
         for i in range(self.cfg.max_new_tokens - 1):
-            t0 = time.time()
-            current_input = np.full((tokens.shape[0], 1), generated_tokens[-1])
-            
-            # verbose=False suppresses per-step noise
-            logits = self.forward(current_input, inference=True, verbose=False)
-            
-            dt = time.time() - t0
+            # Input shape: (B, 1)
+            logits = self.forward(generated[-1][:, None], inference=True, verbose=False)
             next_token = self.sample_top_k(logits, k=self.cfg.top_k_sample, temperature=self.cfg.temperature)
-            token_str = self.detokenize([next_token[0]])[0]
-            
-            # Stream token as it's generated (production-like streaming)
-            print(token_str, end="", flush=True)
-            
-            # Log detailed step info on separate line (doesn't interrupt stream)
-            print(f"\n  [Step {i+1:02d}/{self.cfg.max_new_tokens-1}] Token: {next_token[0]:<6} ({token_str}) | Latency: {dt:.3f}s")
-            print("[STREAM] ", end="", flush=True)  # Continue streaming on next line
-            
-            generated_tokens.append(next_token[0])
+            generated.append(next_token)
+            print(self.detokenize([next_token[0]])[0], end="", flush=True)
+
+        t_decode_end = time.time()
+        duration = t_decode_end - t_decode_start
+        tokens_sec = (len(generated) - 1) / duration if duration > 0 else 0
+
+        print(f"\nTime to first Token ({self.detokenize([generated[0][0]])[0]}) : {ttft:.4f}s")
+        print(f"Output tokens/sec : {tokens_sec:.2f}")
+        print()
+        return generated
+
+    def _get_draft_model(self):
+        if self._draft_model is None or self._draft_model.cfg.n_layers != self.cfg.draft_layers:
+            # Initialize draft model using the first N layers of the target model
+            draft_cfg = copy.deepcopy(self.cfg)
+            draft_cfg.n_layers = self.cfg.draft_layers
+            # Disable speculative in draft to avoid infinite recursion
+            draft_cfg.speculative = False
+            self._draft_model = EinsumTransformer(draft_cfg, _from_weights=self.weights,
+                                            _E_name=self.E_name,
+                                            _layer_weights=self.layer_weights[:self.cfg.draft_layers])
+            # Share the executor to avoid creating too many threads
+            self._draft_model.executor = self.executor
+        return self._draft_model
+
+    def speculative_generate(self, tokens, k=4):
+        """
+        Implementation of speculative decoding.
+        A smaller 'draft' model (first few layers of the current model) predicts k tokens,
+        which are then verified in parallel by the full 'target' model.
+        """
+        print(f"[INFO] Starting speculative decoding (k={k}, draft_layers={self.cfg.draft_layers})...")
+        self.clear_cache()
+        draft_model = self._get_draft_model()
+        draft_model.clear_cache()
+        B = tokens.shape[0]
         
-        # Final newline after streaming
-        print()  # Newline after streaming completes
-            
-        print(f"\n[GENERATION COMPLETE] Total: {len(generated_tokens)} tokens.")
+        t0 = time.time()
+        # 1. Prefill: Process initial prompt tokens in target model
+        logits = self.forward(tokens, inference=True, verbose=True)
+
+        # 2. Seed draft model KV cache from target model to avoid redundant prefill
+        for i in range(self.cfg.draft_layers):
+            draft_model.cache[i]["K"] = self.cache[i]["K"]
+            draft_model.cache[i]["V"] = self.cache[i]["V"]
+        draft_model.cur_pos = self.cur_pos
         
-        # Recalculate KV cache size after all decode steps (cache has grown)
-        total_elements = 0
-        for c in self.cache:
-            if c["K"] is not None:
-                total_elements += c["K"].size + c["V"].size
-        self._kv_size_mb = (total_elements * 4) / (1024 * 1024)
-        
-        # Show final aggregate decode table
-        self.verbose = True # Re-enable for final table print
-        self._print_stats_table(title=f"DECODE PHASE AGGREGATE SUMMARY ({len(generated_tokens)-1} tokens)")
-        
-        return generated_tokens
+        # 2. Sample the first token after the prompt
+        next_token = self.sample_top_k(logits, k=self.cfg.top_k_sample, temperature=self.cfg.temperature)
+        ttft = time.time() - t0
+
+        generated = [next_token]
+        print(f"\n Decoding Stage")
+        print(f"=================")
+        print(f"[STREAM] {self.detokenize([next_token[0]])[0]}", end="", flush=True)
+
+        t_decode_start = time.time()
+        # 3. Speculative loop: Iterate until max_new_tokens is reached
+        while len(generated) < self.cfg.max_new_tokens:
+            # a. Draft predicts k speculative tokens sequentially
+            d_tokens = []
+            draft_input = generated[-1][:, None]
+            for _ in range(k):
+                d_logits = draft_model.forward(draft_input, inference=True, verbose=False)
+                d_tok = self.sample_top_k(d_logits, k=self.cfg.top_k_sample, temperature=self.cfg.temperature)
+                d_tokens.append(d_tok)
+                draft_input = d_tok[:, None]
+
+            # b. Target verifies all k draft tokens + current token in a single parallel pass.
+            # v_input[j] will predict the token for d_tokens[j].
+            # v_input[k] (the last draft token) will predict a "bonus" token.
+            v_input = np.stack([generated[-1]] + d_tokens, axis=1) # Shape (B, k+1)
+            v_logits = self.forward(v_input, inference=True, verbose=False)
+
+            # c. Verify draft tokens against target model predictions
+            n_accepted = 0
+            next_toks = None
+            for j in range(k):
+                # Sample the target model's prediction for the token at d_tokens[j] position
+                target_toks = self.sample_top_k(v_logits[:, j:j+1, :], k=self.cfg.top_k_sample, temperature=self.cfg.temperature)
+
+                # In batched mode, we only accept if ALL batches matched for this step
+                # to keep KV caches aligned across the batch.
+                if np.array_equal(target_toks, d_tokens[j]):
+                    # Draft was correct!
+                    generated.append(d_tokens[j])
+                    print(self.detokenize([d_tokens[j][0]])[0], end="", flush=True)
+                    n_accepted += 1
+                else:
+                    # Mismatch. Accept the target's correction and stop verification.
+                    generated.append(target_toks)
+                    print(f"[{self.detokenize([target_toks[0]])[0]}]", end="", flush=True)
+                    next_toks = target_toks
+                    break
+
+            # If all were accepted, we get a bonus token from the last logit position
+            if n_accepted == k:
+                next_toks = self.sample_top_k(v_logits[:, k:k+1, :], k=self.cfg.top_k_sample, temperature=self.cfg.temperature)
+                generated.append(next_toks)
+                print(self.detokenize([next_toks[0]])[0], end="", flush=True)
+
+            # d. Rollback target model KV cache
+            # We processed 'k+1' tokens as input.
+            # If all accepted + bonus: n_accepted=k. generated grew by k+1. cache grew by k+1.
+            # We want to keep all k+1 processed inputs in cache. n_to_keep = k+1.
+            # If n_accepted < k: we stopped at j. we accepted d_tokens[0...j-1] and correction for d_tokens[j].
+            # Total new tokens in generated: j+1. New tokens in cache to keep: j+1 (v_input[0...j]).
+            n_to_keep = n_accepted + 1
+            n_target_rollback = (k + 1) - n_to_keep
+            if n_target_rollback > 0:
+                for layer in self.cache:
+                    if layer["K"] is not None:
+                        layer["K"] = layer["K"][:, :, :-n_target_rollback, :]
+                        layer["V"] = layer["V"][:, :, :-n_target_rollback, :]
+                self.cur_pos -= n_target_rollback
+
+            # e. Synchronize draft model state with target model
+            # This ensures both models are aligned for the next speculative step.
+            for l in range(self.cfg.draft_layers):
+                draft_model.cache[l]["K"] = self.cache[l]["K"]
+                draft_model.cache[l]["V"] = self.cache[l]["V"]
+            draft_model.cur_pos = self.cur_pos
+
+        t_decode_end = time.time()
+        duration = t_decode_end - t_decode_start
+        tokens_sec = (len(generated) - 1) / duration if duration > 0 else 0
+
+        print(f"\nTime to first Token ({self.detokenize([generated[0][0]])[0]}) : {ttft:.4f}s")
+        print(f"Output tokens/sec : {tokens_sec:.2f}")
+        print()
+        return generated
+
+    def _init_stats(self):
+        self._stats = {k: [] for k in [
+            'attn', 'ffn', 'layers', 'norm', 'weight_load', 'attn_load', 'attn_qkv', 'attn_rope', 'attn_score', 'attn_out', 'ffn_load', 'ffn_compute',
+            'prefill', 'decode', 'embedding', 'output_head',
+            'layers_step', 'norm_step', 'weight_load_step', 'attn_step', 'attn_load_step', 'attn_qkv_step', 'attn_rope_step', 'attn_score_step', 'attn_out_step', 'ffn_step', 'ffn_load_step', 'ffn_compute_step',
+            'bw_total', 'bw_layers', 'bw_attn', 'bw_ffn', 'bw_norm', 'bw_head', 'bw_embed', 'bw_attn_out', 'bw_attn_score', 'bw_attn_qkv', 'bw_ffn_compute',
+            'bw_layers_step', 'bw_attn_step', 'bw_ffn_step', 'bw_norm_step', 'bw_attn_out_step', 'bw_attn_score_step', 'bw_attn_qkv_step', 'bw_ffn_compute_step',
+            'opt_step', 'opt_clip', 'opt_update'
+        ]}
+        self._memory_stats = {'grad_total_mb': 0.0, 'fwd_activation_mb': 0.0, 'grad_breakdown': {}, 'opt_per_step_mb': []}
+
+    def _rope_backward(self, dy, positions):
+        B, T, H, D = dy.shape
+        pos = np.asarray(positions, dtype=np.float64)
+        if len(pos) != T:
+            if len(pos) > T: pos = pos[:T]
+            else: pos = np.concatenate([pos, np.arange(pos[-1]+1, pos[-1]+1 + T - len(pos))])
+        inv_freq = 1.0 / (self.cfg.rope_base ** (np.arange(0, D, 2) / D))
+        freqs = np.outer(pos, inv_freq)
+        cos, sin = np.cos(freqs), np.sin(freqs)
+        cos, sin = cos[None, :, None, :], sin[None, :, None, :]
+        dy1, dy2 = dy[..., 0::2], dy[..., 1::2]
+        dx = np.empty_like(dy)
+        dx[..., 0::2] = dy1 * cos + dy2 * sin
+        dx[..., 1::2] = -dy1 * sin + dy2 * cos
+        return dx
+
+    def sample_top_k(self, logits, k=50, temperature=1.0):
+        logits = logits[:, -1, :] / (temperature + 1e-9)
+        indices_to_remove = logits < np.partition(logits, -k, axis=-1)[..., -k, None]
+        logits[indices_to_remove] = -float('Inf')
+        exp_logits = np.exp(logits - np.max(logits, axis=-1, keepdims=True))
+        probs = exp_logits / np.sum(exp_logits, axis=-1, keepdims=True)
+        return np.array([np.random.choice(len(p), p=p) for p in probs])
+
+    def detokenize(self, token_ids): return [f"<token_{tid}>" for tid in token_ids]
+
+    def _print_stats_table(self, title="TIMING BREAKDOWN (seconds)"):
+        self._log("\n" + "="*50)
+        self._log(f"{title:^50}")
+        self._log("-" * 50)
+        self._log(f"{'Phase':<25} | {'p50':<10} | {'p99':<10}")
+        self._log("-" * 50)
+        def pr(n, ts):
+            if ts: self._log(f"{n:<25} | {np.percentile(ts, 50):<10.4f} | {np.percentile(ts, 99):<10.4f}")
+
+        t_up = title.upper()
+        if "FWD" in t_up or "TIMING BREAKDOWN" in t_up:
+            pr("Embedding", self._stats.get('embedding'))
+            pr("Layer Total (All)", self._stats.get('layers_step'))
+            pr("  Norm", self._stats.get('norm_step'))
+            pr("  Weight Load", self._stats.get('weight_load_step'))
+            pr("  Attention", self._stats.get('attn_step'))
+            pr("    Ld weights", self._stats.get('attn_load_step'))
+            pr("    QKV Proj", self._stats.get('attn_qkv_step'))
+            pr("    RoPE", self._stats.get('attn_rope_step'))
+            pr("    Score/Sftmx", self._stats.get('attn_score_step'))
+            pr("    Out Agg/Proj", self._stats.get('attn_out_step'))
+            pr("  FeedForward", self._stats.get('ffn_step'))
+            pr("    Ld weights", self._stats.get('ffn_load_step'))
+            pr("    Compute", self._stats.get('ffn_compute_step'))
+            pr("Output Head", self._stats.get('output_head'))
+            if self._stats.get('prefill'):
+                self._log("-" * 50)
+                pr("Prefill Stage", self._stats['prefill'])
+            if self._stats.get('decode'):
+                self._log("-" * 50)
+                pr("Decode Stage", self._stats['decode'])
+        elif "BWD" in t_up or "BACKWARD" in t_up:
+            pr("Backward Pass", self._stats.get('bw_total'))
+            pr("  BW Head", self._stats.get('bw_head'))
+            pr("  BW Layers (All)", self._stats.get('bw_layers_step'))
+            pr("    BW Attention", self._stats.get('bw_attn_step'))
+            pr("      BW Out Proj", self._stats.get('bw_attn_out_step'))
+            pr("      BW Score", self._stats.get('bw_attn_score_step'))
+            pr("      BW QKV", self._stats.get('bw_attn_qkv_step'))
+            pr("    BW FeedForward", self._stats.get('bw_ffn_step'))
+            pr("      BW SwiGLU", self._stats.get('bw_ffn_compute_step'))
+            pr("    BW Norms", self._stats.get('bw_norm_step'))
+            pr("  BW Embed", self._stats.get('bw_embed'))
+        elif "OPT" in t_up:
+            pr("Optimizer Step", self._stats.get('opt_step'))
+            pr("  Grad Clipping", self._stats.get('opt_clip'))
+            pr("  Weight Updates", self._stats.get('opt_update'))
+
+        self._log("="*50 + "\n")
+
+    def merge_lora_weights(self):
+        if not self.use_lora: return
+        print("[INFO] Merging LoRA adapters...")
+        c = self.cfg
+        scale = self.lora_alpha / self.lora_rank
+        for i in range(c.n_layers):
+            p = self.layer_weights[i]
+            for k in ["q", "v"]:
+                if p.get(f"lora_A_{k}"):
+                    W_name = p[f"W_{k}"]
+                    A, B = self.weights[p[f"lora_A_{k}"]], self.weights[p[f"lora_B_{k}"]]
+                    self.weights[W_name] = self.weights[W_name] + scale * (A @ B).T
+        self.use_lora = False
+        print("[INFO] LoRA merge complete (LoRA disabled after merge).")
+
 
 class EinsumOptimizer:
-    def __init__(self, model: EinsumTransformer, lr=0.001):
-        self.model = model
-        self.lr = lr
+    def __init__(self, model: EinsumTransformer, lr=0.001, grad_clip=1.0):
+        self.model, self.lr, self.grad_clip = model, lr, grad_clip
 
     def step(self):
         """
         Optimizer step: Apply gradient descent to update all model weights.
-        
         HIGH-LEVEL FLOW:
         ================
         1. Embedding Update:
@@ -1623,74 +1504,56 @@ class EinsumOptimizer:
         Updates are applied in-place to LazyWeightManager.cache, enabling
         iterative training without reloading weights from disk.
         """
+        m, g, lr = self.model, self.model._grads, self.lr
+        t0 = time.time()
 
-        m = self.model
-        g = m._grads
-        
-        t_opt_start = time.time()
-        
-        # Calculate memory footprint of this optimizer step
+        t_clip = time.time()
+        # Global gradient clipping for stability
+        if self.grad_clip > 0:
+            total_norm = 0
+            for grad in g.values():
+                total_norm += np.sum(grad**2)
+            total_norm = np.sqrt(total_norm)
+            clip_coef = self.grad_clip / (total_norm + 1e-6)
+            if clip_coef < 1:
+                for k in g:
+                    g[k] *= clip_coef
+        m._stats['opt_clip'].append(time.time() - t_clip)
+
+        t_update = time.time()
+
+        # Calculate memory and update E in main thread
         step_memory_bytes = 0
-        
-        # Head/Embedding
-        # In Llama, E and head are often shared or separate. 
-        # Here we only update based on E_name
         if "E" in g:
-            old_E = m.weights[m.E_name]
-            step_memory_bytes += old_E.nbytes + g["E"].nbytes
-            m.weights[m.E_name] = old_E - self.lr * g["E"]
-        
-        # Layers
-        for i in range(m.cfg.n_layers):
+            step_memory_bytes += m.weights[m.E_name].nbytes + g["E"].nbytes
+            m.weights[m.E_name] -= lr * g["E"]
+
+        def update_layer(i):
             p = m.layer_weights[i]
-            
-            # LoRA Adapters (Update if present)
+            mem = 0
             for k in ["lora_A_q", "lora_B_q", "lora_A_v", "lora_B_v"]:
-                # Check if this adapter exists in weights AND has a gradient
                 w_key = f"{k}_{i}"
                 if w_key in m.weights and w_key in g:
-                    old_w = m.weights[w_key]
-                    grad = g[w_key] # Shape matches
-                    step_memory_bytes += old_w.nbytes + grad.nbytes
-                    m.weights[w_key] = old_w - self.lr * grad
-
-            # Attn (Base weights)
-            for k in ["W_q", "W_k", "W_v", "W_o"]:
-                name = p[k]
+                    mem += m.weights[w_key].nbytes + g[w_key].nbytes
+                    m.weights[w_key] -= lr * g[w_key]
+            for k in ["W_q", "W_k", "W_v", "W_o", "W1", "W2", "W3"]:
                 grad_key = f"{k}_{i}"
-                if name and grad_key in g:
-                    # Weights in safetensors are often (out, in). 
-                    # Our grads are (in, out) or similar. 
-                    # We use .T to match the shape in weights[name]
-                    old_w = m.weights[name]
-                    grad_t = g[grad_key].T
-                    step_memory_bytes += old_w.nbytes + grad_t.nbytes
-                    m.weights[name] = old_w - self.lr * grad_t
-                
-            # Norms
+                if p.get(k) and grad_key in g:
+                    mem += m.weights[p[k]].nbytes + g[grad_key].nbytes
+                    m.weights[p[k]] -= lr * g[grad_key].T
             for k in ["norm1", "norm2"]:
-                name = p[k]
                 grad_key = f"{k}_{i}"
-                if name and grad_key in g:
-                    old_w = m.weights[name]
-                    grad = g[grad_key]
-                    step_memory_bytes += old_w.nbytes + grad.nbytes
-                    m.weights[name] = old_w - self.lr * grad
-                
-            # FFN
-            if not m.cfg.use_moe:
-                for k in ["W1", "W2", "W3"]:
-                    name = p[k]
-                    grad_key = f"{k}_{i}"
-                    if name and grad_key in g:
-                        old_w = m.weights[name]
-                        grad_t = g[grad_key].T
-                        step_memory_bytes += old_w.nbytes + grad_t.nbytes
-                        m.weights[name] = old_w - self.lr * grad_t
-        
-        opt_time = time.time() - t_opt_start
-        step_memory_mb = step_memory_bytes / (1024 * 1024)
-        
-        # Track stats
-        m._stats['opt_step'].append(opt_time)
-        m._memory_stats['opt_per_step_mb'].append(step_memory_mb)
+                if p.get(k) and grad_key in g:
+                    mem += m.weights[p[k]].nbytes + g[grad_key].nbytes
+                    m.weights[p[k]] -= lr * g[grad_key]
+            return mem
+
+        futures = [m.executor.submit(update_layer, i) for i in range(m.cfg.n_layers)]
+        for f in as_completed(futures):
+            step_memory_bytes += f.result()
+
+        m._stats['opt_update'].append(time.time() - t_update)
+
+        w_mem = m.weights.get_cache_memory_mb() if hasattr(m.weights, 'get_cache_memory_mb') else 0
+        m._memory_stats['opt_per_step_mb'].append((step_memory_bytes / (1024 * 1024)) + w_mem)
+        m._stats['opt_step'].append(time.time() - t0)
