@@ -24,11 +24,15 @@ Install: `uv sync` (or `pip install -e .`); for Ray: `uv sync --extra ray` or `p
 
 ## Intent & Use Case
 
-This repository serves as a transparent "glass box" for LLM execution flow. It allows for:
-- **Parameter Sensitivity Analysis**: Tweak RoPE base frequencies, context lengths, and model dimensions.
-- **Micro-Architectural Bottleneck Identification**: Granular profiling helps identify exactly where CPU cycles are spent (e.g., Weight Loading vs. MatMuls).
-- **Architectural Backpropagation Research**: Manually derived `backward` passes for every component allow for direct research into gradient flow and optimization strategies.
-- **Component Sub-Phasing**: Visualize the transition between Prefill, Decode, and Training stages.
+This repository serves as a transparent **"glass box"** for LLM execution flow. It is designed for developers who want to look under the hood of Transformer architectures without the complexity of CUDA kernels or framework abstractions.
+
+### Core Experimentation Paths
+
+1. **Architectural Prototyping**: Easily swap between GQA, MQA, and Multi-Head Attention. Experiment with Mixture-of-Experts (MoE) by adjusting expert counts and `top_k` gating directly in the JSON config.
+2. **Precision & Quantization Research**: Study the impact of `W4A4` vs `W8A16` on both memory capacity and numerical stability. The simulated quantization allows you to see precision loss in real-time.
+3. **Fine-Tuning Strategies**: Use the built-in LoRA support to experiment with rank (`r`) and alpha (`alpha`) sensitivity. Monitor how freezing base weights impacts gradient memory.
+4. **Performance Profiling**: The granular telemetry (down to RoPE and Softmax sub-phases) helps you identify if an architecture is compute-bound (FFN) or memory-bound (Weight Loading/Attention).
+5. **Numerical Stability Analysis**: Deep-dive into gradient flow with manually derived `backward()` passes. Test how different normalization schemes (RMSNorm) and activation functions (SwiGLU) affect convergence.
 
 ## Design Philosophy
 
@@ -69,23 +73,9 @@ In this codebase, quantization is **simulated** (quantize→dequant to float32).
 
 The per-layer breakdown and **Mem save** show the **theoretical** reduction vs a float32 baseline (4 bytes/element). Assumed: float32=4 B, fp16=2 B, int8=1 B, int4=0.5 B.
 
-**Mem save is total across all layers** (not per layer): Embedding is once; Attn, FFN, and RMSNorm are summed over all `n_layers`. So Total can reach several GB for large models (e.g. ~9 GB for Llama 3.2 3B with W8A16: ~12 GB in float32 → ~3 GB in W8 + activation savings).
+**Mem save is total across all layers** (not per layer): Embedding is once; Attn, FFN, and RMSNorm are summed over all `n_layers`.
 
-**Example 1: `fast_lora` (d_model=512, 8 layers) with `W8A16` — total ~105 MB saving:**
-
-```
-[INFO] Per-layer operation breakdown (by tensor datatype, source→target) and memory usage:
-  Operation          Weights            Activations        Before         After          Mem save
-  ------------------ ------------------ ------------------ -------------- -------------- --------------
-  Embedding          float32→int8       float32→fp16       9.000 MB       2.500 MB       6.500 MB
-  RMSNorm (×2)       float32→int8       float32            0.031 MB       0.008 MB       0.023 MB
-  Attn (Q,K,V,O)     float32→int8       float32→fp16       32.000 MB      10.000 MB      22.000 MB
-  FFN (W1,W2,W3)     float32→int8       float32→fp16       104.000 MB     28.000 MB      76.000 MB
-  ------------------ ------------------ ------------------ -------------- -------------- --------------
-  Total (all 8 layers)                                       145.031 MB     40.508 MB      104.523 MB
-```
-
-**Example 2: `llama` (Llama 3.2 3B, d_model=3072, 28 layers) with `W8A16` — total ~3.1 GB saving:**
+**Example: `llama` (Llama 3.2 3B, d_model=3072, 28 layers) with `W8A16` — total ~3.1 GB saving:**
 
 ```
 [INFO] Per-layer operation breakdown (by tensor datatype, source→target) and memory usage:
@@ -160,13 +150,14 @@ With `quantization: "none"`, Mem save is `—`. Run e.g. `python run_model.py --
 | Feature | Description |
 |---------|-------------|
 | **Lazy Shard Loading** | Automatic discovery and on-demand loading of sharded `.safetensors`. |
+| **Dynamic Cache** | Automatically adjusts `max_cache_size` to prevent I/O thrashing. |
+| **Multi-threading** | Thread-safe parallel execution for independent attention and MoE projections. |
 | **Iterative Decode Loop** | Full generation flow from prompt (Prefill) to iterative token sampling. |
-| **Silent Decode Mode** | Streamlined per-token logging to reduce terminal noise during generation. |
-| **Aggregate Summaries** | Performance reporting across the entire generation budget, not just per-step. |
-| **RoPE Instrumentation** | Visual feedback on Base frequency, Head dimension, and Position indices. |
-| **Top-K Sampling** | Controllable generation with configurable temperature and sampling budget. |
+| **Speculative Decoding** | Draft-model accelerated inference with parallel target-model verification. |
+| **Aggregate Summaries** | Granular performance profiling for every phase (RoPE, QKV, Score, etc.). |
+| **Numerical Stability** | Piecewise sigmoid and high-precision RMS calculations to prevent NaNs. |
 | **Manual Backprop** | Full component-wise `backward()` pass implemented using pure `einsum` notation. |
-| **Einsum Optimizer** | In-memory weight updates via a transparent SGD-based `EinsumOptimizer`. |
+| **Einsum Optimizer** | Thread-parallel weight updates with global gradient clipping. |
 
 ## Architecture & Feature Matrix
 
@@ -176,7 +167,7 @@ Characterization of architectural options and which models they map to:
 |---------|--------|----------------|
 | **GQA** (Grouped Query Attention) | Implemented | Llama 2/3, Mistral, Qwen, Phi-2/3, Gemma |
 | **MQA** (Multi-Query Attention) | Implemented | Phi-1, MPT |
-| **Speculative decoding** | Hooked | Llama, Gemma, Mistral (inference-only; draft config in `optmizations`) |
+| **Speculative decoding** | Implemented | Llama, Gemma, Mistral (inference-only) |
 | **MoE FFN** (Mixture of Experts) | Implemented | Mixtral, Llama 3.1 8B/405B, Qwen2-MoE, DeepSeek-MoE |
 | **Mixed-precision quantization (WxAy)** | Implemented | Llama, Phi, Gemma, Mistral (config `quantization`: W8A16, W8A8, W4A4, W8A4, etc.) |
 | **Prefill/decode split** | Hooked | All (config `prefill_only` for hardware split; prefill/decode phases implemented) |
@@ -335,95 +326,132 @@ uv run python train_model.py --config configs/my_lora.json --steps 10
 
 ##  Example Output & Performance Analysis
 
-### Inference Mode Output (e.g. fast_lora, 10 tokens)
-```
-==================================================
-TIMING BREAKDOWN (seconds)
---------------------------------------------------
-Phase                | p50        | p99       
-----------------------------------------------
-Embedding            | 0.0003     | 0.0003    
-Layer Total          | 0.7005     | 0.7183    
-  Norm               | 0.0003     | 0.0004    
-  Weight Load        | 0.0000     | 0.0000    
-  Attention          | 0.1433     | 0.1463    
-    Ld weights       | 0.0000     | 0.0000    
-    QKV Proj         | 0.0821     | 0.0838    
-    RoPE             | 0.0011     | 0.0012    
-    Score/Sftmx      | 0.0092     | 0.0096    
-    Out Agg/Proj     | 0.0512     | 0.0550    
-  FeedForward        | 0.5555     | 0.5715    
-    Ld weights       | 0.0000     | 0.0000    
-    Compute          | 0.5555     | 0.5715    
-Output Head          | 0.3376     | 0.3376    
-----------------------------------------------
-[NOTE] Prefill components sum: 5.9156s, Total: 5.5781s, Diff: -0.3376s (overhead/KV cache)
-Prefill Stage        | 5.5781     | 5.5781    
-----------------------------------------------
-KV Cache Size        | 16.00      MB
-==================================================
+### Training Mode (Llama 3.2 3B, 5 steps)
+
+The following output demonstrates a training run on Llama 3.2 3B using `W8A16` quantization. Note the granular breakdown of both the forward and backward passes.
+
+```bash
+uv run python train_model.py --config configs/llama.json --steps 5 --lr 0.05 --fix-batch --seed 42
 ```
 
-**Key Observations:**
-- **Embedding** and **Output Head** are timed separately; the [NOTE] explains when components sum ≠ Prefill total (output head / KV work).
-- **FFN dominates** layer compute: FeedForward (0.56s) vs Attention (0.14s).
-- **Attention**: QKV Proj + Out Agg/Proj account for most of attention time; RoPE and Score/Sftmx are small.
-- **KV Cache Size**: `n_layers × 2 × batch × n_heads × seq_len × d_head` (× 4 bytes); reported after prefill populates the cache.
-
-### Training Mode Output (e.g. fast_lora, 4 layers, 10 steps)
-
-Training runs with `verbose=False` per step; the **TRAINING SUMMARY** and the **forward/backward timing tables** are printed once at the end (p50/p99 over all steps).
-
 ```
+##################################################
+TRAINING START: 5 steps, lr=0.05 (from --lr) (fixed batch)
+##################################################
+
+===============================================================================================
+| Step   | Loss       | Total (s)  | FWD (s)    | BWD (s)    | OPT (s)    | Peak Mem   |
+-----------------------------------------------------------------------------------------------
+| 1      | 20.7098    | 25.59      | 13.59      | 12.00      | 0.00       | 13445.7    |
+| 2      | 20.7105    | 17.18      | 7.10       | 10.08      | 0.00       | 13445.7    |
+| 3      | 20.7094    | 18.27      | 7.10       | 11.16      | 0.00       | 13445.7    |
+| 4      | 20.7053    | 17.61      | 7.16       | 10.45      | 0.00       | 13445.7    |
+| 5      | 20.7061    | 19.36      | 7.00       | 12.36      | 0.00       | 13445.7    |
+===============================================================================================
+
 ==================================================
 TRAINING SUMMARY
 ==================================================
-Total Steps:         10
-Total Time:          48.50s
-Step time (fwd+bwd+opt):  mean=4.850s  p50=4.599s  p99=5.882s
-Loss:                start=8.3277  end=8.3434
-Optimizer mem/step:  272.06 MB (opt update only)
-Gradient Memory:     136.03 MB
+Loss Trend(LR: 0.05):  start=20.7098  end=20.7061  change per step = -0.000924
+
+Execution Time breakdown:
+--------------------------------------------------
+Phase                     | p50        | p99
+--------------------------------------------------
+Step time (fwd):          | 7.103      | 13.334
+Step time (bwd):          | 11.165     | 12.343
+Step time (opt):          | 0.004      | 0.004
+--------------------------------------------------
+Total (5 steps)            | 91.358     | 128.401
+--------------------------------------------------
+
+Memory Breakdown:
+--------------------------------------------------
+FWD mem/step:       7309.10 MB
+BWD mem/step:       6154.08 MB
+Optimizer mem/step: 6162.83 MB
+Misc (baseline memory i.e. Weight Manager Cache) : 6136.58 MB
+Total memory (Peak): 13445.68 MB
+--------------------------------------------------
 
 ==================================================
-TIMING BREAKDOWN (seconds)
+         FWD per step breakdown (Seconds)
 --------------------------------------------------
-Phase                | p50        | p99       
-----------------------------------------------
-Embedding            | 0.0001     | 0.0001    
-Layer Total          | 0.6769     | 0.7109    
-  Norm               | 0.0005     | 0.0005    
-  Weight Load        | 0.0000     | 0.0000    
-  Attention          | 0.1400     | 0.1473    
-  FeedForward        | 0.5499     | 0.5708    
-Output Head          | 0.3155     | 0.3155    
-----------------------------------------------
-[NOTE] Prefill components sum: 3.04s, Total: 2.73s, Diff: -0.32s (overhead/KV cache)
-Prefill Stage        | 2.7273     | 2.7273    
+Phase                     | p50        | p99
+--------------------------------------------------
+Embedding                 | 0.6694     | 0.9139
+Layer Total (All)         | 5.6586     | 10.2091
+  Norm                    | 0.0320     | 0.0356
+  Weight Load             | 0.0010     | 4.4702
+  Attention               | 2.3699     | 3.2943
+    Ld weights            | 0.2332     | 0.5724
+    QKV Proj              | 0.0730     | 0.0756
+    RoPE                  | 0.0521     | 0.0563
+    Score/Sftmx           | 0.4716     | 0.4751
+    Out Agg/Proj          | 1.0970     | 1.1061
+  FeedForward             | 3.1848     | 6.7917
+    Ld weights            | 2.2923     | 5.9398
+    Compute               | 0.8975     | 0.9252
+Output Head               | 0.5705     | 1.9264
 ==================================================
 
 ==================================================
-BACKWARD PASS TIMING BREAKDOWN (seconds)
+         BWD per step breakdown (Seconds)
 --------------------------------------------------
-Phase                | p50        | p99       
-----------------------------------------------
-Backward Pass        | 3.1462     | 3.1462    
-  BW Layers          | 0.6705     | 0.7975    
-  BW Head            | 0.3345     | 0.3345    
-  BW Embed           | 0.0003     | 0.0003    
-  BW Attention       | 0.1747     | 0.3012    
-  BW FeedForward     | 0.4946     | 0.4951    
-  BW Norms           | 0.0005     | 0.0008    
-----------------------------------------------
-Gradient Memory      | 136.03     MB
+Phase                     | p50        | p99
+--------------------------------------------------
+Backward Pass             | 11.1646    | 12.3427
+  BW Head                 | 0.3712     | 0.5812
+  BW Layers (All)         | 10.3178    | 11.4609
+    BW Attention          | 5.2008     | 5.6069
+      BW Out Proj         | 0.2525     | 0.3112
+      BW Score            | 0.7101     | 0.7471
+      BW QKV              | 3.8871     | 4.0500
+    BW FeedForward        | 5.1170     | 5.8560
+      BW SwiGLU           | 5.0845     | 5.8211
+    BW Norms              | 0.0632     | 0.0690
+  BW Embed                | 0.0000     | 0.0000
 ==================================================
 ```
 
-**Key Observations:**
-- **TRAINING SUMMARY**: Total Time = sum of step times; Step time is fwd+bwd+opt; Loss start/end shows if training is learning (use `--fix-batch --seed 42` to see loss decrease).
-- **Forward table**: Same phases as inference; p50/p99 over all steps.
-- **Backward table**: BW Head, BW Embed, BW Attention, BW FeedForward, BW Norms; Gradient Memory matches summary.
-- **Optimizer mem/step**: Memory for the optimizer update only, not fwd/bwd activations.
+### Inference Mode (fast_lora, 10 tokens)
+
+Inference mode provides streaming token output and reports latency metrics such as **Time to First Token (TTFT)** and **tokens/sec**.
+
+```bash
+uv run python run_model.py --config configs/fast_lora.json
+```
+
+```
+==================================================
+            TIMING BREAKDOWN (seconds)
+--------------------------------------------------
+Phase                     | p50        | p99
+--------------------------------------------------
+Embedding                 | 0.1316     | 0.1316
+Layer Total (All)         | 2.2321     | 2.2321
+  Norm                    | 0.0277     | 0.0277
+  Weight Load             | 0.0004     | 0.0004
+  Attention               | 1.1233     | 1.1233
+    Ld weights            | 0.0429     | 0.0429
+    QKV Proj              | 0.0882     | 0.0882
+    RoPE                  | 0.0409     | 0.0409
+    Score/Sftmx           | 0.4869     | 0.4869
+    Out Agg/Proj          | 0.4108     | 0.4108
+  FeedForward             | 1.0295     | 1.0295
+    Ld weights            | 0.1991     | 0.1991
+    Compute               | 0.8204     | 0.8204
+Output Head               | 0.1268     | 0.1268
+--------------------------------------------------
+Prefill Stage             | 2.3662     | 2.3662
+==================================================
+
+ Decoding Stage
+=================
+[STREAM] <token_861><token_2647>...
+Time to first Token (<token_861>) : 2.5104s
+Output tokens/sec : 4.47
+```
 
 ## Parameter Experimentation Guide
 
