@@ -891,16 +891,27 @@ class EinsumTransformer:
                 scale = self.lora_alpha / self.lora_rank
                 if p.get("lora_A_q"):
                     Aq, Bq = self.get_w(p["lora_A_q"]), self.get_w(p["lora_B_q"])
-                    # Ensure float32 and sanitize inputs to prevent instability/overflow
-                    Aq = np.nan_to_num(Aq.astype(np.float32), copy=False, nan=0.0, posinf=0.0, neginf=0.0)
-                    Bq = np.nan_to_num(Bq.astype(np.float32), copy=False, nan=0.0, posinf=0.0, neginf=0.0)
-                    # wq is [In, Out], Aq is [In, R], Bq is [R, Out]
-                    wq = wq + scale * (Aq @ Bq)
+                    # Aggressive sanitization
+                    Aq = np.nan_to_num(Aq.astype(np.float32, copy=False), nan=0.0, posinf=0.0, neginf=0.0)
+                    Bq = np.nan_to_num(Bq.astype(np.float32, copy=False), nan=0.0, posinf=0.0, neginf=0.0)
+                    wq = np.nan_to_num(wq.astype(np.float32, copy=False), nan=0.0, posinf=0.0, neginf=0.0)
+
+                    # Compute delta with explicit check
+                    delta = Aq @ Bq
+                    delta = np.nan_to_num(delta, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+
+                    wq = wq + scale * delta
+
                 if p.get("lora_A_v"):
                     Av, Bv = self.get_w(p["lora_A_v"]), self.get_w(p["lora_B_v"])
-                    Av = np.nan_to_num(Av.astype(np.float32), copy=False, nan=0.0, posinf=0.0, neginf=0.0)
-                    Bv = np.nan_to_num(Bv.astype(np.float32), copy=False, nan=0.0, posinf=0.0, neginf=0.0)
-                    wv = wv + scale * (Av @ Bv)
+                    Av = np.nan_to_num(Av.astype(np.float32, copy=False), nan=0.0, posinf=0.0, neginf=0.0)
+                    Bv = np.nan_to_num(Bv.astype(np.float32, copy=False), nan=0.0, posinf=0.0, neginf=0.0)
+                    wv = np.nan_to_num(wv.astype(np.float32, copy=False), nan=0.0, posinf=0.0, neginf=0.0)
+
+                    delta = Av @ Bv
+                    delta = np.nan_to_num(delta, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+
+                    wv = wv + scale * delta
 
             layer_w['W_qkv'] = np.ascontiguousarray(np.concatenate([wq, wk, wv], axis=1))
 

@@ -6,7 +6,17 @@ import argparse
 import json
 import sys
 import copy
+import platform
+import os
 from core_transformer import TransformerConfig, EinsumTransformer
+
+def print_system_info():
+    print(f"\nSystem Information:")
+    print(f"  System: {platform.system()} {platform.release()}")
+    print(f"  Machine: {platform.machine()}")
+    print(f"  Processor: {platform.processor()}")
+    print(f"  Python: {sys.version.split()[0]}")
+    print(f"  Numpy: {np.__version__}")
 
 def benchmark(model, tokens, max_new_tokens=20, profile=False, name="Baseline"):
     # Warmup
@@ -79,6 +89,8 @@ if __name__ == "__main__":
     cfg_dict['speculative'] = False
 
     cfg = TransformerConfig(cfg_dict)
+
+    print_system_info()
 
     # 1. Baseline
     print("\nInitializing Baseline Model...")
