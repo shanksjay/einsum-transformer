@@ -7,19 +7,19 @@ import json
 import sys
 import copy
 from core_transformer import TransformerConfig, EinsumTransformer
-from optimized_transformer import OptimizedTransformer
 
 def benchmark(model, tokens, max_new_tokens=20, profile=False, name="Baseline"):
     # Warmup
     print(f"[{name}] Warming up...")
     try:
-        if isinstance(model, OptimizedTransformer):
-            model.clear_cache()
-            # Need matching batch size for warmup
-            warmup_tokens = tokens[:, :2]
-            model.generate(warmup_tokens, max_new_tokens=2)
-        else:
-            model.generate(tokens[:, :2])
+        model.clear_cache()
+        # Need matching batch size for warmup
+        warmup_tokens = tokens[:, :2]
+        # Temporarily reduce max_new_tokens for warmup
+        orig_max = model.cfg.max_new_tokens
+        model.cfg.max_new_tokens = 2
+        model.generate(warmup_tokens)
+        model.cfg.max_new_tokens = orig_max
     except Exception as e:
         print(f"Warmup failed: {e}")
 
@@ -33,10 +33,9 @@ def benchmark(model, tokens, max_new_tokens=20, profile=False, name="Baseline"):
 
     t0 = time.perf_counter()
 
-    if isinstance(model, OptimizedTransformer):
-        generated = model.generate(tokens, max_new_tokens=max_new_tokens)
-    else:
-        generated = model.generate(tokens)
+    # Set max_new_tokens
+    model.cfg.max_new_tokens = max_new_tokens
+    generated = model.generate(tokens)
 
     t_end = time.perf_counter()
 
@@ -48,16 +47,10 @@ def benchmark(model, tokens, max_new_tokens=20, profile=False, name="Baseline"):
     total_time = t_end - t0
 
     # Estimate decode time
-    if isinstance(model, OptimizedTransformer):
-        model.clear_cache()
-        t_p_start = time.perf_counter()
-        model.forward_chunk(tokens)
-        t_prefill = time.perf_counter() - t_p_start
-    else:
-        model.clear_cache()
-        t_p_start = time.perf_counter()
-        model.forward(tokens, inference=True, verbose=False)
-        t_prefill = time.perf_counter() - t_p_start
+    model.clear_cache()
+    t_p_start = time.perf_counter()
+    model.forward(tokens, inference=True, verbose=False)
+    t_prefill = time.perf_counter() - t_p_start
 
     decode_time = total_time - t_prefill
     steps_per_sec = max_new_tokens / decode_time if decode_time > 0 else 0
@@ -98,7 +91,9 @@ if __name__ == "__main__":
 
     # 2. Optimized (Standard)
     print("\nInitializing Optimized Model (Standard)...")
-    opt_model = OptimizedTransformer(cfg, parent_model=baseline_model)
+    # Standard EinsumTransformer handles optimizations internally now
+    # We reuse weights to simulate 'inference from loaded model'
+    opt_model = EinsumTransformer(cfg, _from_weights=baseline_model.weights, _E_name=baseline_model.E_name, _layer_weights=baseline_model.layer_weights)
     benchmark(opt_model, tokens, max_new_tokens=cfg.max_new_tokens, profile=args.profile, name="Optimized-Standard")
 
     # 3. Optimized (Speculative)
@@ -107,5 +102,5 @@ if __name__ == "__main__":
     cfg_spec.speculative = True
     cfg_spec.draft_layers = 2
 
-    opt_model_spec = OptimizedTransformer(cfg_spec, parent_model=baseline_model)
+    opt_model_spec = EinsumTransformer(cfg_spec, _from_weights=baseline_model.weights, _E_name=baseline_model.E_name, _layer_weights=baseline_model.layer_weights)
     benchmark(opt_model_spec, tokens, max_new_tokens=cfg.max_new_tokens, profile=args.profile, name="Optimized-Speculative")

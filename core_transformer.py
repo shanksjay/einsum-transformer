@@ -14,6 +14,12 @@ try:
 except ImportError:
     ml_dtypes = None
 
+try:
+    from scipy.special import expit
+    USE_SCIPY = True
+except ImportError:
+    USE_SCIPY = False
+
 
 class TransformerConfig:
     def __init__(self, cfg):
@@ -230,6 +236,13 @@ class EinsumTransformer:
         self.lora_target_modules = getattr(self.cfg, "lora_target_modules", ["q_proj", "v_proj"])
         self.lora_merge_after_training = getattr(self.cfg, "lora_merge_after_training", False)
 
+        # Optimization state
+        self.optimized_layers = None
+        self.optimized_params = None
+        self.kv_cache_opt = None
+        self.cos_cached = None
+        self.sin_cached = None
+
         if _from_weights is not None:
             if _E_name is None or _layer_weights is None:
                 self.weights = DictWeightManager(_from_weights) if isinstance(_from_weights, dict) else _from_weights
@@ -261,6 +274,8 @@ class EinsumTransformer:
     def clear_cache(self):
         self.cache = [{"K": None, "V": None} for _ in range(self.cfg.n_layers)]
         self.cur_pos = 0
+        if self.kv_cache_opt is not None:
+            self.kv_cache_opt.fill(0)
 
     def _load_weights(self, path):
         print(f"[INFO] Attempting to load weights from: {path}")
@@ -841,6 +856,202 @@ class EinsumTransformer:
         return out / self.cfg.top_k
 
     def forward(self, tokens, inference=False, verbose=True, training=False, max_layers=None):
+        if inference and not self.cfg.use_moe and not self.use_lora:
+            # Initialize optimized state on first run
+            if self.optimized_params is None:
+                self._optimize_for_inference()
+            return self._forward_inference(tokens, verbose)
+
+        return self._forward_standard(tokens, inference, verbose, training, max_layers)
+
+    def _optimize_for_inference(self):
+        c = self.cfg
+        print("[INFO] Optimizing weights for inference (FUSED)...")
+
+        self.optimized_params = {}
+        # Tied weights: Output Head = E.T
+        E = self.get_w(self.E_name).astype(np.float32)
+        self.optimized_params['E'] = E
+        self.optimized_params['Head'] = E.T
+
+        self.optimized_layers = []
+        for i in range(c.n_layers):
+            p = self.layer_weights[i]
+            layer_w = {}
+
+            def load_linear(key, transpose=True):
+                w = self.get_w(p[key], transpose=transpose)
+                return np.ascontiguousarray(w)
+
+            wq = load_linear('W_q')
+            wk = load_linear('W_k')
+            wv = load_linear('W_v')
+            layer_w['W_qkv'] = np.ascontiguousarray(np.concatenate([wq, wk, wv], axis=1))
+
+            layer_w['W_o'] = load_linear('W_o')
+            layer_w['norm1'] = self.get_w(p['norm1'])
+            layer_w['norm2'] = self.get_w(p['norm2'])
+
+            w1 = load_linear('W1')
+            w2 = load_linear('W2')
+            layer_w['W_gate_up'] = np.ascontiguousarray(np.concatenate([w1, w2], axis=1))
+            layer_w['W3'] = load_linear('W3')
+
+            self.optimized_layers.append(layer_w)
+
+        # Init optimized KV cache
+        max_seq = max(c.seq_len, 4096)
+        self.kv_cache_opt = np.zeros(
+            (c.batch_size, c.n_layers, 2, max_seq, c.n_kv_heads, c.d_head),
+            dtype=np.float32
+        )
+
+        # Init RoPE
+        head_dim = c.d_head
+        theta = 10000.0
+        inv_freq = 1.0 / (theta ** (np.arange(0, head_dim, 2).astype(np.float32) / head_dim))
+        t = np.arange(max_seq, dtype=np.float32)
+        freqs = np.outer(t, inv_freq)
+        emb = np.concatenate((freqs, freqs), axis=-1)
+        self.cos_cached = np.cos(emb).astype(np.float32)
+        self.sin_cached = np.sin(emb).astype(np.float32)
+
+    def _forward_inference(self, tokens, verbose=True):
+        B, L = tokens.shape
+        c = self.cfg
+        start_pos = self.cur_pos
+
+        if B > c.batch_size:
+            raise ValueError(f"Batch size {B} exceeds allocated {c.batch_size}")
+
+        x = np.take(self.optimized_params['E'], tokens, axis=0) # [B, L, D]
+
+        d_q = c.n_heads * c.d_head
+        d_kv = c.n_kv_heads * c.d_head
+        d_gate = c.d_ff
+
+        cos_T = self.cos_cached[start_pos : start_pos+L]
+        sin_T = self.sin_cached[start_pos : start_pos+L]
+
+        if L == 1:
+            cos_T = cos_T[None, None, :, :]
+            sin_T = sin_T[None, None, :, :]
+        else:
+            cos_T = cos_T[None, :, None, :]
+            sin_T = sin_T[None, :, None, :]
+
+        mask = None
+        if L > 1:
+            mask = np.triu(np.ones((L, L), dtype=np.float32), k=1) * -1e9
+
+        for i, l in enumerate(self.optimized_layers):
+            # Norm 1
+            h = self.rms_norm(x, l['norm1'])
+
+            # QKV
+            qkv = h @ l['W_qkv']
+
+            q = qkv[..., :d_q]
+            k = qkv[..., d_q:d_q+d_kv]
+            v = qkv[..., d_q+d_kv:]
+
+            q = q.reshape(B, L, c.n_heads, c.d_head)
+            k = k.reshape(B, L, c.n_kv_heads, c.d_head)
+            v = v.reshape(B, L, c.n_kv_heads, c.d_head)
+
+            # RoPE
+            q_r, q_i = q[..., 0::2], q[..., 1::2]
+            k_r, k_i = k[..., 0::2], k[..., 1::2]
+
+            c_half = cos_T[..., 0::2]
+            s_half = sin_T[..., 0::2]
+
+            q_r_new = q_r * c_half - q_i * s_half
+            q_i_new = q_r * s_half + q_i * c_half
+            q[..., 0::2] = q_r_new
+            q[..., 1::2] = q_i_new
+
+            k_r_new = k_r * c_half - k_i * s_half
+            k_i_new = k_r * s_half + k_i * c_half
+            k[..., 0::2] = k_r_new
+            k[..., 1::2] = k_i_new
+
+            # Update Cache
+            self.kv_cache_opt[:B, i, 0, start_pos:start_pos+L, :, :] = k
+            self.kv_cache_opt[:B, i, 1, start_pos:start_pos+L, :, :] = v
+
+            k_cache = self.kv_cache_opt[:B, i, 0, :start_pos+L, :, :]
+            v_cache = self.kv_cache_opt[:B, i, 1, :start_pos+L, :, :]
+
+            # Attention
+            if c.n_heads != c.n_kv_heads:
+                n_rep = c.n_heads // c.n_kv_heads
+                q_reshaped = q.reshape(B, L, c.n_kv_heads, n_rep, c.d_head).transpose(0, 2, 1, 3, 4)
+
+                k_t = k_cache.transpose(0, 2, 3, 1)
+                k_t = k_t[:, :, None, :, :]
+
+                scores = np.matmul(q_reshaped, k_t) / np.sqrt(c.d_head)
+
+                if mask is not None:
+                    scores[..., :, :, start_pos:] += mask.reshape(L, 1, L)
+
+                max_score = np.max(scores, axis=-1, keepdims=True)
+                exp_score = np.exp(scores - max_score)
+                attn = exp_score / np.sum(exp_score, axis=-1, keepdims=True)
+
+                v_t = v_cache.transpose(0, 2, 1, 3)
+                v_t = v_t[:, :, None, :, :]
+
+                out = np.matmul(attn, v_t)
+                out = out.transpose(0, 2, 1, 3, 4).reshape(B, L, c.d_model)
+
+            else:
+                q_t = q.transpose(0, 2, 1, 3)
+                k_t = k_cache.transpose(0, 2, 3, 1)
+
+                scores = np.matmul(q_t, k_t) / np.sqrt(c.d_head)
+
+                if mask is not None:
+                    scores[..., :, start_pos:] += mask
+
+                max_score = np.max(scores, axis=-1, keepdims=True)
+                exp_score = np.exp(scores - max_score)
+                attn = exp_score / np.sum(exp_score, axis=-1, keepdims=True)
+
+                v_t = v_cache.transpose(0, 2, 1, 3)
+                out = np.matmul(attn, v_t)
+                out = out.transpose(0, 2, 1, 3).reshape(B, L, c.d_model)
+
+            h = out @ l['W_o']
+            x = x + h
+
+            # FFN
+            h = self.rms_norm(x, l['norm2'])
+            gate_up = h @ l['W_gate_up']
+            gate = gate_up[..., :d_gate]
+            up = gate_up[..., d_gate:]
+
+            if USE_SCIPY:
+                gate = gate * expit(gate) * up
+            else:
+                sig = np.where(gate > 0, 1.0 / (1.0 + np.exp(-gate)), np.exp(gate) / (1.0 + np.exp(gate)))
+                gate = gate * sig * up
+
+            down = gate @ l['W3']
+            x = x + down
+
+        logits = x @ self.optimized_params['Head']
+
+        # Only advance position if not speculative verification (verification advances manually or logic handles it)
+        # For standard generation, we advance.
+        # But this function is used by generate() loop which expects manual advance if called in chunks?
+        # Actually generate() calls this per step.
+        # Let's side-effect update cur_pos for simplicity in standard inference
+        self.cur_pos += L
+        return logits
+
+    def _forward_standard(self, tokens, inference=False, verbose=True, training=False, max_layers=None):
         """
         Forward pass of the Transformer using pure einsum notation.
 
@@ -1200,7 +1411,10 @@ class EinsumTransformer:
 
         t0 = time.time()
         # Prefill
+        # logits = self.forward(tokens, inference=True, verbose=True)
+        # Using forward with inference=True handles optimization internally
         logits = self.forward(tokens, inference=True, verbose=True)
+
         next_token = self.sample_top_k(logits, k=self.cfg.top_k_sample, temperature=self.cfg.temperature)
         ttft = time.time() - t0
 
@@ -1260,9 +1474,19 @@ class EinsumTransformer:
         logits = self.forward(tokens, inference=True, verbose=True)
 
         # 2. Seed draft model KV cache from target model to avoid redundant prefill
-        for i in range(self.cfg.draft_layers):
-            draft_model.cache[i]["K"] = self.cache[i]["K"]
-            draft_model.cache[i]["V"] = self.cache[i]["V"]
+        # NOTE: Optimized KV cache is separate. If optimization is on, we need to sync optimized caches.
+        if self.kv_cache_opt is not None:
+            # Ensure draft model is also optimized
+            if draft_model.kv_cache_opt is None:
+                draft_model._optimize_for_inference()
+
+            for i in range(self.cfg.draft_layers):
+                draft_model.kv_cache_opt[:, i] = self.kv_cache_opt[:, i]
+        else:
+            for i in range(self.cfg.draft_layers):
+                draft_model.cache[i]["K"] = self.cache[i]["K"]
+                draft_model.cache[i]["V"] = self.cache[i]["V"]
+
         draft_model.cur_pos = self.cur_pos
         
         # 2. Sample the first token after the prompt
@@ -1320,26 +1544,38 @@ class EinsumTransformer:
                 print(self.detokenize([next_toks[0]])[0], end="", flush=True)
 
             # d. Rollback target model KV cache
-            # We processed 'k+1' tokens as input.
-            # If all accepted + bonus: n_accepted=k. generated grew by k+1. cache grew by k+1.
-            # We want to keep all k+1 processed inputs in cache. n_to_keep = k+1.
-            # If n_accepted < k: we stopped at j. we accepted d_tokens[0...j-1] and correction for d_tokens[j].
-            # Total new tokens in generated: j+1. New tokens in cache to keep: j+1 (v_input[0...j]).
             n_to_keep = n_accepted + 1
             n_target_rollback = (k + 1) - n_to_keep
+
             if n_target_rollback > 0:
-                for layer in self.cache:
-                    if layer["K"] is not None:
-                        layer["K"] = layer["K"][:, :, :-n_target_rollback, :]
-                        layer["V"] = layer["V"][:, :, :-n_target_rollback, :]
                 self.cur_pos -= n_target_rollback
+                # Support Optimized Cache rollback
+                # Optimized cache is just a circular buffer or linear buffer.
+                # Since we write linearly, we just decrement cur_pos.
+                # No data clearing needed as it will be overwritten.
+
+                # Standard Cache rollback (if used, but here we use optimized likely)
+                if self.kv_cache_opt is None:
+                    for layer in self.cache:
+                        if layer["K"] is not None:
+                            layer["K"] = layer["K"][:, :, :-n_target_rollback, :]
+                            layer["V"] = layer["V"][:, :, :-n_target_rollback, :]
 
             # e. Synchronize draft model state with target model
-            # This ensures both models are aligned for the next speculative step.
-            for l in range(self.cfg.draft_layers):
-                draft_model.cache[l]["K"] = self.cache[l]["K"]
-                draft_model.cache[l]["V"] = self.cache[l]["V"]
             draft_model.cur_pos = self.cur_pos
+            if self.kv_cache_opt is not None:
+                # Optimized sync
+                # Only need to sync the valid part up to cur_pos
+                # Copy from (cur_pos - n_to_keep) to cur_pos.
+                start_sync = max(0, self.cur_pos - n_to_keep)
+                # Draft cache has fewer layers (draft_layers), self cache has n_layers
+                n_d = self.cfg.draft_layers
+                # Slice ONLY the draft layers from the main cache
+                draft_model.kv_cache_opt[:, :n_d, :, start_sync:self.cur_pos, :, :] = self.kv_cache_opt[:, :n_d, :, start_sync:self.cur_pos, :, :]
+            else:
+                for l in range(self.cfg.draft_layers):
+                    draft_model.cache[l]["K"] = self.cache[l]["K"]
+                    draft_model.cache[l]["V"] = self.cache[l]["V"]
 
         t_decode_end = time.time()
         duration = t_decode_end - t_decode_start
