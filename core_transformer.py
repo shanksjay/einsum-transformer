@@ -942,6 +942,10 @@ class EinsumTransformer:
         self.sin_cached = np.sin(emb).astype(np.float32)
 
     def _forward_inference(self, tokens, verbose=True):
+        if not hasattr(self, '_stats'): self._init_stats()
+        # Helper to track stats similar to standard forward
+        t_stage_start = time.time()
+
         B, L = tokens.shape
         c = self.cfg
         start_pos = self.cur_pos
@@ -949,7 +953,9 @@ class EinsumTransformer:
         if B > c.batch_size:
             raise ValueError(f"Batch size {B} exceeds allocated {c.batch_size}")
 
+        t_emb = time.time()
         x = np.take(self.optimized_params['E'], tokens, axis=0) # [B, L, D]
+        self._stats['embedding'].append(time.time() - t_emb)
 
         d_q = c.n_heads * c.d_head
         d_kv = c.n_kv_heads * c.d_head
@@ -969,15 +975,23 @@ class EinsumTransformer:
         if L > 1:
             mask = np.triu(np.ones((L, L), dtype=np.float32), k=1) * -1e9
 
+        t_layers_total = 0
+
         for i, l in enumerate(self.optimized_layers):
+            t_l_start = time.time()
+
+            t_norm = time.time()
             # Norm 1
             h = self.rms_norm(x, l['norm1'])
             # Ensure stability of activations
             h = np.nan_to_num(h, copy=False, nan=0.0, posinf=65504.0, neginf=-65504.0)
             h = np.ascontiguousarray(h)
+            self._stats['norm_step'].append(time.time() - t_norm)
 
+            t_qkv = time.time()
             # QKV
             qkv = h @ l['W_qkv']
+            self._stats['attn_qkv_step'].append(time.time() - t_qkv)
 
             q = qkv[..., :d_q]
             k = qkv[..., d_q:d_q+d_kv]
@@ -987,6 +1001,7 @@ class EinsumTransformer:
             k = k.reshape(B, L, c.n_kv_heads, c.d_head)
             v = v.reshape(B, L, c.n_kv_heads, c.d_head)
 
+            t_rope = time.time()
             # RoPE
             q_r, q_i = q[..., 0::2], q[..., 1::2]
             k_r, k_i = k[..., 0::2], k[..., 1::2]
@@ -1001,8 +1016,7 @@ class EinsumTransformer:
 
             k_r_new = k_r * c_half - k_i * s_half
             k_i_new = k_r * s_half + k_i * c_half
-            k[..., 0::2] = k_r_new
-            k[..., 1::2] = k_i_new
+            self._stats['attn_rope_step'].append(time.time() - t_rope)
 
             # Update Cache
             self.kv_cache_opt[:B, i, 0, start_pos:start_pos+L, :, :] = k
@@ -1011,6 +1025,7 @@ class EinsumTransformer:
             k_cache = self.kv_cache_opt[:B, i, 0, :start_pos+L, :, :]
             v_cache = self.kv_cache_opt[:B, i, 1, :start_pos+L, :, :]
 
+            t_attn_score = time.time()
             # Attention
             if c.n_heads != c.n_kv_heads:
                 n_rep = c.n_heads // c.n_kv_heads
@@ -1050,10 +1065,14 @@ class EinsumTransformer:
                 v_t = v_cache.transpose(0, 2, 1, 3)
                 out = np.matmul(attn, v_t)
                 out = out.transpose(0, 2, 1, 3).reshape(B, L, c.d_model)
+            self._stats['attn_score_step'].append(time.time() - t_attn_score)
 
+            t_out = time.time()
             h = out @ l['W_o']
             x = x + h
+            self._stats['attn_out_step'].append(time.time() - t_out)
 
+            t_ffn_s = time.time()
             # FFN
             h = self.rms_norm(x, l['norm2'])
             h = np.nan_to_num(h, copy=False, nan=0.0, posinf=65504.0, neginf=-65504.0)
@@ -1071,8 +1090,24 @@ class EinsumTransformer:
 
             down = gate @ l['W3']
             x = x + down
+            self._stats['ffn_compute_step'].append(time.time() - t_ffn_s)
 
+            # Aggregate layer time
+            self._stats['layers_step'].append(time.time() - t_l_start)
+            t_layers_total += (time.time() - t_l_start)
+
+        t_head = time.time()
         logits = x @ self.optimized_params['Head']
+        self._stats['output_head'].append(time.time() - t_head)
+
+        # Stats for stage
+        if L > 1:
+            self._stats['prefill'].append(time.time() - t_stage_start)
+        else:
+            self._stats['decode'].append(time.time() - t_stage_start)
+
+        if verbose:
+             self._print_stats_table()
 
         # Only advance position if not speculative verification (verification advances manually or logic handles it)
         # For standard generation, we advance.
