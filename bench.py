@@ -17,6 +17,8 @@ def print_system_info():
     print(f"  Processor: {platform.processor()}")
     print(f"  Python: {sys.version.split()[0]}")
     print(f"  Numpy: {np.__version__}")
+    print("\nNumpy Config:")
+    np.__config__.show()
 
 def benchmark(model, tokens, max_new_tokens=20, profile=False, name="Baseline"):
     # Warmup

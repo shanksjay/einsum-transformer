@@ -868,9 +868,15 @@ class EinsumTransformer:
         c = self.cfg
         print("[INFO] Optimizing weights for inference (FUSED)...")
 
+        def _sanitize(x):
+            # Aggressively clean weights: cast to float32, replace NaNs/Infs with 0
+            if x is None: return None
+            x = x.astype(np.float32, copy=False)
+            return np.nan_to_num(x, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+
         self.optimized_params = {}
         # Tied weights: Output Head = E.T
-        E = self.get_w(self.E_name).astype(np.float32)
+        E = _sanitize(self.get_w(self.E_name))
         self.optimized_params['E'] = E
         self.optimized_params['Head'] = E.T
 
@@ -881,7 +887,7 @@ class EinsumTransformer:
 
             def load_linear(key, transpose=True):
                 w = self.get_w(p[key], transpose=transpose)
-                return np.ascontiguousarray(w)
+                return _sanitize(np.ascontiguousarray(w))
 
             wq = load_linear('W_q')
             wk = load_linear('W_k')
@@ -891,33 +897,21 @@ class EinsumTransformer:
                 scale = self.lora_alpha / self.lora_rank
                 if p.get("lora_A_q"):
                     Aq, Bq = self.get_w(p["lora_A_q"]), self.get_w(p["lora_B_q"])
-                    # Aggressive sanitization
-                    Aq = np.nan_to_num(Aq.astype(np.float32, copy=False), nan=0.0, posinf=0.0, neginf=0.0)
-                    Bq = np.nan_to_num(Bq.astype(np.float32, copy=False), nan=0.0, posinf=0.0, neginf=0.0)
-                    wq = np.nan_to_num(wq.astype(np.float32, copy=False), nan=0.0, posinf=0.0, neginf=0.0)
-
-                    # Compute delta with explicit check
-                    delta = Aq @ Bq
-                    delta = np.nan_to_num(delta, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
-
-                    wq = wq + scale * delta
+                    Aq, Bq = _sanitize(Aq), _sanitize(Bq)
+                    delta = _sanitize(Aq @ Bq)
+                    wq = _sanitize(wq + scale * delta)
 
                 if p.get("lora_A_v"):
                     Av, Bv = self.get_w(p["lora_A_v"]), self.get_w(p["lora_B_v"])
-                    Av = np.nan_to_num(Av.astype(np.float32, copy=False), nan=0.0, posinf=0.0, neginf=0.0)
-                    Bv = np.nan_to_num(Bv.astype(np.float32, copy=False), nan=0.0, posinf=0.0, neginf=0.0)
-                    wv = np.nan_to_num(wv.astype(np.float32, copy=False), nan=0.0, posinf=0.0, neginf=0.0)
-
-                    delta = Av @ Bv
-                    delta = np.nan_to_num(delta, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
-
-                    wv = wv + scale * delta
+                    Av, Bv = _sanitize(Av), _sanitize(Bv)
+                    delta = _sanitize(Av @ Bv)
+                    wv = _sanitize(wv + scale * delta)
 
             layer_w['W_qkv'] = np.ascontiguousarray(np.concatenate([wq, wk, wv], axis=1))
 
             layer_w['W_o'] = load_linear('W_o')
-            layer_w['norm1'] = self.get_w(p['norm1'])
-            layer_w['norm2'] = self.get_w(p['norm2'])
+            layer_w['norm1'] = _sanitize(self.get_w(p['norm1']))
+            layer_w['norm2'] = _sanitize(self.get_w(p['norm2']))
 
             w1 = load_linear('W1')
             w2 = load_linear('W2')
