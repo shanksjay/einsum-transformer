@@ -891,13 +891,15 @@ class EinsumTransformer:
                 scale = self.lora_alpha / self.lora_rank
                 if p.get("lora_A_q"):
                     Aq, Bq = self.get_w(p["lora_A_q"]), self.get_w(p["lora_B_q"])
-                    # Ensure float32 for stability, especially if base weights are bfloat16
-                    Aq, Bq = Aq.astype(np.float32), Bq.astype(np.float32)
+                    # Ensure float32 and sanitize inputs to prevent instability/overflow
+                    Aq = np.nan_to_num(Aq.astype(np.float32), copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+                    Bq = np.nan_to_num(Bq.astype(np.float32), copy=False, nan=0.0, posinf=0.0, neginf=0.0)
                     # wq is [In, Out], Aq is [In, R], Bq is [R, Out]
                     wq = wq + scale * (Aq @ Bq)
                 if p.get("lora_A_v"):
                     Av, Bv = self.get_w(p["lora_A_v"]), self.get_w(p["lora_B_v"])
-                    Av, Bv = Av.astype(np.float32), Bv.astype(np.float32)
+                    Av = np.nan_to_num(Av.astype(np.float32), copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+                    Bv = np.nan_to_num(Bv.astype(np.float32), copy=False, nan=0.0, posinf=0.0, neginf=0.0)
                     wv = wv + scale * (Av @ Bv)
 
             layer_w['W_qkv'] = np.ascontiguousarray(np.concatenate([wq, wk, wv], axis=1))
