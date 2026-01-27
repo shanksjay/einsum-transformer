@@ -972,6 +972,9 @@ class EinsumTransformer:
         for i, l in enumerate(self.optimized_layers):
             # Norm 1
             h = self.rms_norm(x, l['norm1'])
+            # Ensure stability of activations
+            h = np.nan_to_num(h, copy=False, nan=0.0, posinf=65504.0, neginf=-65504.0)
+            h = np.ascontiguousarray(h)
 
             # QKV
             qkv = h @ l['W_qkv']
@@ -1053,6 +1056,9 @@ class EinsumTransformer:
 
             # FFN
             h = self.rms_norm(x, l['norm2'])
+            h = np.nan_to_num(h, copy=False, nan=0.0, posinf=65504.0, neginf=-65504.0)
+            h = np.ascontiguousarray(h)
+
             gate_up = h @ l['W_gate_up']
             gate = gate_up[..., :d_gate]
             up = gate_up[..., d_gate:]
