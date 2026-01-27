@@ -856,7 +856,7 @@ class EinsumTransformer:
         return out / self.cfg.top_k
 
     def forward(self, tokens, inference=False, verbose=True, training=False, max_layers=None):
-        if inference and not self.cfg.use_moe and not self.use_lora:
+        if inference and not self.cfg.use_moe:
             # Initialize optimized state on first run
             if self.optimized_params is None:
                 self._optimize_for_inference()
@@ -886,6 +886,17 @@ class EinsumTransformer:
             wq = load_linear('W_q')
             wk = load_linear('W_k')
             wv = load_linear('W_v')
+
+            if self.use_lora:
+                scale = self.lora_alpha / self.lora_rank
+                if p.get("lora_A_q"):
+                    Aq, Bq = self.get_w(p["lora_A_q"]), self.get_w(p["lora_B_q"])
+                    # wq is [In, Out], Aq is [In, R], Bq is [R, Out]
+                    wq = wq + scale * (Aq @ Bq)
+                if p.get("lora_A_v"):
+                    Av, Bv = self.get_w(p["lora_A_v"]), self.get_w(p["lora_B_v"])
+                    wv = wv + scale * (Av @ Bv)
+
             layer_w['W_qkv'] = np.ascontiguousarray(np.concatenate([wq, wk, wv], axis=1))
 
             layer_w['W_o'] = load_linear('W_o')
@@ -898,6 +909,10 @@ class EinsumTransformer:
             layer_w['W3'] = load_linear('W3')
 
             self.optimized_layers.append(layer_w)
+
+        # Unload original weights to save memory
+        if hasattr(self.weights, 'purge_cache'):
+            self.weights.purge_cache()
 
         # Init optimized KV cache
         max_seq = max(c.seq_len, 4096)

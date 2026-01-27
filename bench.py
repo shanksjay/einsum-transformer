@@ -104,3 +104,25 @@ if __name__ == "__main__":
 
     opt_model_spec = EinsumTransformer(cfg_spec, _from_weights=baseline_model.weights, _E_name=baseline_model.E_name, _layer_weights=baseline_model.layer_weights)
     benchmark(opt_model_spec, tokens, max_new_tokens=cfg.max_new_tokens, profile=args.profile, name="Optimized-Speculative")
+
+    # 4. Optimized (LoRA + Speculative)
+    print("\nInitializing Optimized Model (LoRA + Speculative)...")
+    cfg_lora = copy.deepcopy(cfg)
+    cfg_lora.speculative = True
+    cfg_lora.draft_layers = 2
+    cfg_lora.use_lora = True # Enable LoRA to test fallback behavior
+
+    # We need to make sure weights contain LoRA params.
+    # Baseline random init might have them if configured, but let's check.
+    # config/fast_lora.json has use_lora: false but lora_target_modules defined.
+    # EinsumTransformer init will create them if missing when use_lora=True is passed?
+    # No, _from_weights skips init_weights_random/load_weights.
+    # It calls _bind_weights.
+    # If weights are missing, it might error or init them if code allows.
+    # Let's ensure baseline has them.
+
+    # Actually, let's just create a new model for this test to ensure weights exist
+    opt_model_lora = EinsumTransformer(cfg_lora)
+    # Use small batch for LoRA test to avoid OOM if random init is large
+    tokens_lora = np.random.randint(0, cfg.vocab_size, size=(cfg.batch_size, prompt_len))
+    benchmark(opt_model_lora, tokens_lora, max_new_tokens=cfg.max_new_tokens, profile=args.profile, name="Optimized-LoRA-Speculative")
