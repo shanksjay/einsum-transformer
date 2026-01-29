@@ -9,3 +9,6 @@
 ## 2024-10-24 - RoPE Precomputation & EAFP
 **Learning:** Precomputing RoPE tables yields ~17% speedup for single-token decoding (T=1) by avoiding `pow`, `outer`, `cos`, `sin` ops. Using `try-except` (EAFP) for cache lookup is significantly faster (saves ~20us) than explicit `np.all` bounds checking in Python/NumPy for small arrays.
 **Action:** Use precomputed caches for static embeddings and EAFP for hot-path validations.
+## 2026-01-27 - NumPy Masking Overhead
+**Learning:** Piecewise function application using boolean masks in NumPy (`mask = x > 0; out[mask] = ...`) is significantly slower (10x+) than vectorized operations, even when handling special cases like overflow. Suppressing warnings with `np.errstate` is much cheaper than masking.
+**Action:** Replace masked piecewise logic with mathematically equivalent continuous functions where possible, using `np.errstate` to handle safe overflows (e.g. `exp(-large) -> inf`).
