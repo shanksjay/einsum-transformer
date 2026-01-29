@@ -296,6 +296,7 @@ class EinsumTransformer:
         self.kv_cache_opt = None
         self.cos_cached = None
         self.sin_cached = None
+        self._init_rope()
 
         if _from_weights is not None:
             if _E_name is None or _layer_weights is None:
@@ -324,6 +325,17 @@ class EinsumTransformer:
             quant_bits_w = getattr(self.cfg, 'quantization_weight_bits', 0)
             quant_bits_a = getattr(self.cfg, 'quantization_activation_bits', 0)
             print(f"[INFO] Mixed-precision quantization: {self.cfg.quantization} (W{quant_bits_w} A{quant_bits_a})")
+
+    def _init_rope(self):
+        c = self.cfg
+        D = c.d_head
+        inv_freq = 1.0 / (c.rope_base ** (np.arange(0, D, 2) / D))
+        t = np.arange(c.seq_len)
+        freqs = np.outer(t, inv_freq)
+        self.rope_cache = {
+            "cos": np.cos(freqs), # (seq_len, D/2)
+            "sin": np.sin(freqs)
+        }
 
     def clear_cache(self):
         self.cache = [{"K": None, "V": None} for _ in range(self.cfg.n_layers)]
@@ -735,13 +747,12 @@ class EinsumTransformer:
         a = futures[0].result()
         b = futures[1].result()
 
-        # Numerical stable sigmoid to avoid overflow in np.exp
-        # We use a piecewise approach to avoid evaluating np.exp on values that would overflow
-        sig_b = np.zeros_like(b)
-        pos_mask = (b >= 0)
-        neg_mask = ~pos_mask
-        sig_b[pos_mask] = 1.0 / (1.0 + np.exp(-b[pos_mask]))
-        sig_b[neg_mask] = np.exp(b[neg_mask]) / (1.0 + np.exp(b[neg_mask]))
+        # Optimized stable sigmoid
+        # np.exp(-b) can overflow for large negative b, resulting in inf.
+        # 1.0 / (1.0 + inf) evaluates to 0.0, which is the correct limit for sigmoid(large_negative).
+        # We suppress the overflow warning as this behavior is intended and safe.
+        with np.errstate(over='ignore'):
+            sig_b = 1.0 / (1.0 + np.exp(-b))
 
         swish_b = b * sig_b
         gated = a * swish_b
@@ -758,14 +769,25 @@ class EinsumTransformer:
 
     def apply_rope(self, x, positions):
         B, T, H, D = x.shape
-        pos = np.asarray(positions, dtype=np.float64)
+        pos = np.asarray(positions)
         if len(pos) != T:
             if len(pos) > T: pos = pos[:T]
-            else: pos = np.concatenate([pos, np.arange(pos[-1]+1, pos[-1]+1 + T - len(pos))])
-        inv_freq = 1.0 / (self.cfg.rope_base ** (np.arange(0, D, 2) / D))
-        freqs = np.outer(pos, inv_freq)
-        cos, sin = np.cos(freqs), np.sin(freqs)
-        cos, sin = cos[None, :, None, :], sin[None, :, None, :]
+            else:
+                start = pos[-1] + 1
+                pos = np.concatenate([pos, np.arange(start, start + T - len(pos))])
+
+        pos = pos.astype(np.int32)
+
+        try:
+            cos = self.rope_cache["cos"][pos]
+            sin = self.rope_cache["sin"][pos]
+            cos, sin = cos[None, :, None, :], sin[None, :, None, :]
+        except IndexError:
+            inv_freq = 1.0 / (self.cfg.rope_base ** (np.arange(0, D, 2) / D))
+            freqs = np.outer(pos, inv_freq)
+            cos, sin = np.cos(freqs), np.sin(freqs)
+            cos, sin = cos[None, :, None, :], sin[None, :, None, :]
+
         x1, x2 = x[..., 0::2], x[..., 1::2]
         out = np.empty_like(x)
         out[..., 0::2] = x1 * cos - x2 * sin
@@ -1719,14 +1741,25 @@ class EinsumTransformer:
 
     def _rope_backward(self, dy, positions):
         B, T, H, D = dy.shape
-        pos = np.asarray(positions, dtype=np.float64)
+        pos = np.asarray(positions)
         if len(pos) != T:
             if len(pos) > T: pos = pos[:T]
-            else: pos = np.concatenate([pos, np.arange(pos[-1]+1, pos[-1]+1 + T - len(pos))])
-        inv_freq = 1.0 / (self.cfg.rope_base ** (np.arange(0, D, 2) / D))
-        freqs = np.outer(pos, inv_freq)
-        cos, sin = np.cos(freqs), np.sin(freqs)
-        cos, sin = cos[None, :, None, :], sin[None, :, None, :]
+            else:
+                start = pos[-1] + 1
+                pos = np.concatenate([pos, np.arange(start, start + T - len(pos))])
+
+        pos = pos.astype(np.int32)
+
+        try:
+            cos = self.rope_cache["cos"][pos]
+            sin = self.rope_cache["sin"][pos]
+            cos, sin = cos[None, :, None, :], sin[None, :, None, :]
+        except IndexError:
+            inv_freq = 1.0 / (self.cfg.rope_base ** (np.arange(0, D, 2) / D))
+            freqs = np.outer(pos, inv_freq)
+            cos, sin = np.cos(freqs), np.sin(freqs)
+            cos, sin = cos[None, :, None, :], sin[None, :, None, :]
+
         dy1, dy2 = dy[..., 0::2], dy[..., 1::2]
         dx = np.empty_like(dy)
         dx[..., 0::2] = dy1 * cos + dy2 * sin
