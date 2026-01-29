@@ -14,6 +14,77 @@ try:
 except ImportError:
     ml_dtypes = None
 
+try:
+    from scipy.special import expit
+    USE_SCIPY = True
+except ImportError:
+    USE_SCIPY = False
+
+import platform
+
+def _get_platform_block_size():
+    """Determine optimal block size for tiled matmul based on platform."""
+    sys_plat = platform.system()
+    machine = platform.machine()
+
+    if sys_plat == 'Darwin' and machine == 'arm64':
+        # Apple Silicon (M1/M2/M3)
+        # Optimal block size for AMX/NEON often around 2048-4096 depending on L2
+        return 2048
+    elif machine == 'x86_64':
+        # Intel/AMD AVX512 usually prefers 512-1024 chunks to stay in L1/L2
+        return 1024
+    else:
+        # Conservative default
+        return 1024
+
+def tiled_matmul(a, b, block_size=None, executor=None):
+    """
+    Perform matrix multiplication a @ b using tiling to reduce peak memory
+    and improve stability. Supports parallel dispatch for chunks.
+
+    a: [..., K]
+    b: [K, N]
+    Output: [..., N]
+    """
+    if block_size is None:
+        block_size = _get_platform_block_size()
+
+    K = a.shape[-1]
+    N = b.shape[-1]
+
+    # Heuristic: Parallelize if total work > threshold
+    # 4096*4096 floats = 16M ops.
+    total_ops = np.prod(a.shape[:-1]) * K * N
+    use_parallel = executor is not None and total_ops > 1e7
+
+    # If small, just run standard matmul
+    if not use_parallel and K * N < 4096 * 4096:
+        return np.matmul(a, b)
+
+    out_shape = list(a.shape)
+    out_shape[-1] = N
+    res = np.empty(out_shape, dtype=a.dtype)
+
+    def compute_chunk(start_idx, end_idx):
+        # a: [..., K] @ b[:, start:end] -> [..., chunk]
+        res[..., start_idx:end_idx] = np.matmul(a, b[:, start_idx:end_idx])
+
+    if use_parallel:
+        futures = []
+        for i in range(0, N, block_size):
+            end = min(i + block_size, N)
+            futures.append(executor.submit(compute_chunk, i, end))
+        # Wait for all
+        for f in as_completed(futures):
+            f.result()
+    else:
+        for i in range(0, N, block_size):
+            end = min(i + block_size, N)
+            compute_chunk(i, end)
+
+    return res
+
 
 class TransformerConfig:
     def __init__(self, cfg):
@@ -230,7 +301,12 @@ class EinsumTransformer:
         self.lora_target_modules = getattr(self.cfg, "lora_target_modules", ["q_proj", "v_proj"])
         self.lora_merge_after_training = getattr(self.cfg, "lora_merge_after_training", False)
 
-        self._init_rope()
+        # Optimization state
+        self.optimized_layers = None
+        self.optimized_params = None
+        self.kv_cache_opt = None
+        self.cos_cached = None
+        self.sin_cached = None
 
         if _from_weights is not None:
             if _E_name is None or _layer_weights is None:
@@ -260,20 +336,11 @@ class EinsumTransformer:
             quant_bits_a = getattr(self.cfg, 'quantization_activation_bits', 0)
             print(f"[INFO] Mixed-precision quantization: {self.cfg.quantization} (W{quant_bits_w} A{quant_bits_a})")
 
-    def _init_rope(self):
-        c = self.cfg
-        D = c.d_head
-        inv_freq = 1.0 / (c.rope_base ** (np.arange(0, D, 2) / D))
-        t = np.arange(c.seq_len)
-        freqs = np.outer(t, inv_freq)
-        self.rope_cache = {
-            "cos": np.cos(freqs), # (seq_len, D/2)
-            "sin": np.sin(freqs)
-        }
-
     def clear_cache(self):
         self.cache = [{"K": None, "V": None} for _ in range(self.cfg.n_layers)]
         self.cur_pos = 0
+        if self.kv_cache_opt is not None:
+            self.kv_cache_opt.fill(0)
 
     def _load_weights(self, path):
         print(f"[INFO] Attempting to load weights from: {path}")
@@ -679,12 +746,13 @@ class EinsumTransformer:
         a = futures[0].result()
         b = futures[1].result()
 
-        # Optimized stable sigmoid
-        # np.exp(-b) can overflow for large negative b, resulting in inf.
-        # 1.0 / (1.0 + inf) evaluates to 0.0, which is the correct limit for sigmoid(large_negative).
-        # We suppress the overflow warning as this behavior is intended and safe.
-        with np.errstate(over='ignore'):
-            sig_b = 1.0 / (1.0 + np.exp(-b))
+        # Numerical stable sigmoid to avoid overflow in np.exp
+        # We use a piecewise approach to avoid evaluating np.exp on values that would overflow
+        sig_b = np.zeros_like(b)
+        pos_mask = (b >= 0)
+        neg_mask = ~pos_mask
+        sig_b[pos_mask] = 1.0 / (1.0 + np.exp(-b[pos_mask]))
+        sig_b[neg_mask] = np.exp(b[neg_mask]) / (1.0 + np.exp(b[neg_mask]))
 
         swish_b = b * sig_b
         gated = a * swish_b
@@ -701,25 +769,14 @@ class EinsumTransformer:
 
     def apply_rope(self, x, positions):
         B, T, H, D = x.shape
-        pos = np.asarray(positions)
+        pos = np.asarray(positions, dtype=np.float64)
         if len(pos) != T:
             if len(pos) > T: pos = pos[:T]
-            else:
-                start = pos[-1] + 1
-                pos = np.concatenate([pos, np.arange(start, start + T - len(pos))])
-
-        pos = pos.astype(np.int32)
-
-        try:
-            cos = self.rope_cache["cos"][pos]
-            sin = self.rope_cache["sin"][pos]
-            cos, sin = cos[None, :, None, :], sin[None, :, None, :]
-        except IndexError:
-            inv_freq = 1.0 / (self.cfg.rope_base ** (np.arange(0, D, 2) / D))
-            freqs = np.outer(pos, inv_freq)
-            cos, sin = np.cos(freqs), np.sin(freqs)
-            cos, sin = cos[None, :, None, :], sin[None, :, None, :]
-
+            else: pos = np.concatenate([pos, np.arange(pos[-1]+1, pos[-1]+1 + T - len(pos))])
+        inv_freq = 1.0 / (self.cfg.rope_base ** (np.arange(0, D, 2) / D))
+        freqs = np.outer(pos, inv_freq)
+        cos, sin = np.cos(freqs), np.sin(freqs)
+        cos, sin = cos[None, :, None, :], sin[None, :, None, :]
         x1, x2 = x[..., 0::2], x[..., 1::2]
         out = np.empty_like(x)
         out[..., 0::2] = x1 * cos - x2 * sin
@@ -864,6 +921,268 @@ class EinsumTransformer:
         return out / self.cfg.top_k
 
     def forward(self, tokens, inference=False, verbose=True, training=False, max_layers=None):
+        if inference and not self.cfg.use_moe:
+            # Initialize optimized state on first run
+            if self.optimized_params is None:
+                self._optimize_for_inference()
+            return self._forward_inference(tokens, verbose)
+
+        return self._forward_standard(tokens, inference, verbose, training, max_layers)
+
+    def _optimize_for_inference(self):
+        c = self.cfg
+        print("[INFO] Optimizing weights for inference (FUSED)...")
+
+        def _sanitize(x):
+            # Aggressively clean weights: cast to float32, replace NaNs/Infs with 0
+            if x is None: return None
+            x = x.astype(np.float32, copy=False)
+            return np.nan_to_num(x, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+
+        self.optimized_params = {}
+        # Tied weights: Output Head = E.T
+        E = _sanitize(self.get_w(self.E_name))
+        self.optimized_params['E'] = E
+        self.optimized_params['Head'] = E.T
+
+        self.optimized_layers = []
+        for i in range(c.n_layers):
+            p = self.layer_weights[i]
+            layer_w = {}
+
+            def load_linear(key, transpose=True):
+                w = self.get_w(p[key], transpose=transpose)
+                return _sanitize(np.ascontiguousarray(w))
+
+            wq = load_linear('W_q')
+            wk = load_linear('W_k')
+            wv = load_linear('W_v')
+
+            if self.use_lora:
+                scale = self.lora_alpha / self.lora_rank
+                if p.get("lora_A_q"):
+                    Aq, Bq = self.get_w(p["lora_A_q"]), self.get_w(p["lora_B_q"])
+                    Aq, Bq = _sanitize(Aq), _sanitize(Bq)
+                    delta = _sanitize(Aq @ Bq)
+                    wq = _sanitize(wq + scale * delta)
+
+                if p.get("lora_A_v"):
+                    Av, Bv = self.get_w(p["lora_A_v"]), self.get_w(p["lora_B_v"])
+                    Av, Bv = _sanitize(Av), _sanitize(Bv)
+                    delta = _sanitize(Av @ Bv)
+                    wv = _sanitize(wv + scale * delta)
+
+            layer_w['W_qkv'] = np.ascontiguousarray(np.concatenate([wq, wk, wv], axis=1))
+
+            layer_w['W_o'] = load_linear('W_o')
+            layer_w['norm1'] = _sanitize(self.get_w(p['norm1']))
+            layer_w['norm2'] = _sanitize(self.get_w(p['norm2']))
+
+            w1 = load_linear('W1')
+            w2 = load_linear('W2')
+            layer_w['W_gate_up'] = np.ascontiguousarray(np.concatenate([w1, w2], axis=1))
+            layer_w['W3'] = load_linear('W3')
+
+            self.optimized_layers.append(layer_w)
+
+        # Unload original weights to save memory
+        if hasattr(self.weights, 'purge_cache'):
+            self.weights.purge_cache()
+
+        # Init optimized KV cache
+        max_seq = max(c.seq_len, 4096)
+        self.kv_cache_opt = np.zeros(
+            (c.batch_size, c.n_layers, 2, max_seq, c.n_kv_heads, c.d_head),
+            dtype=np.float32
+        )
+
+        # Init RoPE
+        head_dim = c.d_head
+        theta = 10000.0
+        inv_freq = 1.0 / (theta ** (np.arange(0, head_dim, 2).astype(np.float32) / head_dim))
+        t = np.arange(max_seq, dtype=np.float32)
+        freqs = np.outer(t, inv_freq)
+        emb = np.concatenate((freqs, freqs), axis=-1)
+        self.cos_cached = np.cos(emb).astype(np.float32)
+        self.sin_cached = np.sin(emb).astype(np.float32)
+
+    def _forward_inference(self, tokens, verbose=True):
+        if not hasattr(self, '_stats'): self._init_stats()
+        # Helper to track stats similar to standard forward
+        t_stage_start = time.time()
+
+        B, L = tokens.shape
+        c = self.cfg
+        start_pos = self.cur_pos
+
+        if B > c.batch_size:
+            raise ValueError(f"Batch size {B} exceeds allocated {c.batch_size}")
+
+        t_emb = time.time()
+        x = np.take(self.optimized_params['E'], tokens, axis=0) # [B, L, D]
+        self._stats['embedding'].append(time.time() - t_emb)
+
+        d_q = c.n_heads * c.d_head
+        d_kv = c.n_kv_heads * c.d_head
+        d_gate = c.d_ff
+
+        cos_T = self.cos_cached[start_pos : start_pos+L]
+        sin_T = self.sin_cached[start_pos : start_pos+L]
+
+        if L == 1:
+            cos_T = cos_T[None, None, :, :]
+            sin_T = sin_T[None, None, :, :]
+        else:
+            cos_T = cos_T[None, :, None, :]
+            sin_T = sin_T[None, :, None, :]
+
+        mask = None
+        if L > 1:
+            mask = np.triu(np.ones((L, L), dtype=np.float32), k=1) * -1e9
+
+        t_layers_total = 0
+
+        for i, l in enumerate(self.optimized_layers):
+            t_l_start = time.time()
+
+            t_norm = time.time()
+            # Norm 1
+            h = self.rms_norm(x, l['norm1'])
+            # Ensure stability of activations
+            h = np.nan_to_num(h, copy=False, nan=0.0, posinf=65504.0, neginf=-65504.0)
+            h = np.ascontiguousarray(h)
+            self._stats['norm_step'].append(time.time() - t_norm)
+
+            t_qkv = time.time()
+            # QKV
+            qkv = tiled_matmul(h, l['W_qkv'], executor=self.executor)
+            self._stats['attn_qkv_step'].append(time.time() - t_qkv)
+
+            q = qkv[..., :d_q]
+            k = qkv[..., d_q:d_q+d_kv]
+            v = qkv[..., d_q+d_kv:]
+
+            q = q.reshape(B, L, c.n_heads, c.d_head)
+            k = k.reshape(B, L, c.n_kv_heads, c.d_head)
+            v = v.reshape(B, L, c.n_kv_heads, c.d_head)
+
+            t_rope = time.time()
+            # RoPE
+            q_r, q_i = q[..., 0::2], q[..., 1::2]
+            k_r, k_i = k[..., 0::2], k[..., 1::2]
+
+            c_half = cos_T[..., 0::2]
+            s_half = sin_T[..., 0::2]
+
+            q_r_new = q_r * c_half - q_i * s_half
+            q_i_new = q_r * s_half + q_i * c_half
+            q[..., 0::2] = q_r_new
+            q[..., 1::2] = q_i_new
+
+            k_r_new = k_r * c_half - k_i * s_half
+            k_i_new = k_r * s_half + k_i * c_half
+            self._stats['attn_rope_step'].append(time.time() - t_rope)
+
+            # Update Cache
+            self.kv_cache_opt[:B, i, 0, start_pos:start_pos+L, :, :] = k
+            self.kv_cache_opt[:B, i, 1, start_pos:start_pos+L, :, :] = v
+
+            k_cache = self.kv_cache_opt[:B, i, 0, :start_pos+L, :, :]
+            v_cache = self.kv_cache_opt[:B, i, 1, :start_pos+L, :, :]
+
+            t_attn_score = time.time()
+            # Attention
+            if c.n_heads != c.n_kv_heads:
+                n_rep = c.n_heads // c.n_kv_heads
+                q_reshaped = q.reshape(B, L, c.n_kv_heads, n_rep, c.d_head).transpose(0, 2, 1, 3, 4)
+
+                k_t = k_cache.transpose(0, 2, 3, 1)
+                k_t = k_t[:, :, None, :, :]
+
+                scores = np.matmul(q_reshaped, k_t) / np.sqrt(c.d_head)
+
+                if mask is not None:
+                    scores[..., :, :, start_pos:] += mask.reshape(L, 1, L)
+
+                max_score = np.max(scores, axis=-1, keepdims=True)
+                exp_score = np.exp(scores - max_score)
+                attn = exp_score / np.sum(exp_score, axis=-1, keepdims=True)
+
+                v_t = v_cache.transpose(0, 2, 1, 3)
+                v_t = v_t[:, :, None, :, :]
+
+                out = np.matmul(attn, v_t)
+                out = out.transpose(0, 2, 1, 3, 4).reshape(B, L, c.d_model)
+
+            else:
+                q_t = q.transpose(0, 2, 1, 3)
+                k_t = k_cache.transpose(0, 2, 3, 1)
+
+                scores = np.matmul(q_t, k_t) / np.sqrt(c.d_head)
+
+                if mask is not None:
+                    scores[..., :, start_pos:] += mask
+
+                max_score = np.max(scores, axis=-1, keepdims=True)
+                exp_score = np.exp(scores - max_score)
+                attn = exp_score / np.sum(exp_score, axis=-1, keepdims=True)
+
+                v_t = v_cache.transpose(0, 2, 1, 3)
+                out = np.matmul(attn, v_t)
+                out = out.transpose(0, 2, 1, 3).reshape(B, L, c.d_model)
+            self._stats['attn_score_step'].append(time.time() - t_attn_score)
+
+            t_out = time.time()
+            h = tiled_matmul(out, l['W_o'])
+            x = x + h
+            self._stats['attn_out_step'].append(time.time() - t_out)
+
+            t_ffn_s = time.time()
+            # FFN
+            h = self.rms_norm(x, l['norm2'])
+            h = np.nan_to_num(h, copy=False, nan=0.0, posinf=65504.0, neginf=-65504.0)
+            h = np.ascontiguousarray(h)
+
+            gate_up = tiled_matmul(h, l['W_gate_up'])
+            gate = gate_up[..., :d_gate]
+            up = gate_up[..., d_gate:]
+
+            if USE_SCIPY:
+                gate = gate * expit(gate) * up
+            else:
+                sig = np.where(gate > 0, 1.0 / (1.0 + np.exp(-gate)), np.exp(gate) / (1.0 + np.exp(gate)))
+                gate = gate * sig * up
+
+            down = tiled_matmul(gate, l['W3'])
+            x = x + down
+            self._stats['ffn_compute_step'].append(time.time() - t_ffn_s)
+
+            # Aggregate layer time
+            self._stats['layers_step'].append(time.time() - t_l_start)
+            t_layers_total += (time.time() - t_l_start)
+
+        t_head = time.time()
+        logits = tiled_matmul(x, self.optimized_params['Head'])
+        self._stats['output_head'].append(time.time() - t_head)
+
+        # Stats for stage
+        if L > 1:
+            self._stats['prefill'].append(time.time() - t_stage_start)
+        else:
+            self._stats['decode'].append(time.time() - t_stage_start)
+
+        if verbose:
+             self._print_stats_table()
+
+        # Only advance position if not speculative verification (verification advances manually or logic handles it)
+        # For standard generation, we advance.
+        # But this function is used by generate() loop which expects manual advance if called in chunks?
+        # Actually generate() calls this per step.
+        # Let's side-effect update cur_pos for simplicity in standard inference
+        self.cur_pos += L
+        return logits
+
+    def _forward_standard(self, tokens, inference=False, verbose=True, training=False, max_layers=None):
         """
         Forward pass of the Transformer using pure einsum notation.
 
@@ -1223,7 +1542,10 @@ class EinsumTransformer:
 
         t0 = time.time()
         # Prefill
+        # logits = self.forward(tokens, inference=True, verbose=True)
+        # Using forward with inference=True handles optimization internally
         logits = self.forward(tokens, inference=True, verbose=True)
+
         next_token = self.sample_top_k(logits, k=self.cfg.top_k_sample, temperature=self.cfg.temperature)
         ttft = time.time() - t0
 
@@ -1283,9 +1605,19 @@ class EinsumTransformer:
         logits = self.forward(tokens, inference=True, verbose=True)
 
         # 2. Seed draft model KV cache from target model to avoid redundant prefill
-        for i in range(self.cfg.draft_layers):
-            draft_model.cache[i]["K"] = self.cache[i]["K"]
-            draft_model.cache[i]["V"] = self.cache[i]["V"]
+        # NOTE: Optimized KV cache is separate. If optimization is on, we need to sync optimized caches.
+        if self.kv_cache_opt is not None:
+            # Ensure draft model is also optimized
+            if draft_model.kv_cache_opt is None:
+                draft_model._optimize_for_inference()
+
+            for i in range(self.cfg.draft_layers):
+                draft_model.kv_cache_opt[:, i] = self.kv_cache_opt[:, i]
+        else:
+            for i in range(self.cfg.draft_layers):
+                draft_model.cache[i]["K"] = self.cache[i]["K"]
+                draft_model.cache[i]["V"] = self.cache[i]["V"]
+
         draft_model.cur_pos = self.cur_pos
         
         # 2. Sample the first token after the prompt
@@ -1343,26 +1675,38 @@ class EinsumTransformer:
                 print(self.detokenize([next_toks[0]])[0], end="", flush=True)
 
             # d. Rollback target model KV cache
-            # We processed 'k+1' tokens as input.
-            # If all accepted + bonus: n_accepted=k. generated grew by k+1. cache grew by k+1.
-            # We want to keep all k+1 processed inputs in cache. n_to_keep = k+1.
-            # If n_accepted < k: we stopped at j. we accepted d_tokens[0...j-1] and correction for d_tokens[j].
-            # Total new tokens in generated: j+1. New tokens in cache to keep: j+1 (v_input[0...j]).
             n_to_keep = n_accepted + 1
             n_target_rollback = (k + 1) - n_to_keep
+
             if n_target_rollback > 0:
-                for layer in self.cache:
-                    if layer["K"] is not None:
-                        layer["K"] = layer["K"][:, :, :-n_target_rollback, :]
-                        layer["V"] = layer["V"][:, :, :-n_target_rollback, :]
                 self.cur_pos -= n_target_rollback
+                # Support Optimized Cache rollback
+                # Optimized cache is just a circular buffer or linear buffer.
+                # Since we write linearly, we just decrement cur_pos.
+                # No data clearing needed as it will be overwritten.
+
+                # Standard Cache rollback (if used, but here we use optimized likely)
+                if self.kv_cache_opt is None:
+                    for layer in self.cache:
+                        if layer["K"] is not None:
+                            layer["K"] = layer["K"][:, :, :-n_target_rollback, :]
+                            layer["V"] = layer["V"][:, :, :-n_target_rollback, :]
 
             # e. Synchronize draft model state with target model
-            # This ensures both models are aligned for the next speculative step.
-            for l in range(self.cfg.draft_layers):
-                draft_model.cache[l]["K"] = self.cache[l]["K"]
-                draft_model.cache[l]["V"] = self.cache[l]["V"]
             draft_model.cur_pos = self.cur_pos
+            if self.kv_cache_opt is not None:
+                # Optimized sync
+                # Only need to sync the valid part up to cur_pos
+                # Copy from (cur_pos - n_to_keep) to cur_pos.
+                start_sync = max(0, self.cur_pos - n_to_keep)
+                # Draft cache has fewer layers (draft_layers), self cache has n_layers
+                n_d = self.cfg.draft_layers
+                # Slice ONLY the draft layers from the main cache
+                draft_model.kv_cache_opt[:, :n_d, :, start_sync:self.cur_pos, :, :] = self.kv_cache_opt[:, :n_d, :, start_sync:self.cur_pos, :, :]
+            else:
+                for l in range(self.cfg.draft_layers):
+                    draft_model.cache[l]["K"] = self.cache[l]["K"]
+                    draft_model.cache[l]["V"] = self.cache[l]["V"]
 
         t_decode_end = time.time()
         duration = t_decode_end - t_decode_start
@@ -1386,25 +1730,14 @@ class EinsumTransformer:
 
     def _rope_backward(self, dy, positions):
         B, T, H, D = dy.shape
-        pos = np.asarray(positions)
+        pos = np.asarray(positions, dtype=np.float64)
         if len(pos) != T:
             if len(pos) > T: pos = pos[:T]
-            else:
-                start = pos[-1] + 1
-                pos = np.concatenate([pos, np.arange(start, start + T - len(pos))])
-
-        pos = pos.astype(np.int32)
-
-        try:
-            cos = self.rope_cache["cos"][pos]
-            sin = self.rope_cache["sin"][pos]
-            cos, sin = cos[None, :, None, :], sin[None, :, None, :]
-        except IndexError:
-            inv_freq = 1.0 / (self.cfg.rope_base ** (np.arange(0, D, 2) / D))
-            freqs = np.outer(pos, inv_freq)
-            cos, sin = np.cos(freqs), np.sin(freqs)
-            cos, sin = cos[None, :, None, :], sin[None, :, None, :]
-
+            else: pos = np.concatenate([pos, np.arange(pos[-1]+1, pos[-1]+1 + T - len(pos))])
+        inv_freq = 1.0 / (self.cfg.rope_base ** (np.arange(0, D, 2) / D))
+        freqs = np.outer(pos, inv_freq)
+        cos, sin = np.cos(freqs), np.sin(freqs)
+        cos, sin = cos[None, :, None, :], sin[None, :, None, :]
         dy1, dy2 = dy[..., 0::2], dy[..., 1::2]
         dx = np.empty_like(dy)
         dx[..., 0::2] = dy1 * cos + dy2 * sin
