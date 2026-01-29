@@ -20,6 +20,60 @@ try:
 except ImportError:
     USE_SCIPY = False
 
+import platform
+
+def _get_platform_block_size():
+    """Determine optimal block size for tiled matmul based on platform."""
+    sys_plat = platform.system()
+    machine = platform.machine()
+
+    if sys_plat == 'Darwin' and machine == 'arm64':
+        # Apple Silicon (M1/M2/M3)
+        # Optimal block size for AMX/NEON often around 2048-4096 depending on L2
+        return 2048
+    elif machine == 'x86_64':
+        # Intel/AMD AVX512 usually prefers 512-1024 chunks to stay in L1/L2
+        return 1024
+    else:
+        # Conservative default
+        return 1024
+
+def tiled_matmul(a, b, block_size=None):
+    """
+    Perform matrix multiplication a @ b using tiling to reduce peak memory
+    and improve stability on some BLAS backends (e.g. Accelerate).
+
+    a: [..., K]
+    b: [K, N]
+    Output: [..., N]
+    """
+    if block_size is None:
+        block_size = _get_platform_block_size()
+
+    # If matrices are small, standard matmul is faster due to python overhead
+    K = a.shape[-1]
+    N = b.shape[-1]
+    if K * N < 4096 * 4096:
+        return np.matmul(a, b)
+
+    # Result shape
+    out_shape = list(a.shape)
+    out_shape[-1] = N
+
+    # We allocate the full result, but compute it in chunks
+    # Warning: pre-allocating full result might be OOM for huge batches,
+    # but for inference batch size is small.
+    res = np.empty(out_shape, dtype=a.dtype)
+
+    # Iterate over N (columns of b) in chunks
+    for i in range(0, N, block_size):
+        end = min(i + block_size, N)
+        # Compute slice
+        # a: [..., K] @ b[:, i:end]: [K, block] -> [..., block]
+        res[..., i:end] = np.matmul(a, b[:, i:end])
+
+    return res
+
 
 class TransformerConfig:
     def __init__(self, cfg):
@@ -990,7 +1044,7 @@ class EinsumTransformer:
 
             t_qkv = time.time()
             # QKV
-            qkv = h @ l['W_qkv']
+            qkv = tiled_matmul(h, l['W_qkv'])
             self._stats['attn_qkv_step'].append(time.time() - t_qkv)
 
             q = qkv[..., :d_q]
@@ -1068,7 +1122,7 @@ class EinsumTransformer:
             self._stats['attn_score_step'].append(time.time() - t_attn_score)
 
             t_out = time.time()
-            h = out @ l['W_o']
+            h = tiled_matmul(out, l['W_o'])
             x = x + h
             self._stats['attn_out_step'].append(time.time() - t_out)
 
@@ -1078,7 +1132,7 @@ class EinsumTransformer:
             h = np.nan_to_num(h, copy=False, nan=0.0, posinf=65504.0, neginf=-65504.0)
             h = np.ascontiguousarray(h)
 
-            gate_up = h @ l['W_gate_up']
+            gate_up = tiled_matmul(h, l['W_gate_up'])
             gate = gate_up[..., :d_gate]
             up = gate_up[..., d_gate:]
 
@@ -1088,7 +1142,7 @@ class EinsumTransformer:
                 sig = np.where(gate > 0, 1.0 / (1.0 + np.exp(-gate)), np.exp(gate) / (1.0 + np.exp(gate)))
                 gate = gate * sig * up
 
-            down = gate @ l['W3']
+            down = tiled_matmul(gate, l['W3'])
             x = x + down
             self._stats['ffn_compute_step'].append(time.time() - t_ffn_s)
 
@@ -1097,7 +1151,7 @@ class EinsumTransformer:
             t_layers_total += (time.time() - t_l_start)
 
         t_head = time.time()
-        logits = x @ self.optimized_params['Head']
+        logits = tiled_matmul(x, self.optimized_params['Head'])
         self._stats['output_head'].append(time.time() - t_head)
 
         # Stats for stage
