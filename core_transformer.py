@@ -14,11 +14,6 @@ try:
 except ImportError:
     ml_dtypes = None
 
-try:
-    from scipy.special import expit
-    USE_SCIPY = True
-except ImportError:
-    USE_SCIPY = False
 
 import platform
 
@@ -723,6 +718,11 @@ class EinsumTransformer:
 
         return data.T if transpose else data
 
+    @staticmethod
+    def _sigmoid(x):
+        with np.errstate(over='ignore'):
+            return (1.0 / (1.0 + np.exp(-x))).astype(x.dtype, copy=False)
+
     def rms_norm(self, x, w, eps=1e-6, key=None):
         t0 = time.time()
         # Use higher precision for RMS calculation to avoid overflow
@@ -747,12 +747,7 @@ class EinsumTransformer:
         b = futures[1].result()
 
         # Numerical stable sigmoid to avoid overflow in np.exp
-        # We use a piecewise approach to avoid evaluating np.exp on values that would overflow
-        sig_b = np.zeros_like(b)
-        pos_mask = (b >= 0)
-        neg_mask = ~pos_mask
-        sig_b[pos_mask] = 1.0 / (1.0 + np.exp(-b[pos_mask]))
-        sig_b[neg_mask] = np.exp(b[neg_mask]) / (1.0 + np.exp(b[neg_mask]))
+        sig_b = self._sigmoid(b)
 
         swish_b = b * sig_b
         gated = a * swish_b
@@ -1147,11 +1142,7 @@ class EinsumTransformer:
             gate = gate_up[..., :d_gate]
             up = gate_up[..., d_gate:]
 
-            if USE_SCIPY:
-                gate = gate * expit(gate) * up
-            else:
-                sig = np.where(gate > 0, 1.0 / (1.0 + np.exp(-gate)), np.exp(gate) / (1.0 + np.exp(gate)))
-                gate = gate * sig * up
+            gate = gate * self._sigmoid(gate) * up
 
             down = tiled_matmul(gate, l['W3'])
             x = x + down
