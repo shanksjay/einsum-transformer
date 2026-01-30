@@ -7,7 +7,7 @@ requires-python = ">=3.10"
 dependencies = [
     "huggingface-hub",
     "safetensors",
-    "numpy"
+    "numpy",
 ]
 
 [project.optional-dependencies]
