@@ -9,3 +9,7 @@
 ## 2026-01-30 - Optimized Sigmoid Performance
 **Learning:** A naive sigmoid implementation `1.0 / (1.0 + np.exp(-x))` wrapped in `np.errstate(over='ignore')` is ~13x faster than a masked piecewise implementation and ~3x faster than `scipy.special.expit` in this environment. It avoids boolean indexing overhead and complex branching.
 **Action:** Use the naive implementation with error state handling for sigmoid activation, ensuring output dtype is preserved to avoid implicit promotion to `float64`.
+
+## 2026-10-24 - RoPE Recomputation Bottleneck
+**Learning:** Contrary to documentation, RoPE embeddings were recomputed on every call, consuming ~14% of forward pass time in small-batch/training regimes.
+**Action:** Implemented `_init_rope` to cache sin/cos tables. Always verify that "precomputed" features are actually stored and used, especially for geometric embeddings.

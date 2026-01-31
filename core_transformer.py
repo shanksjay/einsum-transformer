@@ -331,6 +331,24 @@ class EinsumTransformer:
             quant_bits_a = getattr(self.cfg, 'quantization_activation_bits', 0)
             print(f"[INFO] Mixed-precision quantization: {self.cfg.quantization} (W{quant_bits_w} A{quant_bits_a})")
 
+        self._init_rope()
+
+    def _init_rope(self):
+        """Precompute RoPE tables for the maximum sequence length."""
+        c = self.cfg
+        head_dim = c.d_head
+        # Inverse frequencies
+        inv_freq = 1.0 / (c.rope_base ** (np.arange(0, head_dim, 2).astype(np.float32) / head_dim))
+        # Position indices
+        t = np.arange(c.seq_len, dtype=np.float32)
+        # Outer product: (seq_len, head_dim/2)
+        freqs = np.outer(t, inv_freq)
+        # Cache cos/sin values as float32 to save memory and match activation dtype usually
+        self.rope_cache = {
+            "cos": np.cos(freqs).astype(np.float32),
+            "sin": np.sin(freqs).astype(np.float32)
+        }
+
     def clear_cache(self):
         self.cache = [{"K": None, "V": None} for _ in range(self.cfg.n_layers)]
         self.cur_pos = 0
@@ -764,13 +782,24 @@ class EinsumTransformer:
 
     def apply_rope(self, x, positions):
         B, T, H, D = x.shape
-        pos = np.asarray(positions, dtype=np.float64)
-        if len(pos) != T:
-            if len(pos) > T: pos = pos[:T]
-            else: pos = np.concatenate([pos, np.arange(pos[-1]+1, pos[-1]+1 + T - len(pos))])
-        inv_freq = 1.0 / (self.cfg.rope_base ** (np.arange(0, D, 2) / D))
-        freqs = np.outer(pos, inv_freq)
-        cos, sin = np.cos(freqs), np.sin(freqs)
+
+        try:
+            # Fast path: use cached RoPE tables
+            cos = self.rope_cache["cos"][positions]
+            sin = self.rope_cache["sin"][positions]
+            # Verify shape match (implicit if index out of bounds raises IndexError, but check len)
+            if cos.shape[0] != T:
+                 raise IndexError("Position shape mismatch")
+        except (AttributeError, IndexError, KeyError, TypeError):
+            # Fallback to recomputation
+            pos = np.asarray(positions, dtype=np.float64)
+            if len(pos) != T:
+                if len(pos) > T: pos = pos[:T]
+                else: pos = np.concatenate([pos, np.arange(pos[-1]+1, pos[-1]+1 + T - len(pos))])
+            inv_freq = 1.0 / (self.cfg.rope_base ** (np.arange(0, D, 2) / D))
+            freqs = np.outer(pos, inv_freq)
+            cos, sin = np.cos(freqs), np.sin(freqs)
+
         cos, sin = cos[None, :, None, :], sin[None, :, None, :]
         x1, x2 = x[..., 0::2], x[..., 1::2]
         out = np.empty_like(x)
@@ -1721,13 +1750,21 @@ class EinsumTransformer:
 
     def _rope_backward(self, dy, positions):
         B, T, H, D = dy.shape
-        pos = np.asarray(positions, dtype=np.float64)
-        if len(pos) != T:
-            if len(pos) > T: pos = pos[:T]
-            else: pos = np.concatenate([pos, np.arange(pos[-1]+1, pos[-1]+1 + T - len(pos))])
-        inv_freq = 1.0 / (self.cfg.rope_base ** (np.arange(0, D, 2) / D))
-        freqs = np.outer(pos, inv_freq)
-        cos, sin = np.cos(freqs), np.sin(freqs)
+
+        try:
+            cos = self.rope_cache["cos"][positions]
+            sin = self.rope_cache["sin"][positions]
+            if cos.shape[0] != T:
+                raise IndexError("Position shape mismatch")
+        except (AttributeError, IndexError, KeyError, TypeError):
+            pos = np.asarray(positions, dtype=np.float64)
+            if len(pos) != T:
+                if len(pos) > T: pos = pos[:T]
+                else: pos = np.concatenate([pos, np.arange(pos[-1]+1, pos[-1]+1 + T - len(pos))])
+            inv_freq = 1.0 / (self.cfg.rope_base ** (np.arange(0, D, 2) / D))
+            freqs = np.outer(pos, inv_freq)
+            cos, sin = np.cos(freqs), np.sin(freqs)
+
         cos, sin = cos[None, :, None, :], sin[None, :, None, :]
         dy1, dy2 = dy[..., 0::2], dy[..., 1::2]
         dx = np.empty_like(dy)
