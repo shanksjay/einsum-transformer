@@ -1154,7 +1154,7 @@ class EinsumTransformer:
                 k_t = k_cache.transpose(0, 2, 3, 1)
                 k_t = k_t[:, :, None, :, :]
 
-                scores = np.matmul(q_reshaped, k_t) / np.sqrt(c.d_head)
+                scores = tiled_matmul(q_reshaped, k_t, executor=self.executor) / np.sqrt(c.d_head)
 
                 if mask is not None:
                     scores[..., :, :, start_pos:] += mask.reshape(L, 1, L)
@@ -1166,14 +1166,14 @@ class EinsumTransformer:
                 v_t = v_cache.transpose(0, 2, 1, 3)
                 v_t = v_t[:, :, None, :, :]
 
-                out = np.matmul(attn, v_t)
+                out = tiled_matmul(attn, v_t, executor=self.executor)
                 out = out.transpose(0, 2, 1, 3, 4).reshape(B, L, c.d_model)
 
             else:
                 q_t = q.transpose(0, 2, 1, 3)
                 k_t = k_cache.transpose(0, 2, 3, 1)
 
-                scores = np.matmul(q_t, k_t) / np.sqrt(c.d_head)
+                scores = tiled_matmul(q_t, k_t, executor=self.executor) / np.sqrt(c.d_head)
 
                 if mask is not None:
                     scores[..., :, start_pos:] += mask
@@ -1183,7 +1183,7 @@ class EinsumTransformer:
                 attn = exp_score / np.sum(exp_score, axis=-1, keepdims=True)
 
                 v_t = v_cache.transpose(0, 2, 1, 3)
-                out = np.matmul(attn, v_t)
+                out = tiled_matmul(attn, v_t, executor=self.executor)
                 out = out.transpose(0, 2, 1, 3).reshape(B, L, c.d_model)
             self._stats['attn_score_step'].append(time.time() - t_attn_score)
 
