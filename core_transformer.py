@@ -15,10 +15,10 @@ except ImportError:
     ml_dtypes = None
 
 try:
-    import cupy as cp
-    HAS_CUPY = True
+    import mlx.core as mx
+    HAS_MLX = True
 except ImportError:
-    HAS_CUPY = False
+    HAS_MLX = False
 
 
 import platform
@@ -48,11 +48,11 @@ def tiled_matmul(a, b, block_size=None, executor=None):
     b: [K, N]
     Output: [..., N]
     """
-    # GPU Path: If Cupy is available and inputs are on GPU, use it directly
-    if HAS_CUPY and (isinstance(a, cp.ndarray) or isinstance(b, cp.ndarray)):
-        if not isinstance(a, cp.ndarray): a = cp.asarray(a)
-        if not isinstance(b, cp.ndarray): b = cp.asarray(b)
-        return cp.matmul(a, b)
+    # GPU Path: If MLX is available and inputs are on GPU, use it directly
+    if HAS_MLX and (isinstance(a, mx.array) or isinstance(b, mx.array)):
+        if not isinstance(a, mx.array): a = mx.array(a)
+        if not isinstance(b, mx.array): b = mx.array(b)
+        return mx.matmul(a, b)
 
     if block_size is None:
         block_size = _get_platform_block_size()
