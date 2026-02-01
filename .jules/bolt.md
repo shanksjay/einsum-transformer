@@ -13,3 +13,7 @@
 ## 2026-10-24 - RoPE Recomputation Bottleneck
 **Learning:** Contrary to documentation, RoPE embeddings were recomputed on every call, consuming ~14% of forward pass time in small-batch/training regimes.
 **Action:** Implemented `_init_rope` to cache sin/cos tables. Always verify that "precomputed" features are actually stored and used, especially for geometric embeddings.
+
+## 2026-10-25 - RMSNorm Allocation Bottleneck
+**Learning:** `x.astype(np.float64)` in `rms_norm` creates a full copy of the activation tensor, doubling memory usage and bandwidth. For large tensors, this allocation is slower than the reduction itself.
+**Action:** Use `np.einsum("...d,...d->...", x, x, dtype=np.float64, optimize=True)` to compute the sum of squares directly in high precision without allocating a temporary float64 input tensor. Use a size threshold (e.g., 65536) to fallback to standard implementation for small inputs where einsum overhead dominates.
