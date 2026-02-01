@@ -14,6 +14,12 @@ try:
 except ImportError:
     ml_dtypes = None
 
+try:
+    import cupy as cp
+    HAS_CUPY = True
+except ImportError:
+    HAS_CUPY = False
+
 
 import platform
 
@@ -42,41 +48,66 @@ def tiled_matmul(a, b, block_size=None, executor=None):
     b: [K, N]
     Output: [..., N]
     """
+    # GPU Path: If Cupy is available and inputs are on GPU, use it directly
+    if HAS_CUPY and (isinstance(a, cp.ndarray) or isinstance(b, cp.ndarray)):
+        if not isinstance(a, cp.ndarray): a = cp.asarray(a)
+        if not isinstance(b, cp.ndarray): b = cp.asarray(b)
+        return cp.matmul(a, b)
+
     if block_size is None:
         block_size = _get_platform_block_size()
 
-    K = a.shape[-1]
+    a_shape = a.shape
+    K = a_shape[-1]
+    # Calculate M (product of leading dimensions of a)
+    M = int(np.prod(a_shape[:-1]))
     N = b.shape[-1]
 
     # Heuristic: Parallelize if total work > threshold
     # 4096*4096 floats = 16M ops.
-    total_ops = np.prod(a.shape[:-1]) * K * N
+    total_ops = float(M) * K * N
     use_parallel = executor is not None and total_ops > 1e7
 
-    # If small, just run standard matmul
-    if not use_parallel and K * N < 4096 * 4096:
+    # If small work, just run standard matmul
+    if not use_parallel and total_ops < 1e8:
         return np.matmul(a, b)
 
-    out_shape = list(a.shape)
+    # Flatten 'a' to [M, K] to allow uniform 2D tiling
+    # Note: reshape returns a view if possible, avoiding copy
+    a_flat = a.reshape(M, K)
+
+    out_shape = list(a_shape)
     out_shape[-1] = N
     res = np.empty(out_shape, dtype=a.dtype)
+    res_flat = res.reshape(M, N)
 
-    def compute_chunk(start_idx, end_idx):
-        # a: [..., K] @ b[:, start:end] -> [..., chunk]
-        res[..., start_idx:end_idx] = np.matmul(a, b[:, start_idx:end_idx])
+    def compute_block(m_start, m_end, n_start, n_end):
+        # Perform matmul for the block
+        # a_flat[m_start:m_end, :] @ b[:, n_start:n_end] -> res_flat[m_start:m_end, n_start:n_end]
+        res_flat[m_start:m_end, n_start:n_end] = np.matmul(
+            a_flat[m_start:m_end, :],
+            b[:, n_start:n_end]
+        )
 
     if use_parallel:
         futures = []
-        for i in range(0, N, block_size):
-            end = min(i + block_size, N)
-            futures.append(executor.submit(compute_chunk, i, end))
-        # Wait for all
+        # Tile over M (rows) and N (columns)
+        for i in range(0, M, block_size):
+            m_end = min(i + block_size, M)
+            for j in range(0, N, block_size):
+                n_end = min(j + block_size, N)
+                futures.append(executor.submit(compute_block, i, m_end, j, n_end))
+
+        # Wait for all tasks to complete
         for f in as_completed(futures):
             f.result()
     else:
-        for i in range(0, N, block_size):
-            end = min(i + block_size, N)
-            compute_chunk(i, end)
+        # Serial execution
+        for i in range(0, M, block_size):
+            m_end = min(i + block_size, M)
+            for j in range(0, N, block_size):
+                n_end = min(j + block_size, N)
+                compute_block(i, m_end, j, n_end)
 
     return res
 
