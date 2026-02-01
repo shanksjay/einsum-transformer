@@ -69,6 +69,11 @@ def tiled_matmul(a, b, block_size=None, executor=None):
     M = int(np.prod(a_shape[:-1]))
     N = b.shape[-1]
 
+    # Fallback to standard matmul if b is not 2D (batched matmul)
+    # The current tiling implementation assumes b is [K, N] and broadcasts a over it.
+    if b.ndim > 2:
+        return np.matmul(a, b)
+
     # Heuristic: Parallelize if total work > threshold
     # 4096*4096 floats = 16M ops.
     total_ops = float(M) * K * N
@@ -80,7 +85,11 @@ def tiled_matmul(a, b, block_size=None, executor=None):
 
     # Flatten 'a' to [M, K] to allow uniform 2D tiling
     # Note: reshape returns a view if possible, avoiding copy
-    a_flat = a.reshape(M, K)
+    try:
+        a_flat = a.reshape(M, K)
+    except:
+        # Fallback if view not possible
+        return np.matmul(a, b)
 
     out_shape = list(a_shape)
     out_shape[-1] = N
