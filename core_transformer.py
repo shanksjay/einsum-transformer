@@ -20,6 +20,12 @@ try:
 except ImportError:
     HAS_MLX = False
 
+try:
+    import numba as nb
+    HAS_NUMBA = True
+except ImportError:
+    HAS_NUMBA = False
+
 
 import platform
 
@@ -81,35 +87,59 @@ def tiled_matmul(a, b, block_size=None, executor=None):
     res = np.empty(out_shape, dtype=a.dtype)
     res_flat = res.reshape(M, N)
 
-    def compute_block(m_start, m_end, n_start, n_end):
-        # Perform matmul for the block
-        # a_flat[m_start:m_end, :] @ b[:, n_start:n_end] -> res_flat[m_start:m_end, n_start:n_end]
-        res_flat[m_start:m_end, n_start:n_end] = np.matmul(
-            a_flat[m_start:m_end, :],
-            b[:, n_start:n_end]
-        )
-
-    if use_parallel:
-        futures = []
-        # Tile over M (rows) and N (columns)
-        for i in range(0, M, block_size):
-            m_end = min(i + block_size, M)
-            for j in range(0, N, block_size):
-                n_end = min(j + block_size, N)
-                futures.append(executor.submit(compute_block, i, m_end, j, n_end))
-
-        # Wait for all tasks to complete
-        for f in as_completed(futures):
-            f.result()
+    if HAS_NUMBA:
+        _numba_tiled_matmul(a_flat, b, res_flat, block_size)
     else:
-        # Serial execution
-        for i in range(0, M, block_size):
-            m_end = min(i + block_size, M)
-            for j in range(0, N, block_size):
-                n_end = min(j + block_size, N)
-                compute_block(i, m_end, j, n_end)
+        def compute_block(m_start, m_end, n_start, n_end):
+            # Perform matmul for the block
+            # a_flat[m_start:m_end, :] @ b[:, n_start:n_end] -> res_flat[m_start:m_end, n_start:n_end]
+            res_flat[m_start:m_end, n_start:n_end] = np.matmul(
+                a_flat[m_start:m_end, :],
+                b[:, n_start:n_end]
+            )
+
+        if use_parallel:
+            futures = []
+            # Tile over M (rows) and N (columns)
+            for i in range(0, M, block_size):
+                m_end = min(i + block_size, M)
+                for j in range(0, N, block_size):
+                    n_end = min(j + block_size, N)
+                    futures.append(executor.submit(compute_block, i, m_end, j, n_end))
+
+            # Wait for all tasks to complete
+            for f in as_completed(futures):
+                f.result()
+        else:
+            # Serial execution
+            for i in range(0, M, block_size):
+                m_end = min(i + block_size, M)
+                for j in range(0, N, block_size):
+                    n_end = min(j + block_size, N)
+                    compute_block(i, m_end, j, n_end)
 
     return res
+
+if HAS_NUMBA:
+    @nb.njit(parallel=True, fastmath=True)
+    def _numba_tiled_matmul(a, b, res, block_size):
+        # a: [M, K], b: [K, N], res: [M, N]
+        M, K = a.shape
+        N = b.shape[1]
+        # Parallelize outer loops over blocks
+        # Numba's parallel loop handling is often better than manual chunking
+        # We iterate over blocks to keep memory locality
+        for i in nb.prange(0, M, block_size):
+            m_end = min(i + block_size, M)
+            for j in range(0, N, block_size):
+                n_end = min(j + block_size, N)
+                # Compute block: res[i:m_end, j:n_end] += a[i:m_end, :] @ b[:, j:n_end]
+                # Since res is empty, we assign directly.
+                # However, np.dot/matmul inside njit might not support out= argument or slicing assignment perfectly with BLAS
+                # But typical usage:
+                res[i:m_end, j:n_end] = a[i:m_end, :] @ b[:, j:n_end]
+else:
+    _numba_tiled_matmul = None
 
 
 class TransformerConfig:
