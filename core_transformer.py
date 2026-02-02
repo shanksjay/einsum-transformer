@@ -26,6 +26,12 @@ try:
 except ImportError:
     HAS_NUMBA = False
 
+try:
+    import cupy as cp
+    HAS_CUPY = True
+except ImportError:
+    HAS_CUPY = False
+
 
 import platform
 
@@ -66,6 +72,24 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto"):
         if not isinstance(a, mx.array): a = mx.array(a)
         if not isinstance(b, mx.array): b = mx.array(b)
         return mx.matmul(a, b)
+
+    # Force backend if specified (CuPy)
+    if backend == "cupy" and HAS_CUPY:
+        is_a_cupy = isinstance(a, cp.ndarray)
+        is_b_cupy = isinstance(b, cp.ndarray)
+        if not is_a_cupy: a = cp.array(a)
+        if not is_b_cupy: b = cp.array(b)
+        res = cp.matmul(a, b)
+        # If inputs were numpy, return numpy to keep compatibility with downstream CPU ops
+        if not is_a_cupy and not is_b_cupy:
+            return cp.asnumpy(res)
+        return res
+
+    # Auto GPU Path: If CuPy is available and inputs are on GPU
+    if (backend == "auto" and HAS_CUPY) and (isinstance(a, cp.ndarray) or isinstance(b, cp.ndarray)):
+        if not isinstance(a, cp.ndarray): a = cp.array(a)
+        if not isinstance(b, cp.ndarray): b = cp.array(b)
+        return cp.matmul(a, b)
 
     if block_size is None:
         block_size = _get_platform_block_size()
