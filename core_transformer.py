@@ -829,9 +829,20 @@ class EinsumTransformer:
 
     def rms_norm(self, x, w, eps=1e-6, key=None):
         t0 = time.time()
-        # Use higher precision for RMS calculation to avoid overflow
-        x_fp64 = x.astype(np.float64)
-        rms = np.sqrt(np.mean(x_fp64**2, axis=-1, keepdims=True) + eps).astype(x.dtype)
+
+        # Optimization: For large tensors, use einsum to compute sum of squares in float64
+        # without allocating a full float64 copy of x. This saves memory and is faster.
+        # Threshold chosen based on benchmarks (approx 16 * 4096 elements).
+        if x.size < 65536:
+            # Fast path for small inputs (e.g. single token decode)
+            x_fp64 = x.astype(np.float64)
+            rms = np.sqrt(np.mean(x_fp64**2, axis=-1, keepdims=True) + eps).astype(x.dtype)
+        else:
+            # Memory-efficient path for large inputs (e.g. prefill/training)
+            # Accumulate sum of squares directly in float64 using einsum
+            ss = np.einsum("...d,...d->...", x, x, dtype=np.float64, optimize=True)
+            rms = np.sqrt(ss / x.shape[-1] + eps).astype(x.dtype)[..., None]
+
         # Handle cases where rms might be zero or non-finite
         rms = np.where(np.isfinite(rms) & (rms > 0), rms, eps)
         norm_x = x / rms
