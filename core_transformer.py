@@ -114,10 +114,11 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto"):
         def compute_block(m_start, m_end, n_start, n_end):
             # Perform matmul for the block
             # a_flat[m_start:m_end, :] @ b[:, n_start:n_end] -> res_flat[m_start:m_end, n_start:n_end]
-            res_flat[m_start:m_end, n_start:n_end] = np.matmul(
-                a_flat[m_start:m_end, :],
-                b[:, n_start:n_end]
-            )
+            with np.errstate(all='ignore'):
+                res_flat[m_start:m_end, n_start:n_end] = np.matmul(
+                    a_flat[m_start:m_end, :],
+                    b[:, n_start:n_end]
+                )
 
         if use_parallel:
             futures = []
