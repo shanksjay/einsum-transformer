@@ -1072,13 +1072,15 @@ class EinsumTransformer:
                 if p.get("lora_A_q"):
                     Aq, Bq = self.get_w(p["lora_A_q"]), self.get_w(p["lora_B_q"])
                     Aq, Bq = _sanitize(Aq), _sanitize(Bq)
-                    delta = _sanitize(Aq @ Bq)
+                    with np.errstate(all='ignore'):
+                        delta = _sanitize(Aq @ Bq)
                     wq = _sanitize(wq + scale * delta)
 
                 if p.get("lora_A_v"):
                     Av, Bv = self.get_w(p["lora_A_v"]), self.get_w(p["lora_B_v"])
                     Av, Bv = _sanitize(Av), _sanitize(Bv)
-                    delta = _sanitize(Av @ Bv)
+                    with np.errstate(all='ignore'):
+                        delta = _sanitize(Av @ Bv)
                     wv = _sanitize(wv + scale * delta)
 
             layer_w['W_qkv'] = np.ascontiguousarray(np.concatenate([wq, wk, wv], axis=1))
