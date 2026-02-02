@@ -14,6 +14,18 @@ try:
 except ImportError:
     ml_dtypes = None
 
+try:
+    import mlx.core as mx
+    HAS_MLX = True
+except ImportError:
+    HAS_MLX = False
+
+try:
+    import numba as nb
+    HAS_NUMBA = True
+except ImportError:
+    HAS_NUMBA = False
+
 
 import platform
 
@@ -33,7 +45,7 @@ def _get_platform_block_size():
         # Conservative default
         return 1024
 
-def tiled_matmul(a, b, block_size=None, executor=None):
+def tiled_matmul(a, b, block_size=None, executor=None, backend="auto"):
     """
     Perform matrix multiplication a @ b using tiling to reduce peak memory
     and improve stability. Supports parallel dispatch for chunks.
@@ -41,44 +53,115 @@ def tiled_matmul(a, b, block_size=None, executor=None):
     a: [..., K]
     b: [K, N]
     Output: [..., N]
+    backend: "auto", "mlx", "numba", "numpy"
     """
+    # Force backend if specified
+    if backend == "mlx" and HAS_MLX:
+        if not isinstance(a, mx.array): a = mx.array(a)
+        if not isinstance(b, mx.array): b = mx.array(b)
+        return mx.matmul(a, b)
+
+    # Auto GPU Path: If MLX is available and inputs are on GPU (or we want to use it), use it directly
+    if (backend == "auto" and HAS_MLX) and (isinstance(a, mx.array) or isinstance(b, mx.array)):
+        if not isinstance(a, mx.array): a = mx.array(a)
+        if not isinstance(b, mx.array): b = mx.array(b)
+        return mx.matmul(a, b)
+
     if block_size is None:
         block_size = _get_platform_block_size()
 
-    K = a.shape[-1]
+    a_shape = a.shape
+    K = a_shape[-1]
+    # Calculate M (product of leading dimensions of a)
+    M = int(np.prod(a_shape[:-1]))
     N = b.shape[-1]
+
+    # Fallback to standard matmul if b is not 2D (batched matmul)
+    # The current tiling implementation assumes b is [K, N] and broadcasts a over it.
+    if b.ndim > 2:
+        with np.errstate(all='ignore'):
+            return np.matmul(a, b)
 
     # Heuristic: Parallelize if total work > threshold
     # 4096*4096 floats = 16M ops.
-    total_ops = np.prod(a.shape[:-1]) * K * N
+    total_ops = float(M) * K * N
     use_parallel = executor is not None and total_ops > 1e7
 
-    # If small, just run standard matmul
-    if not use_parallel and K * N < 4096 * 4096:
-        return np.matmul(a, b)
+    # If small work, just run standard matmul
+    if not use_parallel and total_ops < 1e8:
+        with np.errstate(all='ignore'):
+            return np.matmul(a, b)
 
-    out_shape = list(a.shape)
+    # Flatten 'a' to [M, K] to allow uniform 2D tiling
+    # Note: reshape returns a view if possible, avoiding copy
+    try:
+        a_flat = a.reshape(M, K)
+    except:
+        # Fallback if view not possible
+        with np.errstate(all='ignore'):
+            return np.matmul(a, b)
+
+    out_shape = list(a_shape)
     out_shape[-1] = N
     res = np.empty(out_shape, dtype=a.dtype)
+    res_flat = res.reshape(M, N)
 
-    def compute_chunk(start_idx, end_idx):
-        # a: [..., K] @ b[:, start:end] -> [..., chunk]
-        res[..., start_idx:end_idx] = np.matmul(a, b[:, start_idx:end_idx])
+    use_numba = (backend == "numba" and HAS_NUMBA) or (backend == "auto" and HAS_NUMBA)
 
-    if use_parallel:
-        futures = []
-        for i in range(0, N, block_size):
-            end = min(i + block_size, N)
-            futures.append(executor.submit(compute_chunk, i, end))
-        # Wait for all
-        for f in as_completed(futures):
-            f.result()
+    if use_numba:
+        _numba_tiled_matmul(a_flat, b, res_flat, block_size)
     else:
-        for i in range(0, N, block_size):
-            end = min(i + block_size, N)
-            compute_chunk(i, end)
+        def compute_block(m_start, m_end, n_start, n_end):
+            # Perform matmul for the block
+            # a_flat[m_start:m_end, :] @ b[:, n_start:n_end] -> res_flat[m_start:m_end, n_start:n_end]
+            with np.errstate(all='ignore'):
+                res_flat[m_start:m_end, n_start:n_end] = np.matmul(
+                    a_flat[m_start:m_end, :],
+                    b[:, n_start:n_end]
+                )
+
+        if use_parallel:
+            futures = []
+            # Tile over M (rows) and N (columns)
+            for i in range(0, M, block_size):
+                m_end = min(i + block_size, M)
+                for j in range(0, N, block_size):
+                    n_end = min(j + block_size, N)
+                    futures.append(executor.submit(compute_block, i, m_end, j, n_end))
+
+            # Wait for all tasks to complete
+            for f in as_completed(futures):
+                f.result()
+        else:
+            # Serial execution
+            for i in range(0, M, block_size):
+                m_end = min(i + block_size, M)
+                for j in range(0, N, block_size):
+                    n_end = min(j + block_size, N)
+                    compute_block(i, m_end, j, n_end)
 
     return res
+
+if HAS_NUMBA:
+    @nb.njit(parallel=True, fastmath=True)
+    def _numba_tiled_matmul(a, b, res, block_size):
+        # a: [M, K], b: [K, N], res: [M, N]
+        M, K = a.shape
+        N = b.shape[1]
+        # Parallelize outer loops over blocks
+        # Numba's parallel loop handling is often better than manual chunking
+        # We iterate over blocks to keep memory locality
+        for i in nb.prange(0, M, block_size):
+            m_end = min(i + block_size, M)
+            for j in range(0, N, block_size):
+                n_end = min(j + block_size, N)
+                # Compute block: res[i:m_end, j:n_end] += a[i:m_end, :] @ b[:, j:n_end]
+                # Since res is empty, we assign directly.
+                # However, np.dot/matmul inside njit might not support out= argument or slicing assignment perfectly with BLAS
+                # But typical usage:
+                res[i:m_end, j:n_end] = a[i:m_end, :] @ b[:, j:n_end]
+else:
+    _numba_tiled_matmul = None
 
 
 class TransformerConfig:
@@ -152,6 +235,9 @@ class TransformerConfig:
         self.lora_alpha = cfg.get("lora_alpha", 1.0)
         self.lora_target_modules = cfg.get("lora_target_modules", ["q_proj", "v_proj"])
         self.lora_merge_after_training = cfg.get("lora_merge_after_training", False)
+
+        # Backend configuration
+        self.backend = cfg.get("backend", "auto")
 
         self.d_head = self.d_model // self.n_heads
 
@@ -987,13 +1073,15 @@ class EinsumTransformer:
                 if p.get("lora_A_q"):
                     Aq, Bq = self.get_w(p["lora_A_q"]), self.get_w(p["lora_B_q"])
                     Aq, Bq = _sanitize(Aq), _sanitize(Bq)
-                    delta = _sanitize(Aq @ Bq)
+                    with np.errstate(all='ignore'):
+                        delta = _sanitize(Aq @ Bq)
                     wq = _sanitize(wq + scale * delta)
 
                 if p.get("lora_A_v"):
                     Av, Bv = self.get_w(p["lora_A_v"]), self.get_w(p["lora_B_v"])
                     Av, Bv = _sanitize(Av), _sanitize(Bv)
-                    delta = _sanitize(Av @ Bv)
+                    with np.errstate(all='ignore'):
+                        delta = _sanitize(Av @ Bv)
                     wv = _sanitize(wv + scale * delta)
 
             layer_w['W_qkv'] = np.ascontiguousarray(np.concatenate([wq, wk, wv], axis=1))
@@ -1079,7 +1167,7 @@ class EinsumTransformer:
 
             t_qkv = time.time()
             # QKV
-            qkv = tiled_matmul(h, l['W_qkv'], executor=self.executor)
+            qkv = tiled_matmul(h, l['W_qkv'], executor=self.executor, backend=c.backend)
             self._stats['attn_qkv_step'].append(time.time() - t_qkv)
 
             q = qkv[..., :d_q]
@@ -1123,7 +1211,7 @@ class EinsumTransformer:
                 k_t = k_cache.transpose(0, 2, 3, 1)
                 k_t = k_t[:, :, None, :, :]
 
-                scores = np.matmul(q_reshaped, k_t) / np.sqrt(c.d_head)
+                scores = tiled_matmul(q_reshaped, k_t, executor=self.executor, backend=c.backend) / np.sqrt(c.d_head)
 
                 if mask is not None:
                     scores[..., :, :, start_pos:] += mask.reshape(L, 1, L)
@@ -1135,14 +1223,14 @@ class EinsumTransformer:
                 v_t = v_cache.transpose(0, 2, 1, 3)
                 v_t = v_t[:, :, None, :, :]
 
-                out = np.matmul(attn, v_t)
+                out = tiled_matmul(attn, v_t, executor=self.executor, backend=c.backend)
                 out = out.transpose(0, 2, 1, 3, 4).reshape(B, L, c.d_model)
 
             else:
                 q_t = q.transpose(0, 2, 1, 3)
                 k_t = k_cache.transpose(0, 2, 3, 1)
 
-                scores = np.matmul(q_t, k_t) / np.sqrt(c.d_head)
+                scores = tiled_matmul(q_t, k_t, executor=self.executor, backend=c.backend) / np.sqrt(c.d_head)
 
                 if mask is not None:
                     scores[..., :, start_pos:] += mask
@@ -1152,12 +1240,12 @@ class EinsumTransformer:
                 attn = exp_score / np.sum(exp_score, axis=-1, keepdims=True)
 
                 v_t = v_cache.transpose(0, 2, 1, 3)
-                out = np.matmul(attn, v_t)
+                out = tiled_matmul(attn, v_t, executor=self.executor, backend=c.backend)
                 out = out.transpose(0, 2, 1, 3).reshape(B, L, c.d_model)
             self._stats['attn_score_step'].append(time.time() - t_attn_score)
 
             t_out = time.time()
-            h = tiled_matmul(out, l['W_o'])
+            h = tiled_matmul(out, l['W_o'], backend=c.backend)
             x = x + h
             self._stats['attn_out_step'].append(time.time() - t_out)
 
@@ -1167,13 +1255,13 @@ class EinsumTransformer:
             h = np.nan_to_num(h, copy=False, nan=0.0, posinf=65504.0, neginf=-65504.0)
             h = np.ascontiguousarray(h)
 
-            gate_up = tiled_matmul(h, l['W_gate_up'])
+            gate_up = tiled_matmul(h, l['W_gate_up'], backend=c.backend)
             gate = gate_up[..., :d_gate]
             up = gate_up[..., d_gate:]
 
             gate = gate * self._sigmoid(gate) * up
 
-            down = tiled_matmul(gate, l['W3'])
+            down = tiled_matmul(gate, l['W3'], backend=c.backend)
             x = x + down
             self._stats['ffn_compute_step'].append(time.time() - t_ffn_s)
 
@@ -1182,7 +1270,7 @@ class EinsumTransformer:
             t_layers_total += (time.time() - t_l_start)
 
         t_head = time.time()
-        logits = tiled_matmul(x, self.optimized_params['Head'])
+        logits = tiled_matmul(x, self.optimized_params['Head'], backend=c.backend)
         self._stats['output_head'].append(time.time() - t_head)
 
         # Stats for stage
