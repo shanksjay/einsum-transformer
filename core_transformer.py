@@ -1125,9 +1125,8 @@ class EinsumTransformer:
         inv_freq = 1.0 / (theta ** (np.arange(0, head_dim, 2).astype(np.float32) / head_dim))
         t = np.arange(max_seq, dtype=np.float32)
         freqs = np.outer(t, inv_freq)
-        emb = np.concatenate((freqs, freqs), axis=-1)
-        self.cos_cached = np.cos(emb).astype(np.float32)
-        self.sin_cached = np.sin(emb).astype(np.float32)
+        self.cos_cached = np.cos(freqs).astype(np.float32)
+        self.sin_cached = np.sin(freqs).astype(np.float32)
 
     def _forward_inference(self, tokens, verbose=True):
         if not hasattr(self, '_stats'): self._init_stats()
@@ -1194,8 +1193,8 @@ class EinsumTransformer:
             q_r, q_i = q[..., 0::2], q[..., 1::2]
             k_r, k_i = k[..., 0::2], k[..., 1::2]
 
-            c_half = cos_T[..., 0::2]
-            s_half = sin_T[..., 0::2]
+            c_half = cos_T
+            s_half = sin_T
 
             q_r_new = q_r * c_half - q_i * s_half
             q_i_new = q_r * s_half + q_i * c_half
