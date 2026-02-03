@@ -26,6 +26,12 @@ try:
 except ImportError:
     HAS_NUMBA = False
 
+try:
+    import cupy as cp
+    HAS_CUPY = True
+except ImportError:
+    HAS_CUPY = False
+
 
 import platform
 
@@ -53,7 +59,7 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto"):
     a: [..., K]
     b: [K, N]
     Output: [..., N]
-    backend: "auto", "mlx", "numba", "numpy"
+    backend: "auto", "mlx", "numba", "numpy", "cupy"
     """
     # Force backend if specified
     if backend == "mlx" and HAS_MLX:
@@ -61,11 +67,32 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto"):
         if not isinstance(b, mx.array): b = mx.array(b)
         return mx.matmul(a, b)
 
-    # Auto GPU Path: If MLX is available and inputs are on GPU (or we want to use it), use it directly
+    # CuPy Backend
+    if backend == "cupy" and HAS_CUPY:
+        # Check if inputs are numpy/cupy and convert if needed
+        is_a_numpy = isinstance(a, np.ndarray)
+        is_b_numpy = isinstance(b, np.ndarray)
+
+        a_cp = cp.asarray(a)
+        b_cp = cp.asarray(b)
+
+        res_cp = cp.matmul(a_cp, b_cp)
+
+        # If inputs were numpy, return numpy
+        if is_a_numpy and is_b_numpy:
+            return cp.asnumpy(res_cp)
+        return res_cp
+
+    # Auto GPU Path: If MLX/CuPy is available and inputs are on GPU, use it directly
     if (backend == "auto" and HAS_MLX) and (isinstance(a, mx.array) or isinstance(b, mx.array)):
         if not isinstance(a, mx.array): a = mx.array(a)
         if not isinstance(b, mx.array): b = mx.array(b)
         return mx.matmul(a, b)
+
+    if (backend == "auto" and HAS_CUPY) and (isinstance(a, cp.ndarray) or isinstance(b, cp.ndarray)):
+        a_cp = cp.asarray(a)
+        b_cp = cp.asarray(b)
+        return cp.matmul(a_cp, b_cp)
 
     if block_size is None:
         block_size = _get_platform_block_size()
@@ -85,10 +112,18 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto"):
     # Heuristic: Parallelize if total work > threshold
     # 4096*4096 floats = 16M ops.
     total_ops = float(M) * K * N
+
+    local_executor = None
+    if executor is None and total_ops > 1e7:
+        local_executor = ThreadPoolExecutor(max_workers=os.cpu_count() or 4)
+        executor = local_executor
+
     use_parallel = executor is not None and total_ops > 1e7
 
     # If small work, just run standard matmul
     if not use_parallel and total_ops < 1e8:
+        if local_executor:
+            local_executor.shutdown(wait=False)
         with np.errstate(all='ignore'):
             return np.matmul(a, b)
 
@@ -121,17 +156,21 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto"):
                 )
 
         if use_parallel:
-            futures = []
-            # Tile over M (rows) and N (columns)
-            for i in range(0, M, block_size):
-                m_end = min(i + block_size, M)
-                for j in range(0, N, block_size):
-                    n_end = min(j + block_size, N)
-                    futures.append(executor.submit(compute_block, i, m_end, j, n_end))
+            try:
+                futures = []
+                # Tile over M (rows) and N (columns)
+                for i in range(0, M, block_size):
+                    m_end = min(i + block_size, M)
+                    for j in range(0, N, block_size):
+                        n_end = min(j + block_size, N)
+                        futures.append(executor.submit(compute_block, i, m_end, j, n_end))
 
-            # Wait for all tasks to complete
-            for f in as_completed(futures):
-                f.result()
+                # Wait for all tasks to complete
+                for f in as_completed(futures):
+                    f.result()
+            finally:
+                if local_executor:
+                    local_executor.shutdown(wait=False)
         else:
             # Serial execution
             for i in range(0, M, block_size):
