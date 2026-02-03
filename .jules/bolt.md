@@ -17,3 +17,7 @@
 ## 2026-10-25 - RMSNorm Allocation Bottleneck
 **Learning:** `x.astype(np.float64)` in `rms_norm` creates a full copy of the activation tensor, doubling memory usage and bandwidth. For large tensors, this allocation is slower than the reduction itself.
 **Action:** Use `np.einsum("...d,...d->...", x, x, dtype=np.float64, optimize=True)` to compute the sum of squares directly in high precision without allocating a temporary float64 input tensor. Use a size threshold (e.g., 65536) to fallback to standard implementation for small inputs where einsum overhead dominates.
+
+## 2026-10-27 - ThreadPoolExecutor Overhead on Small/Medium Matrices
+**Learning:** Using `ThreadPoolExecutor` for matrix multiplications with less than ~150M FLOPs or small batch sizes (M < 32) can be significantly slower (up to 30x) than single-threaded BLAS (NumPy) due to Python threading overhead and contention.
+**Action:** Increased `tiled_matmul` parallelization threshold to 1.5e8 ops and disabled it for M < 32. Implemented buffer reuse for inference to further reduce allocation overhead.
