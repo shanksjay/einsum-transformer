@@ -432,6 +432,11 @@ class EinsumTransformer:
 
         self._init_rope()
 
+    def _should_parallelize(self, total_ops):
+        """Check if parallel execution is beneficial based on total FLOPs."""
+        # Threshold: 1.5e8 ops (consistent with tiled_matmul heuristic)
+        return self.executor is not None and total_ops > 1.5e8
+
     def _init_rope(self):
         """Precompute RoPE tables for the maximum sequence length."""
         c = self.cfg
@@ -876,9 +881,16 @@ class EinsumTransformer:
         def proj(mat):
             return np.einsum("btd,df->btf", x, mat, optimize=True)
 
-        futures = [self.executor.submit(proj, W1), self.executor.submit(proj, W2)]
-        a = futures[0].result()
-        b = futures[1].result()
+        # Check total ops for one projection: B * T * D * F
+        ops = x.shape[0] * x.shape[1] * x.shape[2] * W1.shape[1]
+
+        if self._should_parallelize(ops):
+            futures = [self.executor.submit(proj, W1), self.executor.submit(proj, W2)]
+            a = futures[0].result()
+            b = futures[1].result()
+        else:
+            a = proj(W1)
+            b = proj(W2)
 
         # Numerical stable sigmoid to avoid overflow in np.exp
         sig_b = self._sigmoid(b)
@@ -952,19 +964,32 @@ class EinsumTransformer:
             t_proj_time = time.time() - t_p
             return name_key, proj, lora_act, t_load_weight, t_proj_time
 
-        # Run Q, K, V projections in parallel
-        futures = [self.executor.submit(compute_proj, k) for k in ["W_q", "W_k", "W_v"]]
+        # Run Q, K, V projections
+        ops = B * T * c.d_model * c.d_model # Approx per projection (W is DxD)
 
-        results = {}
-        t_load_sum = 0
-        t_qkv_sum = 0
-        for future in as_completed(futures):
-            name_key, proj, lora_act, t_lw, t_pt = future.result()
-            results[name_key] = proj
-            if lora_act and self.training:
-                self._activations[f"lora_{name_key[2:]}_{layer_idx}"] = lora_act
-            t_load_sum += t_lw
-            t_qkv_sum += t_pt
+        if self._should_parallelize(ops):
+            futures = [self.executor.submit(compute_proj, k) for k in ["W_q", "W_k", "W_v"]]
+            results = {}
+            t_load_sum = 0
+            t_qkv_sum = 0
+            for future in as_completed(futures):
+                name_key, proj_res, lora_act, t_lw, t_pt = future.result()
+                results[name_key] = proj_res
+                if lora_act and self.training:
+                    self._activations[f"lora_{name_key[2:]}_{layer_idx}"] = lora_act
+                t_load_sum += t_lw
+                t_qkv_sum += t_pt
+        else:
+            results = {}
+            t_load_sum = 0
+            t_qkv_sum = 0
+            for k in ["W_q", "W_k", "W_v"]:
+                name_key, proj_res, lora_act, t_lw, t_pt = compute_proj(k)
+                results[name_key] = proj_res
+                if lora_act and self.training:
+                    self._activations[f"lora_{name_key[2:]}_{layer_idx}"] = lora_act
+                t_load_sum += t_lw
+                t_qkv_sum += t_pt
 
         self._stats['attn_load'].append(t_load_sum / 3.0) # Average or total? Usually stats are for the critical path
         self._stats['attn_qkv'].append(t_qkv_sum / 3.0)
