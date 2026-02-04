@@ -21,3 +21,7 @@
 ## 2026-10-27 - ThreadPoolExecutor Overhead on Small/Medium Matrices
 **Learning:** Using `ThreadPoolExecutor` for matrix multiplications with less than ~150M FLOPs or small batch sizes (M < 32) can be significantly slower (up to 30x) than single-threaded BLAS (NumPy) due to Python threading overhead and contention.
 **Action:** Increased `tiled_matmul` parallelization threshold to 1.5e8 ops and disabled it for M < 32. Implemented buffer reuse for inference to further reduce allocation overhead.
+
+## 2026-10-28 - Threading Overhead in SwiGLU and Attention
+**Learning:** Unconditional submission of `swiglu` and `attention` projections to `ThreadPoolExecutor` causes significant overhead (up to ~30-40%) for small operations (e.g., L=1 decoding or small batches), where the cost of task scheduling exceeds the parallelization gain.
+**Action:** Implemented `_should_parallelize(ops)` helper with a threshold of 1.5e8 ops (consistent with `tiled_matmul`) to enforce serial execution for small workloads in `swiglu` and `attention`.
