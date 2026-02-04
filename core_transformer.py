@@ -4,6 +4,7 @@ import os
 import time
 import copy
 import threading
+import functools
 from pathlib import Path
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -29,6 +30,7 @@ except ImportError:
 
 import platform
 
+@functools.lru_cache(maxsize=1)
 def _get_platform_block_size():
     """Determine optimal block size for tiled matmul based on platform."""
     sys_plat = platform.system()
@@ -45,7 +47,7 @@ def _get_platform_block_size():
         # Conservative default
         return 1024
 
-def tiled_matmul(a, b, block_size=None, executor=None, backend="auto"):
+def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None):
     """
     Perform matrix multiplication a @ b using tiling to reduce peak memory
     and improve stability. Supports parallel dispatch for chunks.
@@ -54,6 +56,7 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto"):
     b: [K, N]
     Output: [..., N]
     backend: "auto", "mlx", "numba", "numpy"
+    out: Optional output array (only used if shapes match)
     """
     # Force backend if specified
     if backend == "mlx" and HAS_MLX:
@@ -80,17 +83,21 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto"):
     # The current tiling implementation assumes b is [K, N] and broadcasts a over it.
     if b.ndim > 2:
         with np.errstate(all='ignore'):
-            return np.matmul(a, b)
+            return np.matmul(a, b, out=out)
 
     # Heuristic: Parallelize if total work > threshold
-    # 4096*4096 floats = 16M ops.
+    # Increased threshold to 1.5e8 (150M ops) to avoid thread overhead for medium sizes
     total_ops = float(M) * K * N
-    use_parallel = executor is not None and total_ops > 1e7
+    use_parallel = executor is not None and total_ops > 1.5e8
+
+    # Disable parallelization for small batch sizes (M < 32) as BLAS is faster
+    if M < 32:
+        use_parallel = False
 
     # If small work, just run standard matmul
-    if not use_parallel and total_ops < 1e8:
+    if not use_parallel and total_ops < 2e8:
         with np.errstate(all='ignore'):
-            return np.matmul(a, b)
+            return np.matmul(a, b, out=out)
 
     # Flatten 'a' to [M, K] to allow uniform 2D tiling
     # Note: reshape returns a view if possible, avoiding copy
@@ -99,11 +106,16 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto"):
     except:
         # Fallback if view not possible
         with np.errstate(all='ignore'):
-            return np.matmul(a, b)
+            return np.matmul(a, b, out=out)
 
     out_shape = list(a_shape)
     out_shape[-1] = N
-    res = np.empty(out_shape, dtype=a.dtype)
+
+    if out is not None and out.shape == tuple(out_shape) and out.dtype == a.dtype:
+        res = out
+    else:
+        res = np.empty(out_shape, dtype=a.dtype)
+
     res_flat = res.reshape(M, N)
 
     use_numba = (backend == "numba" and HAS_NUMBA) or (backend == "auto" and HAS_NUMBA)
@@ -115,9 +127,10 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto"):
             # Perform matmul for the block
             # a_flat[m_start:m_end, :] @ b[:, n_start:n_end] -> res_flat[m_start:m_end, n_start:n_end]
             with np.errstate(all='ignore'):
-                res_flat[m_start:m_end, n_start:n_end] = np.matmul(
+                np.matmul(
                     a_flat[m_start:m_end, :],
-                    b[:, n_start:n_end]
+                    b[:, n_start:n_end],
+                    out=res_flat[m_start:m_end, n_start:n_end]
                 )
 
         if use_parallel:
@@ -827,7 +840,7 @@ class EinsumTransformer:
         with np.errstate(over='ignore'):
             return (1.0 / (1.0 + np.exp(-x))).astype(x.dtype, copy=False)
 
-    def rms_norm(self, x, w, eps=1e-6, key=None):
+    def rms_norm(self, x, w, eps=1e-6, key=None, out=None):
         t0 = time.time()
 
         # Optimization: For large tensors, use einsum to compute sum of squares in float64
@@ -846,7 +859,13 @@ class EinsumTransformer:
         # Handle cases where rms might be zero or non-finite
         rms = np.where(np.isfinite(rms) & (rms > 0), rms, eps)
         norm_x = x / rms
-        res = norm_x * w
+
+        if out is not None:
+            np.multiply(norm_x, w, out=out)
+            res = out
+        else:
+            res = norm_x * w
+
         if hasattr(self, '_stats') and 'norm' in self._stats: self._stats['norm'].append(time.time() - t0)
         if self.training and key is not None: self._activations[key] = {"x": x, "rms": rms, "norm_x": norm_x}
         return res
@@ -1128,6 +1147,22 @@ class EinsumTransformer:
         self.cos_cached = np.cos(freqs).astype(np.float32)
         self.sin_cached = np.sin(freqs).astype(np.float32)
 
+        # Pre-allocate reusable buffers for single-step decode (L=1)
+        B = c.batch_size
+        d_q = c.n_heads * c.d_head
+        d_kv = c.n_kv_heads * c.d_head
+
+        self.decode_buffers = {
+            # QKV projection result: [B, 1, d_q + 2*d_kv]
+            "qkv": np.zeros((B, 1, d_q + 2*d_kv), dtype=np.float32),
+            # FFN gate_up projection result: [B, 1, 2*c.d_ff]
+            "gate_up": np.zeros((B, 1, 2*c.d_ff), dtype=np.float32),
+            # Shared buffer for outputs (Attn out, FFN down, Norm): [B, 1, c.d_model]
+            "out": np.zeros((B, 1, c.d_model), dtype=np.float32),
+            # Buffer for Norm result: [B, 1, c.d_model]
+            "h": np.zeros((B, 1, c.d_model), dtype=np.float32)
+        }
+
     def _forward_inference(self, tokens, verbose=True):
         if not hasattr(self, '_stats'): self._init_stats()
         # Helper to track stats similar to standard forward
@@ -1162,6 +1197,11 @@ class EinsumTransformer:
         if L > 1:
             mask = np.triu(np.ones((L, L), dtype=np.float32), k=1) * -1e9
 
+        # Use pre-allocated buffers if applicable
+        bufs = None
+        if L == 1 and B == c.batch_size and hasattr(self, 'decode_buffers'):
+            bufs = self.decode_buffers
+
         t_layers_total = 0
 
         for i, l in enumerate(self.optimized_layers):
@@ -1169,7 +1209,10 @@ class EinsumTransformer:
 
             t_norm = time.time()
             # Norm 1
-            h = self.rms_norm(x, l['norm1'])
+            if bufs:
+                h = self.rms_norm(x, l['norm1'], out=bufs['h'])
+            else:
+                h = self.rms_norm(x, l['norm1'])
             # Ensure stability of activations
             h = np.nan_to_num(h, copy=False, nan=0.0, posinf=65504.0, neginf=-65504.0)
             h = np.ascontiguousarray(h)
@@ -1177,7 +1220,10 @@ class EinsumTransformer:
 
             t_qkv = time.time()
             # QKV
-            qkv = tiled_matmul(h, l['W_qkv'], executor=self.executor, backend=c.backend)
+            if bufs:
+                qkv = tiled_matmul(h, l['W_qkv'], executor=self.executor, backend=c.backend, out=bufs['qkv'])
+            else:
+                qkv = tiled_matmul(h, l['W_qkv'], executor=self.executor, backend=c.backend)
             self._stats['attn_qkv_step'].append(time.time() - t_qkv)
 
             q = qkv[..., :d_q]
@@ -1255,23 +1301,35 @@ class EinsumTransformer:
             self._stats['attn_score_step'].append(time.time() - t_attn_score)
 
             t_out = time.time()
-            h = tiled_matmul(out, l['W_o'], backend=c.backend)
+            if bufs:
+                h = tiled_matmul(out, l['W_o'], backend=c.backend, out=bufs['out'])
+            else:
+                h = tiled_matmul(out, l['W_o'], backend=c.backend)
             x = x + h
             self._stats['attn_out_step'].append(time.time() - t_out)
 
             t_ffn_s = time.time()
             # FFN
-            h = self.rms_norm(x, l['norm2'])
+            if bufs:
+                h = self.rms_norm(x, l['norm2'], out=bufs['h'])
+            else:
+                h = self.rms_norm(x, l['norm2'])
             h = np.nan_to_num(h, copy=False, nan=0.0, posinf=65504.0, neginf=-65504.0)
             h = np.ascontiguousarray(h)
 
-            gate_up = tiled_matmul(h, l['W_gate_up'], backend=c.backend)
+            if bufs:
+                gate_up = tiled_matmul(h, l['W_gate_up'], backend=c.backend, out=bufs['gate_up'])
+            else:
+                gate_up = tiled_matmul(h, l['W_gate_up'], backend=c.backend)
             gate = gate_up[..., :d_gate]
             up = gate_up[..., d_gate:]
 
             gate = gate * self._sigmoid(gate) * up
 
-            down = tiled_matmul(gate, l['W3'], backend=c.backend)
+            if bufs:
+                down = tiled_matmul(gate, l['W3'], backend=c.backend, out=bufs['out'])
+            else:
+                down = tiled_matmul(gate, l['W3'], backend=c.backend)
             x = x + down
             self._stats['ffn_compute_step'].append(time.time() - t_ffn_s)
 
