@@ -1349,7 +1349,14 @@ class EinsumTransformer:
             gate = gate_up[..., :d_gate]
             up = gate_up[..., d_gate:]
 
-            gate = gate * self._sigmoid(gate) * up
+            # Optimization: In-place SwiGLU to avoid intermediate allocations.
+            # gate (view) becomes swish(gate), then gated output.
+            # 1. Compute sigmoid(gate) - needs allocation
+            sig_gate = self._sigmoid(gate)
+            # 2. In-place multiply: gate = gate * sig_gate (swish)
+            gate *= sig_gate
+            # 3. In-place multiply: gate = gate * up
+            gate *= up
 
             if bufs:
                 down = tiled_matmul(gate, l['W3'], backend=c.backend, out=bufs['out'])
