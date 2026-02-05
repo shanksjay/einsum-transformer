@@ -25,3 +25,7 @@
 ## 2026-10-28 - Threading Overhead in SwiGLU and Attention
 **Learning:** Unconditional submission of `swiglu` and `attention` projections to `ThreadPoolExecutor` causes significant overhead (up to ~30-40%) for small operations (e.g., L=1 decoding or small batches), where the cost of task scheduling exceeds the parallelization gain.
 **Action:** Implemented `_should_parallelize(ops)` helper with a threshold of 1.5e8 ops (consistent with `tiled_matmul`) to enforce serial execution for small workloads in `swiglu` and `attention`.
+
+## 2024-10-31 - Micro-benchmark Denormal Trap
+**Learning:** Micro-benchmarking SwiGLU activation with repeated loops on the same data caused denormals/underflow, making optimized in-place code 100x slower. In-place operations on buffers that decay to zero trigger slow CPU denormal handling.
+**Action:** Always verify micro-benchmarks with fresh random data or ensure values stay in normal range (e.g. reset periodically).
