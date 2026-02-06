@@ -893,15 +893,26 @@ class EinsumTransformer:
             b = proj(W2)
 
         # Numerical stable sigmoid to avoid overflow in np.exp
-        sig_b = self._sigmoid(b)
+        # SwiGLU: Swish(Gate) * Up
+        # a = Gate (W1), b = Up (W2)
 
-        swish_b = b * sig_b
-        gated = a * swish_b
+        if self.training:
+            sig_a = self._sigmoid(a)
+            swish_a = a * sig_a
+            gated = swish_a * b
+            if key is not None:
+                self._activations[key] = {"x": x, "a": a, "b": b, "sig_a": sig_a, "swish_a": swish_a}
+        else:
+            # Memory optimization: In-place Swish(Gate) * Up
+            # a and b are fresh buffers from proj(), so we can modify them in-place.
+            sig_a = self._sigmoid(a)
+            a *= sig_a  # a becomes swish_a (Gate * Sigmoid(Gate))
+            b *= a      # b becomes gated (Up * Swish(Gate))
+            gated = b
+
         res = np.einsum("btf,fd->btd", gated, W3, optimize=True)
         if hasattr(self, '_stats') and 'ffn_compute' in self._stats:
             self._stats['ffn_compute'].append(time.time() - t0)
-        if self.training and key is not None:
-            self._activations[key] = {"x": x, "a": a, "b": b, "sig_b": sig_b, "gated": gated}
         return res
 
     def _log(self, *args, **kwargs):
@@ -1621,10 +1632,24 @@ class EinsumTransformer:
                 t_ffn_compute = time.time()
                 act_ffn, dffn_out = self._activations[f"ffn_{i}"], dx
                 W1, W2, W3 = [self.get_w(p[k], transpose=True) for k in ["W1", "W2", "W3"]]
-                if not self.use_lora: self._grads[f"W3_{i}"] = np.einsum("btf,btd->fd", act_ffn["gated"], dffn_out, optimize=True)
+                # Note: act_ffn["swish_a"] used here is essentially 'gated' / 'b' (Up) since gated = swish_a * b
+                # But strict gradient for W3 depends on 'gated' output.
+                # In forward: gated = swish_a * b.
+                # So we can reconstruct gated = act_ffn["swish_a"] * act_ffn["b"]
+                gated_reconstructed = act_ffn["swish_a"] * act_ffn["b"]
+                if not self.use_lora: self._grads[f"W3_{i}"] = np.einsum("btf,btd->fd", gated_reconstructed, dffn_out, optimize=True)
                 dgated = np.einsum("btd,fd->btf", dffn_out, W3, optimize=True)
-                da = dgated * (act_ffn["b"] * act_ffn["sig_b"])
-                db = dgated * act_ffn["a"] * (act_ffn["sig_b"] * (1 + act_ffn["b"] * (1 - act_ffn["sig_b"])))
+
+                # Backprop through SwiGLU: Swish(a) * b
+                # gated = swish_a * b
+                # db = dgated * swish_a
+                # dswish_a = dgated * b
+                # da = dswish_a * (sig_a + a * sig_a * (1 - sig_a))
+                #    = (dgated * b) * (sig_a + swish_a * (1 - sig_a))
+
+                db = dgated * act_ffn["swish_a"]
+                da = (dgated * act_ffn["b"]) * (act_ffn["sig_a"] + act_ffn["swish_a"] * (1 - act_ffn["sig_a"]))
+
                 if not self.use_lora:
                     self._grads[f"W1_{i}"], self._grads[f"W2_{i}"] = np.einsum("btd,btf->df", act_ffn["x"], da, optimize=True), np.einsum("btd,btf->df", act_ffn["x"], db, optimize=True)
                 dx = dx + np.einsum("btf,df->btd", da, W1, optimize=True) + np.einsum("btf,df->btd", db, W2, optimize=True)
