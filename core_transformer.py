@@ -22,6 +22,12 @@ except ImportError:
     HAS_MLX = False
 
 try:
+    import cupy as cp
+    HAS_CUPY = True
+except ImportError:
+    HAS_CUPY = False
+
+try:
     import numba as nb
     HAS_NUMBA = True
 except ImportError:
@@ -59,6 +65,16 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
     out: Optional output array (only used if shapes match)
     """
     # Force backend if specified
+    if backend == "cupy" and HAS_CUPY:
+        is_a_np = isinstance(a, np.ndarray)
+        is_b_np = isinstance(b, np.ndarray)
+        if not isinstance(a, cp.ndarray): a = cp.asarray(a)
+        if not isinstance(b, cp.ndarray): b = cp.asarray(b)
+        res = cp.matmul(a, b)
+        if is_a_np or is_b_np:
+            return cp.asnumpy(res)
+        return res
+
     if backend == "mlx" and HAS_MLX:
         if not isinstance(a, mx.array): a = mx.array(a)
         if not isinstance(b, mx.array): b = mx.array(b)
@@ -70,6 +86,11 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
         if not isinstance(b, mx.array): b = mx.array(b)
         return mx.matmul(a, b)
 
+    if (backend == "auto" and HAS_CUPY) and (isinstance(a, cp.ndarray) or isinstance(b, cp.ndarray)):
+        if not isinstance(a, cp.ndarray): a = cp.asarray(a)
+        if not isinstance(b, cp.ndarray): b = cp.asarray(b)
+        return cp.matmul(a, b)
+
     if block_size is None:
         block_size = _get_platform_block_size()
 
@@ -79,12 +100,6 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
     M = int(np.prod(a_shape[:-1]))
     N = b.shape[-1]
 
-    # Fallback to standard matmul if b is not 2D (batched matmul)
-    # The current tiling implementation assumes b is [K, N] and broadcasts a over it.
-    if b.ndim > 2:
-        with np.errstate(all='ignore'):
-            return np.matmul(a, b, out=out)
-
     # Heuristic: Parallelize if total work > threshold
     # Increased threshold to 1.5e8 (150M ops) to avoid thread overhead for medium sizes
     total_ops = float(M) * K * N
@@ -93,6 +108,44 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
     # Disable parallelization for small batch sizes (M < 32) as BLAS is faster
     if M < 32:
         use_parallel = False
+
+    # Fallback to standard matmul if b is not 2D (batched matmul)
+    # The current tiling implementation assumes b is [K, N] and broadcasts a over it.
+    if b.ndim > 2:
+        # Check if we can parallelize over batch dimension
+        if use_parallel and a.ndim >= 3 and b.ndim >= 3:
+             batch_dims_a = a.shape[:-2]
+             batch_dims_b = b.shape[:-2]
+
+             if batch_dims_a == batch_dims_b:
+                 res = np.empty(batch_dims_a + (a.shape[-2], b.shape[-1]), dtype=a.dtype)
+
+                 all_indices = list(np.ndindex(batch_dims_a))
+                 num_batches = len(all_indices)
+
+                 def compute_chunk(chunk_start, chunk_end):
+                     for i in range(chunk_start, chunk_end):
+                         idx = all_indices[i]
+                         with np.errstate(all='ignore'):
+                             np.matmul(a[idx], b[idx], out=res[idx])
+
+                 futures = []
+                 # Use executor._max_workers if available, else cpu_count
+                 num_workers = getattr(executor, '_max_workers', os.cpu_count() or 4)
+
+                 chunk_size = max(1, (num_batches + num_workers - 1) // num_workers)
+
+                 for i in range(0, num_batches, chunk_size):
+                     end = min(i + chunk_size, num_batches)
+                     futures.append(executor.submit(compute_chunk, i, end))
+
+                 for f in as_completed(futures):
+                     f.result()
+
+                 return res
+
+        with np.errstate(all='ignore'):
+            return np.matmul(a, b, out=out)
 
     # If small work, just run standard matmul
     if not use_parallel and total_ops < 2e8:
