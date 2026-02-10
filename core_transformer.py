@@ -27,6 +27,12 @@ try:
 except ImportError:
     HAS_NUMBA = False
 
+try:
+    import cupy as cp
+    HAS_CUPY = True
+except ImportError:
+    HAS_CUPY = False
+
 
 import platform
 
@@ -69,6 +75,41 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
         if not isinstance(a, mx.array): a = mx.array(a)
         if not isinstance(b, mx.array): b = mx.array(b)
         return mx.matmul(a, b)
+
+    if HAS_CUPY:
+        use_cupy = (backend == "cupy")
+        if backend == "auto":
+            if isinstance(a, cp.ndarray) or isinstance(b, cp.ndarray):
+                use_cupy = True
+
+        if use_cupy:
+            # Check if inputs were numpy to determine if we should convert back
+            was_numpy = not (isinstance(a, cp.ndarray) or isinstance(b, cp.ndarray))
+
+            if not isinstance(a, cp.ndarray): a = cp.asarray(a)
+            if not isinstance(b, cp.ndarray): b = cp.asarray(b)
+
+            res = cp.matmul(a, b)
+
+            if was_numpy:
+                if out is not None:
+                    # If out is numpy, copy to it
+                    out_np = cp.asnumpy(res)
+                    np.copyto(out, out_np)
+                    return out
+                return cp.asnumpy(res)
+
+            if out is not None:
+                if isinstance(out, cp.ndarray):
+                    cp.copyto(out, res)
+                    return out
+                elif isinstance(out, np.ndarray):
+                    # Mixed case: Inputs Cupy (so result Cupy), but out is NumPy. Copy back.
+                    out_np = cp.asnumpy(res)
+                    np.copyto(out, out_np)
+                    return out
+
+            return res
 
     if block_size is None:
         block_size = _get_platform_block_size()
