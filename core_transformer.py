@@ -27,6 +27,12 @@ try:
 except ImportError:
     HAS_NUMBA = False
 
+try:
+    import cupy as cp
+    HAS_CUPY = True
+except ImportError:
+    HAS_CUPY = False
+
 
 import platform
 
@@ -69,6 +75,40 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
         if not isinstance(a, mx.array): a = mx.array(a)
         if not isinstance(b, mx.array): b = mx.array(b)
         return mx.matmul(a, b)
+
+    # CuPy Path: if requested or if auto-detected via input types
+    use_cupy = (backend == "cupy" and HAS_CUPY)
+    if backend == "auto" and HAS_CUPY:
+        if isinstance(a, cp.ndarray) or isinstance(b, cp.ndarray):
+            use_cupy = True
+
+    if use_cupy:
+        is_numpy_a = isinstance(a, np.ndarray)
+        is_numpy_b = isinstance(b, np.ndarray)
+
+        # Move to GPU if needed
+        a_gpu = cp.asarray(a) if is_numpy_a else a
+        b_gpu = cp.asarray(b) if is_numpy_b else b
+
+        # Perform matmul on GPU
+        res_gpu = cp.matmul(a_gpu, b_gpu)
+
+        # Handle output
+        if out is not None:
+            if isinstance(out, cp.ndarray):
+                # Direct GPU copy
+                cp.copyto(out, res_gpu)
+                return out
+            elif isinstance(out, np.ndarray):
+                # Transfer back to CPU
+                out[:] = cp.asnumpy(res_gpu)
+                return out
+
+        # If inputs were NumPy, we likely want NumPy back (transparent acceleration)
+        if is_numpy_a and is_numpy_b:
+            return cp.asnumpy(res_gpu)
+
+        return res_gpu
 
     if block_size is None:
         block_size = _get_platform_block_size()
