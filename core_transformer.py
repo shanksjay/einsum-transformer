@@ -22,6 +22,12 @@ except ImportError:
     HAS_MLX = False
 
 try:
+    import cupy as cp
+    HAS_CUPY = True
+except ImportError:
+    HAS_CUPY = False
+
+try:
     import numba as nb
     HAS_NUMBA = True
 except ImportError:
@@ -53,9 +59,9 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
     and improve stability. Supports parallel dispatch for chunks.
 
     a: [..., K]
-    b: [K, N]
+    b: [..., K, N]
     Output: [..., N]
-    backend: "auto", "mlx", "numba", "numpy"
+    backend: "auto", "mlx", "cupy", "numba", "numpy"
     out: Optional output array (only used if shapes match)
     """
     # Force backend if specified
@@ -64,34 +70,76 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
         if not isinstance(b, mx.array): b = mx.array(b)
         return mx.matmul(a, b)
 
+    if backend == "cupy" and HAS_CUPY:
+        if not isinstance(a, cp.ndarray): a = cp.array(a)
+        if not isinstance(b, cp.ndarray): b = cp.array(b)
+        res = cp.matmul(a, b)
+        if out is not None:
+            # If out is numpy, we need to transfer back
+            if isinstance(out, np.ndarray):
+                out[:] = cp.asnumpy(res)
+                return out
+            elif isinstance(out, cp.ndarray):
+                out[:] = res
+                return out
+        # If input was numpy (implied by backend check ordering/logic), return numpy?
+        # Standard convention: return what matches backend.
+        # But if caller expects numpy, we might break things.
+        # Memory says: "results are returned to the CPU (or `out` buffer)"
+        return cp.asnumpy(res)
+
     # Auto GPU Path: If MLX is available and inputs are on GPU (or we want to use it), use it directly
     if (backend == "auto" and HAS_MLX) and (isinstance(a, mx.array) or isinstance(b, mx.array)):
         if not isinstance(a, mx.array): a = mx.array(a)
         if not isinstance(b, mx.array): b = mx.array(b)
         return mx.matmul(a, b)
 
+    if (backend == "auto" and HAS_CUPY):
+        # Prefer CuPy if available and explicitly auto-selected or inputs are already on GPU
+        is_gpu = isinstance(a, cp.ndarray) or isinstance(b, cp.ndarray)
+        if is_gpu:
+             if not isinstance(a, cp.ndarray): a = cp.array(a)
+             if not isinstance(b, cp.ndarray): b = cp.array(b)
+             return cp.matmul(a, b)
+
     if block_size is None:
         block_size = _get_platform_block_size()
 
-    a_shape = a.shape
-    K = a_shape[-1]
-    # Calculate M (product of leading dimensions of a)
-    M = int(np.prod(a_shape[:-1]))
-    N = b.shape[-1]
-
-    # Fallback to standard matmul if b is not 2D (batched matmul)
-    # The current tiling implementation assumes b is [K, N] and broadcasts a over it.
-    if b.ndim > 2:
+    # Fallback for scalar or vector inputs which don't fit 2D tiling easily
+    if a.ndim < 2 or b.ndim < 2:
         with np.errstate(all='ignore'):
             return np.matmul(a, b, out=out)
 
+    a_shape = a.shape
+    b_shape = b.shape
+
+    # Check compatibility
+    if a_shape[-1] != b_shape[-2]:
+        raise ValueError(f"Shape mismatch: {a_shape} vs {b_shape}")
+
+    K = a_shape[-1]
+    # M is the second to last dimension of a (rows)
+    M = a_shape[-2]
+    N = b_shape[-1]
+
+    # Calculate total ops including batch dimensions
+    # If len(a_shape) > 2, we have batch dims.
+    batch_ops = 1
+    if len(a_shape) > 2:
+        batch_ops = int(np.prod(a_shape[:-2]))
+    # Note: broadcasting might make effective batch ops larger if b has different batch dims,
+    # but exact calc is complex. Approximate with a's batch.
+
+    total_ops = float(batch_ops) * M * K * N
+
     # Heuristic: Parallelize if total work > threshold
     # Increased threshold to 1.5e8 (150M ops) to avoid thread overhead for medium sizes
-    total_ops = float(M) * K * N
     use_parallel = executor is not None and total_ops > 1.5e8
 
-    # Disable parallelization for small batch sizes (M < 32) as BLAS is faster
-    if M < 32:
+    # Disable parallelization for small row counts per batch (M < 32) as BLAS is faster
+    # unless batch size is huge? If M is small but Batch is huge, tiling M is useless.
+    # But tiling N might be useful.
+    if M < 32 and batch_ops < 100: # Heuristic adjustment
         use_parallel = False
 
     # If small work, just run standard matmul
@@ -99,38 +147,41 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
         with np.errstate(all='ignore'):
             return np.matmul(a, b, out=out)
 
-    # Flatten 'a' to [M, K] to allow uniform 2D tiling
-    # Note: reshape returns a view if possible, avoiding copy
+    # Prepare output
+    # Broadcast rules: a [..., M, K], b [..., K, N] -> [..., M, N]
     try:
-        a_flat = a.reshape(M, K)
-    except:
-        # Fallback if view not possible
-        with np.errstate(all='ignore'):
+        broadcast_batch = np.broadcast_shapes(a_shape[:-2], b_shape[:-2])
+        out_shape = broadcast_batch + (M, N)
+    except Exception:
+         # Fallback to standard if shape broadcast fails logic (unlikely if matmul works)
+         with np.errstate(all='ignore'):
             return np.matmul(a, b, out=out)
 
-    out_shape = list(a_shape)
-    out_shape[-1] = N
-
-    if out is not None and out.shape == tuple(out_shape) and out.dtype == a.dtype:
+    if out is not None and out.shape == out_shape and out.dtype == a.dtype:
         res = out
     else:
         res = np.empty(out_shape, dtype=a.dtype)
 
-    res_flat = res.reshape(M, N)
-
     use_numba = (backend == "numba" and HAS_NUMBA) or (backend == "auto" and HAS_NUMBA)
 
     if use_numba:
-        _numba_tiled_matmul(a_flat, b, res_flat, block_size)
+        # Numba impl currently only supports 2D flattened.
+        # Fallback to standard if batched
+        if len(a_shape) > 2 or len(b_shape) > 2:
+             with np.errstate(all='ignore'):
+                np.matmul(a, b, out=res)
+        else:
+             _numba_tiled_matmul(a, b, res, block_size)
     else:
         def compute_block(m_start, m_end, n_start, n_end):
             # Perform matmul for the block
-            # a_flat[m_start:m_end, :] @ b[:, n_start:n_end] -> res_flat[m_start:m_end, n_start:n_end]
+            # a[..., m_start:m_end, :] @ b[..., :, n_start:n_end]
+            # Slicing with ... handles batch dimensions automatically
             with np.errstate(all='ignore'):
                 np.matmul(
-                    a_flat[m_start:m_end, :],
-                    b[:, n_start:n_end],
-                    out=res_flat[m_start:m_end, n_start:n_end]
+                    a[..., m_start:m_end, :],
+                    b[..., :, n_start:n_end],
+                    out=res[..., m_start:m_end, n_start:n_end]
                 )
 
         if use_parallel:
