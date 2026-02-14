@@ -22,6 +22,12 @@ except ImportError:
     HAS_MLX = False
 
 try:
+    import cupy as cp
+    HAS_CUPY = True
+except ImportError:
+    HAS_CUPY = False
+
+try:
     import numba as nb
     HAS_NUMBA = True
 except ImportError:
@@ -69,6 +75,37 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
         if not isinstance(a, mx.array): a = mx.array(a)
         if not isinstance(b, mx.array): b = mx.array(b)
         return mx.matmul(a, b)
+
+    # CuPy Path: Use CuPy if requested or auto-detected
+    # If backend is "auto", we use CuPy if inputs are already on GPU OR if we have CuPy available for NumPy inputs
+    use_cupy = (backend == "cupy" and HAS_CUPY) or \
+               (backend == "auto" and HAS_CUPY and (isinstance(a, cp.ndarray) or isinstance(b, cp.ndarray))) or \
+               (backend == "auto" and HAS_CUPY and isinstance(a, np.ndarray) and isinstance(b, np.ndarray))
+
+    if use_cupy:
+        # Check inputs before conversion to decide on return type
+        a_is_np = isinstance(a, np.ndarray)
+        b_is_np = isinstance(b, np.ndarray)
+
+        if not isinstance(a, cp.ndarray): a = cp.array(a)
+        if not isinstance(b, cp.ndarray): b = cp.array(b)
+
+        res = cp.matmul(a, b)
+
+        if out is not None:
+            if isinstance(out, np.ndarray):
+                out[:] = res.get()
+                return out
+            elif isinstance(out, cp.ndarray):
+                cp.copyto(out, res)
+                return out
+
+        # If no output buffer, return NumPy array if inputs were NumPy and backend was auto
+        # (following the heuristic: transparent transfer)
+        if out is None and backend == "auto" and a_is_np and b_is_np:
+            return res.get()
+
+        return res
 
     if block_size is None:
         block_size = _get_platform_block_size()
