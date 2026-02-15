@@ -22,6 +22,12 @@ except ImportError:
     HAS_MLX = False
 
 try:
+    import cupy as cp
+    HAS_CUPY = True
+except ImportError:
+    HAS_CUPY = False
+
+try:
     import numba as nb
     HAS_NUMBA = True
 except ImportError:
@@ -64,11 +70,37 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
         if not isinstance(b, mx.array): b = mx.array(b)
         return mx.matmul(a, b)
 
+    if backend == "cupy" and HAS_CUPY:
+        is_a_cp = isinstance(a, cp.ndarray)
+        is_b_cp = isinstance(b, cp.ndarray)
+        if not is_a_cp: a = cp.array(a)
+        if not is_b_cp: b = cp.array(b)
+        res = cp.matmul(a, b)
+        if out is not None:
+            if isinstance(out, np.ndarray):
+                out[:] = res.get()
+            elif isinstance(out, cp.ndarray):
+                cp.copyto(out, res)
+            return out
+        return res if (is_a_cp or is_b_cp) else res.get()
+
     # Auto GPU Path: If MLX is available and inputs are on GPU (or we want to use it), use it directly
     if (backend == "auto" and HAS_MLX) and (isinstance(a, mx.array) or isinstance(b, mx.array)):
         if not isinstance(a, mx.array): a = mx.array(a)
         if not isinstance(b, mx.array): b = mx.array(b)
         return mx.matmul(a, b)
+
+    if (backend == "auto" and HAS_CUPY) and (isinstance(a, cp.ndarray) or isinstance(b, cp.ndarray)):
+        if not isinstance(a, cp.ndarray): a = cp.array(a)
+        if not isinstance(b, cp.ndarray): b = cp.array(b)
+        res = cp.matmul(a, b)
+        if out is not None:
+            if isinstance(out, np.ndarray):
+                out[:] = res.get()
+            elif isinstance(out, cp.ndarray):
+                cp.copyto(out, res)
+            return out
+        return res
 
     if block_size is None:
         block_size = _get_platform_block_size()
@@ -82,6 +114,55 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
     # Fallback to standard matmul if b is not 2D (batched matmul)
     # The current tiling implementation assumes b is [K, N] and broadcasts a over it.
     if b.ndim > 2:
+        # Attempt to parallelize over batch dimension if shapes match
+        can_parallelize = False
+        if executor is not None and a.ndim == b.ndim and a.shape[:-2] == b.shape[:-2]:
+            batch_shape = a.shape[:-2]
+            M, K = a.shape[-2:]
+            K2, N = b.shape[-2:]
+            batch_size = int(np.prod(batch_shape))
+            total_ops = float(batch_size) * M * K * N
+            # Same threshold as 2D tiling
+            if total_ops > 1.5e8 and batch_size > 1:
+                can_parallelize = True
+
+        if can_parallelize:
+            # Flatten batch dims
+            # reshape returns a view usually, efficient
+            a_flat = a.reshape(batch_size, M, K)
+            b_flat = b.reshape(batch_size, K, N)
+
+            if out is not None:
+                # Validate out shape matches
+                if out.shape == batch_shape + (M, N):
+                    out_flat = out.reshape(batch_size, M, N)
+                else:
+                    # Fallback on mismatch
+                    with np.errstate(all='ignore'):
+                        return np.matmul(a, b, out=out)
+            else:
+                out_flat = np.empty((batch_size, M, N), dtype=a.dtype)
+
+            def compute_batch(start, end):
+                with np.errstate(all='ignore'):
+                    np.matmul(a_flat[start:end], b_flat[start:end], out=out_flat[start:end])
+
+            # Determine chunk size
+            num_workers = getattr(executor, '_max_workers', 4)
+            chunk_size = max(1, (batch_size + num_workers - 1) // num_workers)
+
+            futures = []
+            for i in range(0, batch_size, chunk_size):
+                end = min(i + chunk_size, batch_size)
+                futures.append(executor.submit(compute_batch, i, end))
+
+            for f in as_completed(futures):
+                f.result()
+
+            if out is None:
+                return out_flat.reshape(batch_shape + (M, N))
+            return out
+
         with np.errstate(all='ignore'):
             return np.matmul(a, b, out=out)
 
