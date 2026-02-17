@@ -27,6 +27,12 @@ try:
 except ImportError:
     HAS_NUMBA = False
 
+try:
+    import cupy as cp
+    HAS_CUPY = True
+except ImportError:
+    HAS_CUPY = False
+
 
 import platform
 
@@ -53,58 +59,70 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
     and improve stability. Supports parallel dispatch for chunks.
 
     a: [..., K]
-    b: [K, N]
+    b: [K, N] or [..., K, N] (batched)
     Output: [..., N]
-    backend: "auto", "mlx", "numba", "numpy"
+    backend: "auto", "mlx", "numba", "cupy", "numpy"
     out: Optional output array (only used if shapes match)
     """
-    # Force backend if specified
-    if backend == "mlx" and HAS_MLX:
-        if not isinstance(a, mx.array): a = mx.array(a)
-        if not isinstance(b, mx.array): b = mx.array(b)
-        return mx.matmul(a, b)
+    # 1. Handle Backends (MLX, CuPy)
+    if HAS_MLX:
+        is_mlx = isinstance(a, mx.array) or isinstance(b, mx.array)
+        if (backend == "mlx") or (backend == "auto" and is_mlx):
+            if not isinstance(a, mx.array): a = mx.array(a)
+            if not isinstance(b, mx.array): b = mx.array(b)
+            return mx.matmul(a, b)
 
-    # Auto GPU Path: If MLX is available and inputs are on GPU (or we want to use it), use it directly
-    if (backend == "auto" and HAS_MLX) and (isinstance(a, mx.array) or isinstance(b, mx.array)):
-        if not isinstance(a, mx.array): a = mx.array(a)
-        if not isinstance(b, mx.array): b = mx.array(b)
-        return mx.matmul(a, b)
+    if HAS_CUPY:
+        is_cupy = isinstance(a, cp.ndarray) or isinstance(b, cp.ndarray)
+        if (backend == "cupy") or (backend == "auto" and is_cupy):
+            # Transfer to GPU if needed
+            if not isinstance(a, cp.ndarray): a = cp.array(a)
+            if not isinstance(b, cp.ndarray): b = cp.array(b)
+            res = cp.matmul(a, b)
+            # If output buffer provided and is numpy, copy back
+            if out is not None and isinstance(out, np.ndarray):
+                out[:] = cp.asnumpy(res)
+                return out
+            return res
 
+    # 2. Setup Dimensions
     if block_size is None:
         block_size = _get_platform_block_size()
 
+    # Determine if batched matmul (b has > 2 dims)
+    is_batched = b.ndim > 2
+
+    if not is_batched:
+        # Standard 2D tiling (broadcast a over b)
+        return _tiled_matmul_2d_broadcast(a, b, block_size, executor, backend, out)
+    else:
+        # Batched tiling (parallelize over batch dimension)
+        return _tiled_matmul_batched(a, b, block_size, executor, backend, out)
+
+
+def _tiled_matmul_2d_broadcast(a, b, block_size, executor, backend, out):
+    """
+    Case 1: 'b' is [K, N]. 'a' is [..., K].
+    We flatten 'a' to [M, K] and broadcast against 'b'.
+    This is the standard 'linear layer' application case.
+    """
     a_shape = a.shape
     K = a_shape[-1]
-    # Calculate M (product of leading dimensions of a)
     M = int(np.prod(a_shape[:-1]))
     N = b.shape[-1]
 
-    # Fallback to standard matmul if b is not 2D (batched matmul)
-    # The current tiling implementation assumes b is [K, N] and broadcasts a over it.
-    if b.ndim > 2:
-        with np.errstate(all='ignore'):
-            return np.matmul(a, b, out=out)
-
-    # Heuristic: Parallelize if total work > threshold
-    # Increased threshold to 1.5e8 (150M ops) to avoid thread overhead for medium sizes
     total_ops = float(M) * K * N
     use_parallel = executor is not None and total_ops > 1.5e8
+    if M < 32: use_parallel = False
 
-    # Disable parallelization for small batch sizes (M < 32) as BLAS is faster
-    if M < 32:
-        use_parallel = False
-
-    # If small work, just run standard matmul
+    # Fast path for small ops
     if not use_parallel and total_ops < 2e8:
         with np.errstate(all='ignore'):
             return np.matmul(a, b, out=out)
 
-    # Flatten 'a' to [M, K] to allow uniform 2D tiling
-    # Note: reshape returns a view if possible, avoiding copy
     try:
         a_flat = a.reshape(M, K)
     except:
-        # Fallback if view not possible
         with np.errstate(all='ignore'):
             return np.matmul(a, b, out=out)
 
@@ -119,41 +137,124 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
     res_flat = res.reshape(M, N)
 
     use_numba = (backend == "numba" and HAS_NUMBA) or (backend == "auto" and HAS_NUMBA)
-
     if use_numba:
         _numba_tiled_matmul(a_flat, b, res_flat, block_size)
     else:
-        def compute_block(m_start, m_end, n_start, n_end):
-            # Perform matmul for the block
-            # a_flat[m_start:m_end, :] @ b[:, n_start:n_end] -> res_flat[m_start:m_end, n_start:n_end]
-            with np.errstate(all='ignore'):
-                np.matmul(
-                    a_flat[m_start:m_end, :],
-                    b[:, n_start:n_end],
-                    out=res_flat[m_start:m_end, n_start:n_end]
-                )
-
-        if use_parallel:
-            futures = []
-            # Tile over M (rows) and N (columns)
-            for i in range(0, M, block_size):
-                m_end = min(i + block_size, M)
-                for j in range(0, N, block_size):
-                    n_end = min(j + block_size, N)
-                    futures.append(executor.submit(compute_block, i, m_end, j, n_end))
-
-            # Wait for all tasks to complete
-            for f in as_completed(futures):
-                f.result()
-        else:
-            # Serial execution
-            for i in range(0, M, block_size):
-                m_end = min(i + block_size, M)
-                for j in range(0, N, block_size):
-                    n_end = min(j + block_size, N)
-                    compute_block(i, m_end, j, n_end)
+        _tiled_compute_loop(a_flat, b, res_flat, block_size, executor, use_parallel)
 
     return res
+
+def _tiled_matmul_batched(a, b, block_size, executor, backend, out):
+    """
+    Case 2: 'b' is [..., K, N]. 'a' is [..., M, K] or [..., K].
+    Both have batch dimensions. We broadcast batch dims, flatten them,
+    and iterate (potentially in parallel) over the batch index.
+    """
+    try:
+        # Attempt to broadcast shapes for batch dimensions
+        # a: [..., M, K], b: [..., K, N]
+        # We need to broadcast a[..., :-2] and b[..., :-2]
+        # Or if a is [..., K] (vector), it treats it as [..., 1, K] for matmul usually.
+        # But here let's assume standard matmul behavior.
+
+        # Using np.matmul to handle shape broadcasting/checks logic is tricky to replicate perfectly.
+        # But we can assume standard (B, M, K) x (B, K, N) structure for Transformer attention.
+
+        # 1. Broadcast batch shapes
+        # We'll rely on numpy broadcasting rules by iterating.
+        # But we need a common iteration count.
+        # Let's flatten to a list of (a_slice, b_slice, out_slice).
+
+        # To simplify, we only parallelize if explicit batch dims match or are easily broadcastable.
+        # If complex broadcasting, fallback to np.matmul.
+
+        if a.ndim < 2 or b.ndim < 2:
+             return np.matmul(a, b, out=out)
+
+        # Check standard attention pattern: [B, H, M, K] @ [B, H, K, N]
+        if a.shape[:-2] == b.shape[:-2]:
+            batch_shape = a.shape[:-2]
+            B_total = int(np.prod(batch_shape))
+            M, K = a.shape[-2], a.shape[-1]
+            N = b.shape[-1]
+
+            # Reshape to [B_total, M, K] and [B_total, K, N]
+            a_flat = a.reshape(B_total, M, K)
+            b_flat = b.reshape(B_total, K, N)
+
+            if out is None:
+                res = np.empty(list(batch_shape) + [M, N], dtype=a.dtype)
+            else:
+                res = out
+            res_flat = res.reshape(B_total, M, N)
+
+            total_ops_per_batch = float(M) * K * N
+
+            # If individual batch item is large, tile IT.
+            # If individual batch item is small but total is large, parallelize OVER batches.
+
+            # Strategy:
+            # 1. If B_total is large, parallelize loop over B.
+            # 2. If M*K*N is large, tile inside (but we just loop here for simplicity).
+
+            # Let's parallelize over B_total if ops are sufficient
+            total_ops = B_total * total_ops_per_batch
+            use_parallel = executor is not None and total_ops > 1.5e8
+
+            if not use_parallel:
+                 return np.matmul(a, b, out=out)
+
+            def compute_batch(i):
+                # We can call tiled matmul recursively for the 2D slice?
+                # Or just np.matmul since it's likely small enough per head?
+                # Usually attention matrices are [S, S], e.g. 4096*4096. That's 16M ops.
+                # If we have 32 heads, total 500M ops.
+                # So we want parallelization.
+                # If we parallelize over B, each thread does np.matmul(a[i], b[i]).
+                # This is efficient if M, N are not HUGE.
+                with np.errstate(all='ignore'):
+                    np.matmul(a_flat[i], b_flat[i], out=res_flat[i])
+
+            futures = [executor.submit(compute_batch, i) for i in range(B_total)]
+            for f in as_completed(futures):
+                f.result()
+
+            return res
+        else:
+             # Complex broadcasting fallback
+             return np.matmul(a, b, out=out)
+
+    except Exception:
+        return np.matmul(a, b, out=out)
+
+
+def _tiled_compute_loop(a, b, res, block_size, executor, use_parallel):
+    M = a.shape[0]
+    N = b.shape[1]
+
+    def compute_block(m_start, m_end, n_start, n_end):
+        with np.errstate(all='ignore'):
+            np.matmul(
+                a[m_start:m_end, :],
+                b[:, n_start:n_end],
+                out=res[m_start:m_end, n_start:n_end]
+            )
+
+    if use_parallel:
+        futures = []
+        for i in range(0, M, block_size):
+            m_end = min(i + block_size, M)
+            for j in range(0, N, block_size):
+                n_end = min(j + block_size, N)
+                futures.append(executor.submit(compute_block, i, m_end, j, n_end))
+        for f in as_completed(futures):
+            f.result()
+    else:
+        for i in range(0, M, block_size):
+            m_end = min(i + block_size, M)
+            for j in range(0, N, block_size):
+                n_end = min(j + block_size, N)
+                compute_block(i, m_end, j, n_end)
 
 if HAS_NUMBA:
     @nb.njit(parallel=True, fastmath=True)
