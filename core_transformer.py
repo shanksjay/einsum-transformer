@@ -27,6 +27,12 @@ try:
 except ImportError:
     HAS_NUMBA = False
 
+try:
+    import cupy as cp
+    HAS_CUPY = True
+except ImportError:
+    HAS_CUPY = False
+
 
 import platform
 
@@ -63,12 +69,21 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
         if not isinstance(a, mx.array): a = mx.array(a)
         if not isinstance(b, mx.array): b = mx.array(b)
         return mx.matmul(a, b)
+    if backend == "cupy" and HAS_CUPY:
+        if not isinstance(a, cp.ndarray): a = cp.array(a)
+        if not isinstance(b, cp.ndarray): b = cp.array(b)
+        return cp.matmul(a, b)
 
-    # Auto GPU Path: If MLX is available and inputs are on GPU (or we want to use it), use it directly
+    # Auto GPU Path: If MLX/CuPy is available and inputs are on GPU (or we want to use it), use it directly
     if (backend == "auto" and HAS_MLX) and (isinstance(a, mx.array) or isinstance(b, mx.array)):
         if not isinstance(a, mx.array): a = mx.array(a)
         if not isinstance(b, mx.array): b = mx.array(b)
         return mx.matmul(a, b)
+
+    if (backend == "auto" and HAS_CUPY) and (isinstance(a, cp.ndarray) or isinstance(b, cp.ndarray)):
+        if not isinstance(a, cp.ndarray): a = cp.array(a)
+        if not isinstance(b, cp.ndarray): b = cp.array(b)
+        return cp.matmul(a, b)
 
     if block_size is None:
         block_size = _get_platform_block_size()
@@ -82,6 +97,51 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
     # Fallback to standard matmul if b is not 2D (batched matmul)
     # The current tiling implementation assumes b is [K, N] and broadcasts a over it.
     if b.ndim > 2:
+        # Optimization: Parallelize over batch dimension if dimensions align
+        if executor is not None and a.ndim == b.ndim and a.shape[:-2] == b.shape[:-2]:
+            M = a.shape[-2]
+            K = a.shape[-1]
+            N = b.shape[-1]
+            batch_size = int(np.prod(a.shape[:-2]))
+            total_ops = float(batch_size) * M * K * N
+
+            # Use parallel execution if work is sufficient
+            if total_ops > 1.5e8:
+                try:
+                    a_flat = a.reshape(-1, M, K)
+                    b_flat = b.reshape(-1, K, N)
+
+                    if out is not None:
+                        res = out
+                        res_flat = res.reshape(-1, M, N)
+                    else:
+                        out_shape = list(a.shape[:-1]) + [N]
+                        res = np.empty(out_shape, dtype=a.dtype)
+                        res_flat = res.reshape(-1, M, N)
+
+                    def compute_batch_chunk(start, end):
+                        with np.errstate(all='ignore'):
+                            np.matmul(a_flat[start:end], b_flat[start:end], out=res_flat[start:end])
+
+                    # Determine chunking strategy
+                    # We want enough work per chunk to justify overhead
+                    # Use os.cpu_count() as heuristic for worker count to avoid private attribute access
+                    num_workers = os.cpu_count() or 4
+                    chunk_size = max(1, (batch_size + num_workers - 1) // num_workers)
+
+                    futures = []
+                    for i in range(0, batch_size, chunk_size):
+                        end = min(i + chunk_size, batch_size)
+                        futures.append(executor.submit(compute_batch_chunk, i, end))
+
+                    for f in as_completed(futures):
+                        f.result()
+
+                    return res
+                except Exception:
+                    # Fallback to standard matmul on error (e.g. reshape fail)
+                    pass
+
         with np.errstate(all='ignore'):
             return np.matmul(a, b, out=out)
 
