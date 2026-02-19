@@ -22,6 +22,12 @@ except ImportError:
     HAS_MLX = False
 
 try:
+    import cupy as cp
+    HAS_CUPY = True
+except ImportError:
+    HAS_CUPY = False
+
+try:
     import numba as nb
     HAS_NUMBA = True
 except ImportError:
@@ -64,26 +70,79 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
         if not isinstance(b, mx.array): b = mx.array(b)
         return mx.matmul(a, b)
 
+    if backend == "cupy" and HAS_CUPY:
+        if not isinstance(a, cp.ndarray): a = cp.array(a)
+        if not isinstance(b, cp.ndarray): b = cp.array(b)
+        return cp.matmul(a, b)
+
     # Auto GPU Path: If MLX is available and inputs are on GPU (or we want to use it), use it directly
     if (backend == "auto" and HAS_MLX) and (isinstance(a, mx.array) or isinstance(b, mx.array)):
         if not isinstance(a, mx.array): a = mx.array(a)
         if not isinstance(b, mx.array): b = mx.array(b)
         return mx.matmul(a, b)
 
+    if (backend == "auto" and HAS_CUPY) and (isinstance(a, cp.ndarray) or isinstance(b, cp.ndarray)):
+        if not isinstance(a, cp.ndarray): a = cp.array(a)
+        if not isinstance(b, cp.ndarray): b = cp.array(b)
+        return cp.matmul(a, b)
+
     if block_size is None:
         block_size = _get_platform_block_size()
+
+    # Parallel Batched Matmul handling
+    if b.ndim > 2:
+        # Check for matching batch dimensions (common in attention heads: B, H)
+        # We only optimize if batch dimensions match exactly. Broadcasting logic is complex to parallelize manually.
+        if a.ndim > 2 and a.shape[:-2] == b.shape[:-2]:
+            batch_shape = a.shape[:-2]
+            batch_prod = int(np.prod(batch_shape))
+            M = a.shape[-2]
+            K = a.shape[-1]
+            N = b.shape[-1]
+
+            # Heuristic: Parallelize if total work > threshold
+            total_ops = float(batch_prod) * M * K * N
+            use_parallel = executor is not None and total_ops > 1.5e8
+
+            if use_parallel:
+                a_flat = a.reshape(batch_prod, M, K)
+                b_flat = b.reshape(batch_prod, K, N)
+
+                # Allocation for result
+                if out is not None and out.shape == a.shape[:-1] + (N,) and out.dtype == a.dtype:
+                    res = out
+                else:
+                    res = np.empty(a.shape[:-1] + (N,), dtype=a.dtype)
+
+                res_flat = res.reshape(batch_prod, M, N)
+
+                def compute_batch(start, end):
+                    with np.errstate(all='ignore'):
+                        np.matmul(a_flat[start:end], b_flat[start:end], out=res_flat[start:end])
+
+                # Chunk over batch_prod
+                # Try to access max_workers, fallback to cpu_count
+                num_workers = getattr(executor, '_max_workers', os.cpu_count() or 4)
+                chunk_size = max(1, batch_prod // (num_workers * 4))
+                futures = []
+                for i in range(0, batch_prod, chunk_size):
+                    end = min(i + chunk_size, batch_prod)
+                    futures.append(executor.submit(compute_batch, i, end))
+
+                for f in as_completed(futures):
+                    f.result()
+
+                return res
+
+        # Fallback to standard broadcasting if shapes don't match or parallelization disabled
+        with np.errstate(all='ignore'):
+            return np.matmul(a, b, out=out)
 
     a_shape = a.shape
     K = a_shape[-1]
     # Calculate M (product of leading dimensions of a)
     M = int(np.prod(a_shape[:-1]))
     N = b.shape[-1]
-
-    # Fallback to standard matmul if b is not 2D (batched matmul)
-    # The current tiling implementation assumes b is [K, N] and broadcasts a over it.
-    if b.ndim > 2:
-        with np.errstate(all='ignore'):
-            return np.matmul(a, b, out=out)
 
     # Heuristic: Parallelize if total work > threshold
     # Increased threshold to 1.5e8 (150M ops) to avoid thread overhead for medium sizes
