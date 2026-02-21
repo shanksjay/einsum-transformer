@@ -16,6 +16,12 @@ except ImportError:
     ml_dtypes = None
 
 try:
+    import cupy as cp
+    HAS_CUPY = True
+except ImportError:
+    HAS_CUPY = False
+
+try:
     import mlx.core as mx
     HAS_MLX = True
 except ImportError:
@@ -64,11 +70,38 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
         if not isinstance(b, mx.array): b = mx.array(b)
         return mx.matmul(a, b)
 
+    if backend == "cupy" and HAS_CUPY:
+        if not isinstance(a, cp.ndarray): a = cp.array(a)
+        if not isinstance(b, cp.ndarray): b = cp.array(b)
+        res = cp.matmul(a, b)
+        if out is not None:
+            if isinstance(out, np.ndarray):
+                res.get(out=out)
+                return out
+            elif isinstance(out, cp.ndarray):
+                cp.copyto(out, res)
+                return out
+        return res
+
     # Auto GPU Path: If MLX is available and inputs are on GPU (or we want to use it), use it directly
     if (backend == "auto" and HAS_MLX) and (isinstance(a, mx.array) or isinstance(b, mx.array)):
         if not isinstance(a, mx.array): a = mx.array(a)
         if not isinstance(b, mx.array): b = mx.array(b)
         return mx.matmul(a, b)
+
+    # Auto GPU Path: If CuPy is available and inputs are on GPU, use it directly
+    if (backend == "auto" and HAS_CUPY) and (isinstance(a, cp.ndarray) or isinstance(b, cp.ndarray)):
+        if not isinstance(a, cp.ndarray): a = cp.array(a)
+        if not isinstance(b, cp.ndarray): b = cp.array(b)
+        res = cp.matmul(a, b)
+        if out is not None:
+            if isinstance(out, np.ndarray):
+                res.get(out=out)
+                return out
+            elif isinstance(out, cp.ndarray):
+                cp.copyto(out, res)
+                return out
+        return res
 
     if block_size is None:
         block_size = _get_platform_block_size()
