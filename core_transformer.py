@@ -22,6 +22,12 @@ except ImportError:
     HAS_MLX = False
 
 try:
+    import cupy as cp
+    HAS_CUPY = True
+except ImportError:
+    HAS_CUPY = False
+
+try:
     import numba as nb
     HAS_NUMBA = True
 except ImportError:
@@ -64,6 +70,18 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
         if not isinstance(b, mx.array): b = mx.array(b)
         return mx.matmul(a, b)
 
+    # CuPy / GPU Support
+    if (backend == "cupy" and HAS_CUPY) or (backend == "auto" and HAS_CUPY and (isinstance(a, cp.ndarray) or isinstance(b, cp.ndarray))):
+        a_cp = cp.array(a) if not isinstance(a, cp.ndarray) else a
+        b_cp = cp.array(b) if not isinstance(b, cp.ndarray) else b
+        res = cp.matmul(a_cp, b_cp)
+        if out is not None and isinstance(out, np.ndarray):
+            res.get(out=out)
+            return out
+        elif isinstance(a, np.ndarray):
+            return res.get()
+        return res
+
     # Auto GPU Path: If MLX is available and inputs are on GPU (or we want to use it), use it directly
     if (backend == "auto" and HAS_MLX) and (isinstance(a, mx.array) or isinstance(b, mx.array)):
         if not isinstance(a, mx.array): a = mx.array(a)
@@ -79,9 +97,40 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
     M = int(np.prod(a_shape[:-1]))
     N = b.shape[-1]
 
-    # Fallback to standard matmul if b is not 2D (batched matmul)
-    # The current tiling implementation assumes b is [K, N] and broadcasts a over it.
+    # Handle batched matmul (b.ndim > 2) with tiling/threading if possible
+    # Assumption: Only tile if batch dimensions align perfectly for now.
     if b.ndim > 2:
+        if a.ndim >= 3 and b.ndim >= 3 and a.shape[:-2] == b.shape[:-2]:
+            batch_shape = a.shape[:-2]
+            B_total = int(np.prod(batch_shape))
+
+            # Heuristic: Parallelize if total work > threshold
+            # Ops per batch item: M_sub * K * N
+            total_ops = float(B_total) * a.shape[-2] * K * N
+            if executor is not None and total_ops > 1.5e8:
+                # Reshape to [B_total, M_sub, K] and [B_total, K, N_sub]
+                # Note: M_sub is a.shape[-2], N_sub is b.shape[-1]
+                a_flat = a.reshape(B_total, -1, K)
+                b_flat = b.reshape(B_total, K, -1)
+
+                if out is not None:
+                    res = out
+                else:
+                    out_shape = list(a.shape[:-1]) + [b.shape[-1]]
+                    res = np.empty(out_shape, dtype=a.dtype)
+
+                res_flat = res.reshape(B_total, -1, b.shape[-1])
+
+                def compute_batch_slice(idx):
+                    with np.errstate(all='ignore'):
+                        np.matmul(a_flat[idx], b_flat[idx], out=res_flat[idx])
+
+                # Submit all batch slices
+                futures = [executor.submit(compute_batch_slice, i) for i in range(B_total)]
+                for f in as_completed(futures):
+                    f.result()
+                return res
+
         with np.errstate(all='ignore'):
             return np.matmul(a, b, out=out)
 
