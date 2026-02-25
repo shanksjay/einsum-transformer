@@ -27,6 +27,12 @@ try:
 except ImportError:
     HAS_NUMBA = False
 
+try:
+    import cupy as cp
+    HAS_CUPY = True
+except ImportError:
+    HAS_CUPY = False
+
 
 import platform
 
@@ -70,6 +76,20 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
         if not isinstance(b, mx.array): b = mx.array(b)
         return mx.matmul(a, b)
 
+    # CuPy Path
+    if (backend == "cupy" or (backend == "auto" and HAS_CUPY and (isinstance(a, cp.ndarray) or isinstance(b, cp.ndarray)))) and HAS_CUPY:
+        if not isinstance(a, cp.ndarray): a = cp.asarray(a)
+        if not isinstance(b, cp.ndarray): b = cp.asarray(b)
+        res = cp.matmul(a, b)
+        if out is not None:
+             if isinstance(out, np.ndarray):
+                 out[:] = cp.asnumpy(res)
+                 return out
+             elif isinstance(out, cp.ndarray):
+                 out[:] = res
+                 return out
+        return cp.asnumpy(res)
+
     if block_size is None:
         block_size = _get_platform_block_size()
 
@@ -82,6 +102,46 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
     # Fallback to standard matmul if b is not 2D (batched matmul)
     # The current tiling implementation assumes b is [K, N] and broadcasts a over it.
     if b.ndim > 2:
+        # Optimization: Parallelize over batch dimension if shapes match and executor is available
+        if a.ndim >= 2 and b.ndim >= 2 and a.shape[:-2] == b.shape[:-2] and executor is not None:
+            batch_dims = a.shape[:-2]
+            B_total = int(np.prod(batch_dims))
+            M_dim, K_dim = a.shape[-2], a.shape[-1]
+            N_dim = b.shape[-1]
+
+            # Flatten batch dimensions
+            a_flat = a.reshape(B_total, M_dim, K_dim)
+            b_flat = b.reshape(B_total, K_dim, N_dim)
+
+            out_shape = list(batch_dims) + [M_dim, N_dim]
+            if out is not None and out.shape == tuple(out_shape):
+                res = out
+            else:
+                res = np.empty(out_shape, dtype=a.dtype)
+
+            res_flat = res.reshape(B_total, M_dim, N_dim)
+
+            # Check if flattened view is a copy (non-contiguous)
+            is_copy = res_flat.base is None
+
+            if is_copy:
+                 def compute_batch_ret(i):
+                     return np.matmul(a_flat[i], b_flat[i])
+
+                 futures = [executor.submit(compute_batch_ret, i) for i in range(B_total)]
+                 for i, f in enumerate(futures):
+                     idx = np.unravel_index(i, batch_dims)
+                     res[idx] = f.result()
+            else:
+                 def compute_batch_inplace(i):
+                     with np.errstate(all='ignore'):
+                        np.matmul(a_flat[i], b_flat[i], out=res_flat[i])
+
+                 futures = [executor.submit(compute_batch_inplace, i) for i in range(B_total)]
+                 for f in futures: f.result()
+
+            return res
+
         with np.errstate(all='ignore'):
             return np.matmul(a, b, out=out)
 
