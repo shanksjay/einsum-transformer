@@ -16,6 +16,12 @@ except ImportError:
     ml_dtypes = None
 
 try:
+    import cupy as cp
+    HAS_CUPY = True
+except ImportError:
+    HAS_CUPY = False
+
+try:
     import mlx.core as mx
     HAS_MLX = True
 except ImportError:
@@ -59,6 +65,22 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
     out: Optional output array (only used if shapes match)
     """
     # Force backend if specified
+    if backend == "cupy" and HAS_CUPY:
+        is_a_cp = hasattr(a, 'get') and not isinstance(a, np.ndarray)
+        is_b_cp = hasattr(b, 'get') and not isinstance(b, np.ndarray)
+        a_cp = a if is_a_cp else cp.asarray(a)
+        b_cp = b if is_b_cp else cp.asarray(b)
+
+        if out is not None and hasattr(out, 'get') and not isinstance(out, np.ndarray):
+            cp.matmul(a_cp, b_cp, out=out)
+            return out
+
+        res_cp = cp.matmul(a_cp, b_cp)
+        if out is not None:
+            res_cp.get(out=out)
+            return out
+        return res_cp.get()
+
     if backend == "mlx" and HAS_MLX:
         if not isinstance(a, mx.array): a = mx.array(a)
         if not isinstance(b, mx.array): b = mx.array(b)
@@ -82,8 +104,44 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
     # Fallback to standard matmul if b is not 2D (batched matmul)
     # The current tiling implementation assumes b is [K, N] and broadcasts a over it.
     if b.ndim > 2:
-        with np.errstate(all='ignore'):
-            return np.matmul(a, b, out=out)
+        # batched inputs
+        if executor is not None and a.shape[:-2] == b.shape[:-2]:
+            batch_shape = a.shape[:-2]
+            B_total = int(np.prod(batch_shape))
+            M_dim, K_dim = a.shape[-2], a.shape[-1]
+            K_b, N_dim = b.shape[-2], b.shape[-1]
+
+            if out is None:
+                out_shape = list(a.shape)
+                out_shape[-1] = N_dim
+                out = np.empty(out_shape, dtype=a.dtype)
+
+            # flatten batch dimensions
+            try:
+                a_flat = a.reshape(B_total, M_dim, K_dim)
+                b_flat = b.reshape(B_total, K_b, N_dim)
+                res_flat = out.reshape(B_total, M_dim, N_dim)
+            except Exception:
+                # Fallback if reshape fails (e.g. non-contiguous without copy)
+                with np.errstate(all='ignore'):
+                    return np.matmul(a, b, out=out)
+
+            def compute_batch(idx):
+                with np.errstate(all='ignore'):
+                    np.matmul(a_flat[idx], b_flat[idx], out=res_flat[idx])
+
+            futures = [executor.submit(compute_batch, idx) for idx in range(B_total)]
+            for f in as_completed(futures):
+                f.result()
+
+            if not np.shares_memory(out, res_flat):
+                # if res_flat is a copy, copy it back
+                out[...] = res_flat.reshape(out.shape)
+
+            return out
+        else:
+            with np.errstate(all='ignore'):
+                return np.matmul(a, b, out=out)
 
     # Heuristic: Parallelize if total work > threshold
     # Increased threshold to 1.5e8 (150M ops) to avoid thread overhead for medium sizes
