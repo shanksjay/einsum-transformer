@@ -55,7 +55,7 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
     a: [..., K]
     b: [K, N]
     Output: [..., N]
-    backend: "auto", "mlx", "numba", "numpy"
+    backend: "auto", "mlx", "numba", "numpy", "cupy"
     out: Optional output array (only used if shapes match)
     """
     # Force backend if specified
@@ -70,6 +70,30 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
         if not isinstance(b, mx.array): b = mx.array(b)
         return mx.matmul(a, b)
 
+    # CuPy GPU Path
+    try:
+        import cupy as cp
+        HAS_CUPY_LOCAL = True
+    except ImportError:
+        HAS_CUPY_LOCAL = False
+
+    is_a_cp = HAS_CUPY_LOCAL and isinstance(a, getattr(cp, 'ndarray', type(None)))
+    is_b_cp = HAS_CUPY_LOCAL and isinstance(b, getattr(cp, 'ndarray', type(None)))
+
+    if backend == "cupy" or (backend == "auto" and HAS_CUPY_LOCAL and (is_a_cp or is_b_cp)):
+        if HAS_CUPY_LOCAL:
+            a_gpu = a if is_a_cp else cp.asarray(a)
+            b_gpu = b if is_b_cp else cp.asarray(b)
+            if out is not None:
+                if isinstance(out, cp.ndarray):
+                    return cp.matmul(a_gpu, b_gpu, out=out)
+                else:
+                    res = cp.matmul(a_gpu, b_gpu)
+                    res.get(out=out)
+                    return out
+            else:
+                return cp.matmul(a_gpu, b_gpu)
+
     if block_size is None:
         block_size = _get_platform_block_size()
 
@@ -79,9 +103,77 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
     M = int(np.prod(a_shape[:-1]))
     N = b.shape[-1]
 
-    # Fallback to standard matmul if b is not 2D (batched matmul)
-    # The current tiling implementation assumes b is [K, N] and broadcasts a over it.
+    # Handle batched matmul (b.ndim > 2)
     if b.ndim > 2:
+        if executor is not None:
+            b_shape = b.shape
+            try:
+                if a.ndim > 1:
+                    batch_shape = np.broadcast_shapes(a_shape[:-2], b_shape[:-2])
+                else:
+                    batch_shape = b_shape[:-2]
+                B_total = np.prod(batch_shape)
+            except ValueError:
+                with np.errstate(all='ignore'):
+                    return np.matmul(a, b, out=out)
+
+            if B_total > 1:
+                M_inner = a_shape[-2] if a.ndim > 1 else 1
+                total_ops = float(B_total) * M_inner * K * N
+
+                if total_ops > 1.5e8:
+                    out_shape = list(batch_shape)
+                    if a.ndim > 1:
+                        out_shape.append(M_inner)
+                    out_shape.append(N)
+
+                    if out is not None and out.shape == tuple(out_shape) and out.dtype == a.dtype:
+                        res = out
+                    else:
+                        res = np.empty(out_shape, dtype=a.dtype)
+
+                    try:
+                        if a.ndim > 1 and a_shape[:-2] == batch_shape:
+                            a_flat = a.reshape(B_total, M_inner, K)
+                        else:
+                            a_bc = np.broadcast_to(a, tuple(batch_shape) + a_shape[-2:]) if a.ndim > 1 else np.broadcast_to(a, tuple(batch_shape) + (K,))
+                            a_flat = a_bc.reshape(B_total, M_inner, K) if a.ndim > 1 else a_bc.reshape(B_total, K)
+
+                        if b_shape[:-2] == batch_shape:
+                            b_flat = b.reshape(B_total, K, N)
+                        else:
+                            b_bc = np.broadcast_to(b, tuple(batch_shape) + b_shape[-2:])
+                            b_flat = b_bc.reshape(B_total, K, N)
+
+                        res_flat = res.reshape(B_total, M_inner, N) if a.ndim > 1 else res.reshape(B_total, N)
+                    except Exception:
+                        with np.errstate(all='ignore'):
+                            return np.matmul(a, b, out=out)
+
+                    n_workers = getattr(executor, '_max_workers', os.cpu_count() or 4)
+                    chunk_size = max(1, B_total // n_workers)
+
+                    def compute_batch(start, end):
+                        with np.errstate(all='ignore'):
+                            if a.ndim == 1:
+                                tmp = np.matmul(a_flat[start:end, np.newaxis, :], b_flat[start:end])
+                                res_flat[start:end] = tmp.squeeze(axis=1)
+                            else:
+                                np.matmul(a_flat[start:end], b_flat[start:end], out=res_flat[start:end])
+
+                    futures = []
+                    for i in range(0, B_total, chunk_size):
+                        end = min(i + chunk_size, B_total)
+                        futures.append(executor.submit(compute_batch, i, end))
+
+                    for f in futures:
+                        f.result()
+
+                    if not np.shares_memory(res, res_flat):
+                        res[...] = res_flat.reshape(res.shape)
+
+                    return res
+
         with np.errstate(all='ignore'):
             return np.matmul(a, b, out=out)
 
