@@ -82,7 +82,72 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
     # Fallback to standard matmul if b is not 2D (batched matmul)
     # The current tiling implementation assumes b is [K, N] and broadcasts a over it.
     if b.ndim > 2:
+        if executor is not None and a.ndim > 1:
+            try:
+                a_batch_shape = a.shape[:-2]
+                b_batch_shape = b.shape[:-2]
+
+                if a_batch_shape == b_batch_shape:
+                    B_total = int(np.prod(a_batch_shape))
+                    M_dim = a.shape[-2]
+                    K_dim = a.shape[-1]
+                    N_dim = b.shape[-1]
+
+                    a_flat = a.reshape(B_total, M_dim, K_dim)
+                    b_flat = b.reshape(B_total, K_dim, N_dim)
+
+                    out_shape = list(a.shape)
+                    out_shape[-1] = N_dim
+
+                    if out is not None and out.shape == tuple(out_shape) and out.dtype == a.dtype:
+                        res = out
+                    else:
+                        res = np.empty(out_shape, dtype=a.dtype)
+
+                    res_flat = res.reshape(B_total, M_dim, N_dim)
+                    shares = np.shares_memory(res, res_flat)
+
+                    num_workers = os.cpu_count() or 4
+                    chunk_size = max(1, B_total // num_workers)
+
+                    def compute_batch_chunk(start_idx, end_idx):
+                        with np.errstate(all='ignore'):
+                            np.matmul(
+                                a_flat[start_idx:end_idx],
+                                b_flat[start_idx:end_idx],
+                                out=res_flat[start_idx:end_idx]
+                            )
+
+                    futures = []
+                    for i in range(0, B_total, chunk_size):
+                        end_idx = min(i + chunk_size, B_total)
+                        futures.append(executor.submit(compute_batch_chunk, i, end_idx))
+
+                    # We wait for all explicitly rather than using as_completed to avoid
+                    # throwing exceptions prematurely before all threads finish if there's an error.
+                    for f in futures:
+                        f.result()
+
+                    if not shares:
+                        np.copyto(res, res_flat.reshape(out_shape))
+
+                    return res
+            except Exception as e:
+                # If an error occurs, we must ensure all futures have finished or we risk
+                # data corruption by writing to the same out buffer in the fallback below.
+                # However, since f.result() propagates exceptions, we might have bailed early.
+                # The safest thing is to re-raise or just let it fail rather than silently falling back
+                # and risking concurrent writes to the out buffer.
+                print(f"[ERROR] Batched tiled_matmul failed: {e}")
+                raise
+
         with np.errstate(all='ignore'):
+            if a.ndim == 2 and b.ndim == 3 and a.shape[0] == b.shape[0]:
+                res = np.matmul(a[:, np.newaxis, :], b).squeeze(1)
+                if out is not None:
+                    out[:] = res
+                    return out
+                return res
             return np.matmul(a, b, out=out)
 
     # Heuristic: Parallelize if total work > threshold
@@ -121,6 +186,9 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
     use_numba = (backend == "numba" and HAS_NUMBA) or (backend == "auto" and HAS_NUMBA)
 
     if use_numba:
+        if a_flat.dtype != b.dtype:
+            # Numba requires same dtype for @ operator
+            a_flat = a_flat.astype(b.dtype, copy=False)
         _numba_tiled_matmul(a_flat, b, res_flat, block_size)
     else:
         def compute_block(m_start, m_end, n_start, n_end):
@@ -164,7 +232,10 @@ if HAS_NUMBA:
         # Parallelize outer loops over blocks
         # Numba's parallel loop handling is often better than manual chunking
         # We iterate over blocks to keep memory locality
-        for i in nb.prange(0, M, block_size):
+        # nb.prange only supports constant step size
+        num_blocks_m = (M + block_size - 1) // block_size
+        for i_block in nb.prange(num_blocks_m):
+            i = i_block * block_size
             m_end = min(i + block_size, M)
             for j in range(0, N, block_size):
                 n_end = min(j + block_size, N)
