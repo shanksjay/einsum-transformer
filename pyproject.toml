@@ -8,6 +8,8 @@ dependencies = [
     "huggingface-hub",
     "safetensors",
     "numpy",
+    "numba>=0.64.0",
+    "scipy>=1.15.3",
 ]
 
 [project.optional-dependencies]

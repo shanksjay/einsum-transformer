@@ -25,3 +25,13 @@
 ## 2026-10-28 - Threading Overhead in SwiGLU and Attention
 **Learning:** Unconditional submission of `swiglu` and `attention` projections to `ThreadPoolExecutor` causes significant overhead (up to ~30-40%) for small operations (e.g., L=1 decoding or small batches), where the cost of task scheduling exceeds the parallelization gain.
 **Action:** Implemented `_should_parallelize(ops)` helper with a threshold of 1.5e8 ops (consistent with `tiled_matmul`) to enforce serial execution for small workloads in `swiglu` and `attention`.
+
+## 2026-10-31 - Tiled Matmul Batching and Numba Constraints
+**Learning:**
+1. When extending `tiled_matmul` to handle batched multidimensional inputs (`ndim > 2`), using `ThreadPoolExecutor` correctly requires blocking on all futures using `for f in futures: f.result()` and safely re-raising exceptions. Failing to re-raise thread errors while using `except Exception: pass` leads to a silent fallback to `np.matmul(a,b, out=out)`, creating dangerous data-races with surviving threads corrupting the `out` buffer.
+2. Numba's `nb.prange` loop parallelization strictly requires constant step sizes. Iterating via `range(0, M, block_size)` fails during JIT compilation.
+3. Numba's matrix multiplication operator (`@`) enforces strict type matching.
+**Action:**
+1. Explicitly wait and propagate threading errors in `tiled_matmul` without hiding behind a bare `except`.
+2. When applying Numba block parallelization, calculate the total block count first (e.g., `num_blocks = (M + block_size - 1) // block_size`) and iterate using `for i_block in nb.prange(num_blocks)` to guarantee a constant step size of 1.
+3. Cast operand arrays explicitly (e.g., `a.astype(b.dtype, copy=False)`) before Numba compilation execution.
