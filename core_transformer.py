@@ -27,6 +27,11 @@ try:
 except ImportError:
     HAS_NUMBA = False
 
+try:
+    import cupy as cp
+    HAS_CUPY = True
+except ImportError:
+    HAS_CUPY = False
 
 import platform
 
@@ -55,7 +60,7 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
     a: [..., K]
     b: [K, N]
     Output: [..., N]
-    backend: "auto", "mlx", "numba", "numpy"
+    backend: "auto", "mlx", "numba", "numpy", "cupy"
     out: Optional output array (only used if shapes match)
     """
     # Force backend if specified
@@ -64,11 +69,37 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
         if not isinstance(b, mx.array): b = mx.array(b)
         return mx.matmul(a, b)
 
+    if backend == "cupy" and HAS_CUPY:
+        if not isinstance(a, cp.ndarray): a = cp.asarray(a)
+        if not isinstance(b, cp.ndarray): b = cp.asarray(b)
+        if out is not None:
+            if isinstance(out, cp.ndarray):
+                return cp.matmul(a, b, out=out)
+            else:
+                res = cp.matmul(a, b)
+                res.get(out=out)
+                return out
+        else:
+            return cp.matmul(a, b)
+
     # Auto GPU Path: If MLX is available and inputs are on GPU (or we want to use it), use it directly
     if (backend == "auto" and HAS_MLX) and (isinstance(a, mx.array) or isinstance(b, mx.array)):
         if not isinstance(a, mx.array): a = mx.array(a)
         if not isinstance(b, mx.array): b = mx.array(b)
         return mx.matmul(a, b)
+
+    if (backend == "auto" and HAS_CUPY) and (isinstance(a, cp.ndarray) or isinstance(b, cp.ndarray)):
+        if not isinstance(a, cp.ndarray): a = cp.asarray(a)
+        if not isinstance(b, cp.ndarray): b = cp.asarray(b)
+        if out is not None:
+            if isinstance(out, cp.ndarray):
+                return cp.matmul(a, b, out=out)
+            else:
+                res = cp.matmul(a, b)
+                res.get(out=out)
+                return out
+        else:
+            return cp.matmul(a, b)
 
     if block_size is None:
         block_size = _get_platform_block_size()
@@ -79,9 +110,58 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
     M = int(np.prod(a_shape[:-1]))
     N = b.shape[-1]
 
-    # Fallback to standard matmul if b is not 2D (batched matmul)
-    # The current tiling implementation assumes b is [K, N] and broadcasts a over it.
+    # Handle batched matmul (b.ndim > 2) by parallelizing over the batch dimension
     if b.ndim > 2:
+        if a_shape[:-2] == b.shape[:-2]:
+            batch_shape = a_shape[:-2]
+            B_total = int(np.prod(batch_shape))
+            M_inner = a_shape[-2]
+
+            # Fallback if shapes don't match or total batch is 1
+            if B_total == 1:
+                with np.errstate(all='ignore'):
+                    return np.matmul(a, b, out=out)
+
+            if executor is not None:
+                # Reshape to [B_total, M, K] and [B_total, K, N]
+                try:
+                    a_flat = a.reshape(B_total, M_inner, K)
+                    b_flat = b.reshape(B_total, K, N)
+                except:
+                    with np.errstate(all='ignore'):
+                        return np.matmul(a, b, out=out)
+
+                out_shape = list(a_shape)
+                out_shape[-1] = N
+                if out is not None and out.shape == tuple(out_shape) and out.dtype == a.dtype:
+                    res = out
+                else:
+                    res = np.empty(out_shape, dtype=a.dtype)
+
+                res_flat = res.reshape(B_total, M_inner, N)
+
+                # Check if we can write directly to out
+                is_out_view = out is not None and np.shares_memory(res_flat, out)
+
+                futures = []
+                for i in range(B_total):
+                    def compute_batch(idx):
+                        if is_out_view:
+                            with np.errstate(all='ignore'):
+                                np.matmul(a_flat[idx], b_flat[idx], out=res_flat[idx])
+                        else:
+                            with np.errstate(all='ignore'):
+                                res_flat[idx] = np.matmul(a_flat[idx], b_flat[idx])
+                    futures.append(executor.submit(compute_batch, i))
+
+                for f in futures:
+                    f.result()
+
+                if not is_out_view and out is not None:
+                    out[:] = res
+                    return out
+
+                return res
         with np.errstate(all='ignore'):
             return np.matmul(a, b, out=out)
 
