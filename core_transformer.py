@@ -7,13 +7,19 @@ import threading
 import functools
 from pathlib import Path
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from safetensors.numpy import load_file
 from safetensors import safe_open
 try:
     import ml_dtypes
 except ImportError:
     ml_dtypes = None
+
+try:
+    import cupy as cp
+    HAS_CUPY = True
+except ImportError:
+    HAS_CUPY = False
 
 try:
     import mlx.core as mx
@@ -64,6 +70,20 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
         if not isinstance(b, mx.array): b = mx.array(b)
         return mx.matmul(a, b)
 
+    # CuPy backend logic
+    if (backend == "cupy" and HAS_CUPY) or (backend == "auto" and HAS_CUPY and (isinstance(a, cp.ndarray) or isinstance(b, cp.ndarray))):
+        if not isinstance(a, cp.ndarray): a = cp.asarray(a)
+        if not isinstance(b, cp.ndarray): b = cp.asarray(b)
+
+        if out is not None:
+            if isinstance(out, cp.ndarray):
+                return cp.matmul(a, b, out=out)
+            else:
+                # out is numpy array, compute on GPU and copy back
+                res = cp.matmul(a, b)
+                return res.get(out=out)
+        return cp.matmul(a, b)
+
     # Auto GPU Path: If MLX is available and inputs are on GPU (or we want to use it), use it directly
     if (backend == "auto" and HAS_MLX) and (isinstance(a, mx.array) or isinstance(b, mx.array)):
         if not isinstance(a, mx.array): a = mx.array(a)
@@ -79,9 +99,58 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
     M = int(np.prod(a_shape[:-1]))
     N = b.shape[-1]
 
-    # Fallback to standard matmul if b is not 2D (batched matmul)
-    # The current tiling implementation assumes b is [K, N] and broadcasts a over it.
+    # Batched matrix multiplication parallelization
     if b.ndim > 2:
+        # Check if we can parallelize over batch slices
+        # Case 1: Both have matching leading batch dims
+        if a.ndim > 2 and a.shape[:-2] == b.shape[:-2]:
+            if executor is not None:
+                batch_shape = a.shape[:-2]
+                batch_size = int(np.prod(batch_shape))
+                a_flat_batch = a.reshape(batch_size, a.shape[-2], a.shape[-1])
+                b_flat_batch = b.reshape(batch_size, b.shape[-2], b.shape[-1])
+
+                out_shape = list(a.shape)
+                out_shape[-1] = b.shape[-1]
+                if out is not None and out.shape == tuple(out_shape) and out.dtype == a.dtype:
+                    res = out
+                else:
+                    res = np.empty(out_shape, dtype=a.dtype)
+
+                res_flat_batch = res.reshape(batch_size, a.shape[-2], b.shape[-1])
+
+                def compute_batch_slice(i):
+                    with np.errstate(all='ignore'):
+                        np.matmul(a_flat_batch[i], b_flat_batch[i], out=res_flat_batch[i])
+
+                futures = [executor.submit(compute_batch_slice, i) for i in range(batch_size)]
+                for f in futures:
+                    f.result()
+                return res
+
+        # Case 2: 1D vector broadcast over a 3D tensor
+        elif a.ndim == 2 and b.ndim == 3 and executor is not None:
+            batch_size = b.shape[0]
+
+            out_shape = list(a.shape)
+            out_shape[-1] = b.shape[-1]
+            out_shape.insert(0, batch_size)
+            if out is not None and out.shape == tuple(out_shape) and out.dtype == a.dtype:
+                res = out
+            else:
+                res = np.empty(out_shape, dtype=a.dtype)
+
+            def compute_batch_slice(i):
+                with np.errstate(all='ignore'):
+                    # Expand vector to 2D for matmul, then squeeze back
+                    res[i] = np.matmul(a[:, np.newaxis, :], b[i]).squeeze(1)
+
+            futures = [executor.submit(compute_batch_slice, i) for i in range(batch_size)]
+            for f in futures:
+                f.result()
+            return res
+
+        # Fallback to standard matmul if conditions aren't met
         with np.errstate(all='ignore'):
             return np.matmul(a, b, out=out)
 
@@ -143,7 +212,7 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
                     futures.append(executor.submit(compute_block, i, m_end, j, n_end))
 
             # Wait for all tasks to complete
-            for f in as_completed(futures):
+            for f in futures:
                 f.result()
         else:
             # Serial execution
@@ -152,6 +221,9 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
                 for j in range(0, N, block_size):
                     n_end = min(j + block_size, N)
                     compute_block(i, m_end, j, n_end)
+
+    if not np.shares_memory(res, res_flat):
+        np.copyto(res, res_flat.reshape(res.shape))
 
     return res
 
@@ -972,8 +1044,8 @@ class EinsumTransformer:
             results = {}
             t_load_sum = 0
             t_qkv_sum = 0
-            for future in as_completed(futures):
-                name_key, proj_res, lora_act, t_lw, t_pt = future.result()
+            for f in futures:
+                name_key, proj_res, lora_act, t_lw, t_pt = f.result()
                 results[name_key] = proj_res
                 if lora_act and self.training:
                     self._activations[f"lora_{name_key[2:]}_{layer_idx}"] = lora_act
@@ -1078,8 +1150,8 @@ class EinsumTransformer:
             if len(b_idx) == 0: continue
             futures.append(self.executor.submit(run_expert, e, b_idx, t_idx))
 
-        for future in as_completed(futures):
-            e, b_idx, t_idx, res_expert = future.result()
+        for f in futures:
+            e, b_idx, t_idx, res_expert = f.result()
             out[b_idx, t_idx] += res_expert[0]
 
         self._stats['ffn'].append(time.time() - t0)
@@ -2125,7 +2197,7 @@ class EinsumOptimizer:
             return mem
 
         futures = [m.executor.submit(update_layer, i) for i in range(m.cfg.n_layers)]
-        for f in as_completed(futures):
+        for f in futures:
             step_memory_bytes += f.result()
 
         m._stats['opt_update'].append(time.time() - t_update)
