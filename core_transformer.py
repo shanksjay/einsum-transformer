@@ -27,6 +27,12 @@ try:
 except ImportError:
     HAS_NUMBA = False
 
+try:
+    import cupy as cp
+    HAS_CUPY = True
+except ImportError:
+    HAS_CUPY = False
+
 
 import platform
 
@@ -53,9 +59,9 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
     and improve stability. Supports parallel dispatch for chunks.
 
     a: [..., K]
-    b: [K, N]
+    b: [..., K, N]
     Output: [..., N]
-    backend: "auto", "mlx", "numba", "numpy"
+    backend: "auto", "mlx", "numba", "numpy", "cupy"
     out: Optional output array (only used if shapes match)
     """
     # Force backend if specified
@@ -70,6 +76,20 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
         if not isinstance(b, mx.array): b = mx.array(b)
         return mx.matmul(a, b)
 
+    # CuPy Path
+    if (backend == "cupy" and HAS_CUPY) or ((backend == "auto" and HAS_CUPY) and (isinstance(a, cp.ndarray) or isinstance(b, cp.ndarray))):
+        if not isinstance(a, cp.ndarray): a = cp.array(a)
+        if not isinstance(b, cp.ndarray): b = cp.array(b)
+
+        if out is not None and isinstance(out, cp.ndarray):
+            return cp.matmul(a, b, out=out)
+        else:
+            res = cp.matmul(a, b)
+            if out is not None:
+                res.get(out=out)
+                return out
+            return res
+
     if block_size is None:
         block_size = _get_platform_block_size()
 
@@ -79,11 +99,54 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
     M = int(np.prod(a_shape[:-1]))
     N = b.shape[-1]
 
-    # Fallback to standard matmul if b is not 2D (batched matmul)
-    # The current tiling implementation assumes b is [K, N] and broadcasts a over it.
+    # Handle batched b
     if b.ndim > 2:
-        with np.errstate(all='ignore'):
-            return np.matmul(a, b, out=out)
+        # If 'a' is a 1D vector and 'b' is batched, fallback to native matmul.
+        # This native implementation handles the necessary 1D broadcasting correctly,
+        # avoiding shape mismatch errors with 'out' buffers.
+        if a.ndim == 1:
+            with np.errstate(all='ignore'):
+                return np.matmul(a, b, out=out)
+
+        # To batch-process `b`, the batch dimensions of `a` and `b` must match.
+        if a_shape[:-2] != b.shape[:-2]:
+            with np.errstate(all='ignore'):
+                return np.matmul(a, b, out=out)
+
+        B_total = int(np.prod(b.shape[:-2]))
+
+        # Parallel Batched Matmul execution over flat batch dimension
+        if executor is not None:
+            a_flat_batch = a.reshape(B_total, a.shape[-2], K)
+            b_flat_batch = b.reshape(B_total, K, N)
+
+            out_shape = list(a_shape)
+            out_shape[-1] = N
+
+            if out is not None and out.shape == tuple(out_shape) and out.dtype == a.dtype:
+                res = out
+            else:
+                res = np.empty(out_shape, dtype=a.dtype)
+
+            res_flat_batch = res.reshape(B_total, a.shape[-2], N)
+
+            def compute_batch(batch_idx):
+                with np.errstate(all='ignore'):
+                    np.matmul(
+                        a_flat_batch[batch_idx],
+                        b_flat_batch[batch_idx],
+                        out=res_flat_batch[batch_idx]
+                    )
+
+            futures = [executor.submit(compute_batch, i) for i in range(B_total)]
+            # Iterate sequentially to ensure exceptions are caught
+            for f in futures:
+                f.result()
+            return res
+        else:
+            # Serial batched
+            with np.errstate(all='ignore'):
+                return np.matmul(a, b, out=out)
 
     # Heuristic: Parallelize if total work > threshold
     # Increased threshold to 1.5e8 (150M ops) to avoid thread overhead for medium sizes
@@ -143,7 +206,7 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
                     futures.append(executor.submit(compute_block, i, m_end, j, n_end))
 
             # Wait for all tasks to complete
-            for f in as_completed(futures):
+            for f in futures:
                 f.result()
         else:
             # Serial execution
@@ -152,6 +215,10 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
                 for j in range(0, N, block_size):
                     n_end = min(j + block_size, N)
                     compute_block(i, m_end, j, n_end)
+
+    if out is not None and not np.shares_memory(res, res_flat):
+        np.copyto(out, res_flat.reshape(out.shape))
+        return out
 
     return res
 
