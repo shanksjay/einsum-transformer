@@ -27,6 +27,12 @@ try:
 except ImportError:
     HAS_NUMBA = False
 
+try:
+    import cupy as cp
+    HAS_CUPY = True
+except ImportError:
+    HAS_CUPY = False
+
 
 import platform
 
@@ -55,7 +61,7 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
     a: [..., K]
     b: [K, N]
     Output: [..., N]
-    backend: "auto", "mlx", "numba", "numpy"
+    backend: "auto", "mlx", "cupy", "numba", "numpy"
     out: Optional output array (only used if shapes match)
     """
     # Force backend if specified
@@ -64,11 +70,32 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
         if not isinstance(b, mx.array): b = mx.array(b)
         return mx.matmul(a, b)
 
+    if backend == "cupy" and HAS_CUPY:
+        if not hasattr(a, 'get'): a = cp.array(a)
+        if not hasattr(b, 'get'): b = cp.array(b)
+        if out is not None and hasattr(out, 'get'):
+            return cp.matmul(a, b, out=out)
+        res = cp.matmul(a, b)
+        if out is not None:
+            return res.get(out=out)
+        return res
+
     # Auto GPU Path: If MLX is available and inputs are on GPU (or we want to use it), use it directly
     if (backend == "auto" and HAS_MLX) and (isinstance(a, mx.array) or isinstance(b, mx.array)):
         if not isinstance(a, mx.array): a = mx.array(a)
         if not isinstance(b, mx.array): b = mx.array(b)
         return mx.matmul(a, b)
+
+    # Auto GPU Path: If CuPy is available and inputs are on GPU
+    if (backend == "auto" and HAS_CUPY) and (hasattr(a, 'get') or hasattr(b, 'get')):
+        if not hasattr(a, 'get'): a = cp.array(a)
+        if not hasattr(b, 'get'): b = cp.array(b)
+        if out is not None and hasattr(out, 'get'):
+            return cp.matmul(a, b, out=out)
+        res = cp.matmul(a, b)
+        if out is not None:
+            return res.get(out=out)
+        return res
 
     if block_size is None:
         block_size = _get_platform_block_size()
@@ -82,8 +109,31 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
     # Fallback to standard matmul if b is not 2D (batched matmul)
     # The current tiling implementation assumes b is [K, N] and broadcasts a over it.
     if b.ndim > 2:
-        with np.errstate(all='ignore'):
-            return np.matmul(a, b, out=out)
+        if a.ndim == 1 or a.shape[:-2] != b.shape[:-2] or executor is None:
+            with np.errstate(all='ignore'):
+                return np.matmul(a, b, out=out)
+
+        # Batched processing using ThreadPoolExecutor
+        b_total = int(np.prod(b.shape[:-2]))
+        a_flat_batch = a.reshape(b_total, a.shape[-2], K)
+        b_flat_batch = b.reshape(b_total, K, N)
+
+        if out is None:
+            out_shape = list(a.shape)
+            out_shape[-1] = N
+            out = np.empty(out_shape, dtype=a.dtype)
+
+        out_flat_batch = out.reshape(b_total, a.shape[-2], N)
+
+        def compute_batch(i):
+            with np.errstate(all='ignore'):
+                np.matmul(a_flat_batch[i], b_flat_batch[i], out=out_flat_batch[i])
+
+        futures = [executor.submit(compute_batch, i) for i in range(b_total)]
+        for f in futures:
+            f.result()
+
+        return out
 
     # Heuristic: Parallelize if total work > threshold
     # Increased threshold to 1.5e8 (150M ops) to avoid thread overhead for medium sizes
@@ -117,6 +167,7 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
         res = np.empty(out_shape, dtype=a.dtype)
 
     res_flat = res.reshape(M, N)
+    is_copy = not np.shares_memory(res, res_flat)
 
     use_numba = (backend == "numba" and HAS_NUMBA) or (backend == "auto" and HAS_NUMBA)
 
@@ -143,7 +194,7 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
                     futures.append(executor.submit(compute_block, i, m_end, j, n_end))
 
             # Wait for all tasks to complete
-            for f in as_completed(futures):
+            for f in futures:
                 f.result()
         else:
             # Serial execution
@@ -152,6 +203,9 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
                 for j in range(0, N, block_size):
                     n_end = min(j + block_size, N)
                     compute_block(i, m_end, j, n_end)
+
+    if is_copy:
+        np.copyto(res, res_flat.reshape(res.shape))
 
     return res
 
