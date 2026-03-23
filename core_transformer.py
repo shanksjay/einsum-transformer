@@ -27,6 +27,12 @@ try:
 except ImportError:
     HAS_NUMBA = False
 
+try:
+    import cupy as cp
+    HAS_CUPY = True
+except ImportError:
+    HAS_CUPY = False
+
 
 import platform
 
@@ -55,7 +61,7 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
     a: [..., K]
     b: [K, N]
     Output: [..., N]
-    backend: "auto", "mlx", "numba", "numpy"
+    backend: "auto", "mlx", "numba", "numpy", "cupy"
     out: Optional output array (only used if shapes match)
     """
     # Force backend if specified
@@ -70,20 +76,142 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
         if not isinstance(b, mx.array): b = mx.array(b)
         return mx.matmul(a, b)
 
+    use_cupy = (backend == "cupy" and HAS_CUPY) or (
+        backend == "auto" and HAS_CUPY and (
+            (hasattr(a, '__class__') and a.__class__.__name__ == 'ndarray' and a.__class__.__module__ == 'cupy') or
+            (hasattr(b, '__class__') and b.__class__.__name__ == 'ndarray' and b.__class__.__module__ == 'cupy')
+        )
+    )
+
+    if use_cupy:
+        # Convert to cupy arrays if needed
+        is_a_cp = hasattr(a, '__class__') and a.__class__.__name__ == 'ndarray' and a.__class__.__module__ == 'cupy'
+        is_b_cp = hasattr(b, '__class__') and b.__class__.__name__ == 'ndarray' and b.__class__.__module__ == 'cupy'
+        is_out_cp = out is not None and hasattr(out, '__class__') and out.__class__.__name__ == 'ndarray' and out.__class__.__module__ == 'cupy'
+
+        if not is_a_cp:
+            a_cp = cp.array(a)
+        else:
+            a_cp = a
+        if not is_b_cp:
+            b_cp = cp.array(b)
+        else:
+            b_cp = b
+
+        if out is not None:
+            if is_out_cp:
+                cp.matmul(a_cp, b_cp, out=out)
+                return out
+            else:
+                res = cp.matmul(a_cp, b_cp)
+                res.get(out=out)
+                return out
+        else:
+            return cp.matmul(a_cp, b_cp)
+
     if block_size is None:
         block_size = _get_platform_block_size()
 
     a_shape = a.shape
+    b_shape = b.shape
     K = a_shape[-1]
+    N = b_shape[-1]
+
+    # Handle batched matmul where b is > 2D
+    if b.ndim > 2:
+        # Check if shapes are compatible for simple batch parallelization
+        # We need the batch dimensions of 'a' to broadcast correctly over 'b'
+        # or 'a' to be unbatched.
+
+        # If a is a vector (1D), let np.matmul handle the complex broadcasting
+        if a.ndim == 1:
+            with np.errstate(all='ignore'):
+                return np.matmul(a, b, out=out)
+
+        # Find the broadcasted batch shape
+        a_batch_shape = a_shape[:-2] if a.ndim > 2 else ()
+        b_batch_shape = b_shape[:-2]
+
+        try:
+            batch_shape = np.broadcast_shapes(a_batch_shape, b_batch_shape)
+        except ValueError:
+            # Incompatible batch shapes, let np.matmul fail or handle it natively
+            with np.errstate(all='ignore'):
+                return np.matmul(a, b, out=out)
+
+        # Flatten batch dimensions
+        B_total = int(np.prod(batch_shape)) if batch_shape else 1
+
+        # Ensure we can reshape a and b to (B_total, M, K) and (B_total, K, N) respectively
+        M = a_shape[-2] if a.ndim >= 2 else 1
+
+        # If we can't cleanly reshape, fallback
+        if B_total == 1 and batch_shape == ():
+            # Should not reach here if b.ndim > 2, but just in case
+            pass
+        else:
+            try:
+                # We broadcast a and b to the full batch shape before flattening
+                if a_batch_shape != batch_shape:
+                    a_br = np.broadcast_to(a, batch_shape + (M, K))
+                else:
+                    a_br = a
+
+                if b_batch_shape != batch_shape:
+                    b_br = np.broadcast_to(b, batch_shape + (K, N))
+                else:
+                    b_br = b
+
+                a_flat_batch = a_br.reshape(B_total, M, K)
+                b_flat_batch = b_br.reshape(B_total, K, N)
+            except:
+                with np.errstate(all='ignore'):
+                    return np.matmul(a, b, out=out)
+
+            out_shape = batch_shape + (M, N)
+
+            if out is not None and out.shape == tuple(out_shape) and out.dtype == a.dtype:
+                res = out
+            else:
+                res = np.empty(out_shape, dtype=a.dtype)
+
+            res_flat_batch = res.reshape(B_total, M, N)
+
+            total_ops = float(B_total) * M * K * N
+            use_parallel = executor is not None and total_ops > 1.5e8
+
+            if not use_parallel and total_ops < 2e8:
+                with np.errstate(all='ignore'):
+                    return np.matmul(a, b, out=out)
+
+            def compute_batch(b_idx):
+                with np.errstate(all='ignore'):
+                    np.matmul(
+                        a_flat_batch[b_idx],
+                        b_flat_batch[b_idx],
+                        out=res_flat_batch[b_idx]
+                    )
+
+            if use_parallel and executor is not None:
+                futures = [executor.submit(compute_batch, i) for i in range(B_total)]
+                for f in futures:
+                    f.result()  # Ensure exceptions are raised
+            else:
+                for i in range(B_total):
+                    compute_batch(i)
+
+            # If the reshaped output view is not contiguous or doesn't share memory,
+            # we need to copy back to the original `out` buffer.
+            # However, since `res_flat_batch` is just a reshape of `res`,
+            # and `res` is either a new contiguous array or `out` (which might not be contiguous),
+            # reshape might have returned a copy.
+            if out is not None and res is out and not np.shares_memory(res_flat_batch, out):
+                np.copyto(out, res_flat_batch.reshape(out.shape))
+
+            return res
+
     # Calculate M (product of leading dimensions of a)
     M = int(np.prod(a_shape[:-1]))
-    N = b.shape[-1]
-
-    # Fallback to standard matmul if b is not 2D (batched matmul)
-    # The current tiling implementation assumes b is [K, N] and broadcasts a over it.
-    if b.ndim > 2:
-        with np.errstate(all='ignore'):
-            return np.matmul(a, b, out=out)
 
     # Heuristic: Parallelize if total work > threshold
     # Increased threshold to 1.5e8 (150M ops) to avoid thread overhead for medium sizes
@@ -152,6 +280,9 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
                 for j in range(0, N, block_size):
                     n_end = min(j + block_size, N)
                     compute_block(i, m_end, j, n_end)
+
+    if out is not None and res is out and not np.shares_memory(res_flat, out):
+        np.copyto(out, res_flat.reshape(out.shape))
 
     return res
 
