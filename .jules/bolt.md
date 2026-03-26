@@ -25,3 +25,10 @@
 ## 2026-10-28 - Threading Overhead in SwiGLU and Attention
 **Learning:** Unconditional submission of `swiglu` and `attention` projections to `ThreadPoolExecutor` causes significant overhead (up to ~30-40%) for small operations (e.g., L=1 decoding or small batches), where the cost of task scheduling exceeds the parallelization gain.
 **Action:** Implemented `_should_parallelize(ops)` helper with a threshold of 1.5e8 ops (consistent with `tiled_matmul`) to enforce serial execution for small workloads in `swiglu` and `attention`.
+
+## 2025-02-28 - [Tiled Matmul Parallelization]
+**Learning:**
+Batched tile execution in standard BLAS can bottleneck thread scheduling. We discovered we can implement chunked dispatch mechanisms over batched operations inside `tiled_matmul` using `ThreadPoolExecutor`, which yields a stable multi-threading environment out of NumPy limits without losing `np.matmul` backend benefits. For thread processing of void functions, avoiding `as_completed(futures)` and directly polling `for f in futures: f.result()` prevents silent thread exception swallowing and improves memory profiling reliability.
+
+**Action:**
+Upgraded `tiled_matmul`'s `b.ndim > 2` behavior to slice batched inputs and submit to thread pools when executor arrays align dimensions. Incorporated `shares_memory` validations, contiguous chunk copies over `out`, and graceful exception handling. Added full GPU `cupy` backend acceleration routing options.

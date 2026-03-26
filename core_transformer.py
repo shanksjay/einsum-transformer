@@ -27,6 +27,12 @@ try:
 except ImportError:
     HAS_NUMBA = False
 
+try:
+    import cupy as cp
+    HAS_CUPY = True
+except ImportError:
+    HAS_CUPY = False
+
 
 import platform
 
@@ -64,11 +70,35 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
         if not isinstance(b, mx.array): b = mx.array(b)
         return mx.matmul(a, b)
 
+    if backend == "cupy" and HAS_CUPY:
+        if not isinstance(a, cp.ndarray): a = cp.array(a)
+        if not isinstance(b, cp.ndarray): b = cp.array(b)
+        if out is not None:
+            if isinstance(out, cp.ndarray):
+                return cp.matmul(a, b, out=out)
+            else:
+                res = cp.matmul(a, b)
+                res.get(out=out)
+                return out
+        return cp.matmul(a, b)
+
     # Auto GPU Path: If MLX is available and inputs are on GPU (or we want to use it), use it directly
     if (backend == "auto" and HAS_MLX) and (isinstance(a, mx.array) or isinstance(b, mx.array)):
         if not isinstance(a, mx.array): a = mx.array(a)
         if not isinstance(b, mx.array): b = mx.array(b)
         return mx.matmul(a, b)
+
+    if (backend == "auto" and HAS_CUPY) and (isinstance(a, cp.ndarray) or isinstance(b, cp.ndarray)):
+        if not isinstance(a, cp.ndarray): a = cp.array(a)
+        if not isinstance(b, cp.ndarray): b = cp.array(b)
+        if out is not None:
+            if isinstance(out, cp.ndarray):
+                return cp.matmul(a, b, out=out)
+            else:
+                res = cp.matmul(a, b)
+                res.get(out=out)
+                return out
+        return cp.matmul(a, b)
 
     if block_size is None:
         block_size = _get_platform_block_size()
@@ -79,11 +109,49 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
     M = int(np.prod(a_shape[:-1]))
     N = b.shape[-1]
 
-    # Fallback to standard matmul if b is not 2D (batched matmul)
-    # The current tiling implementation assumes b is [K, N] and broadcasts a over it.
+    # If b is batched, attempt to parallelize over the batch dimensions
     if b.ndim > 2:
-        with np.errstate(all='ignore'):
-            return np.matmul(a, b, out=out)
+        if executor is None or a.ndim == 1:
+            with np.errstate(all='ignore'):
+                return np.matmul(a, b, out=out)
+
+        if a.shape[:-2] != b.shape[:-2]:
+            with np.errstate(all='ignore'):
+                return np.matmul(a, b, out=out)
+
+        B_total = int(np.prod(b.shape[:-2]))
+
+        try:
+            a_flat_batch = a.reshape(B_total, a.shape[-2], a.shape[-1])
+            b_flat_batch = b.reshape(B_total, b.shape[-2], b.shape[-1])
+
+            out_shape = list(a.shape)
+            out_shape[-1] = N
+            if out is not None and out.shape == tuple(out_shape) and out.dtype == a.dtype:
+                res = out
+            else:
+                res = np.empty(out_shape, dtype=a.dtype)
+
+            res_flat_batch = res.reshape(B_total, a.shape[-2], N)
+
+            futures = []
+            for i in range(B_total):
+                futures.append(executor.submit(
+                    np.matmul,
+                    a_flat_batch[i],
+                    b_flat_batch[i],
+                    out=res_flat_batch[i]
+                ))
+            for f in futures:
+                f.result()
+
+            if not np.shares_memory(res_flat_batch, res):
+                np.copyto(res, res_flat_batch.reshape(res.shape))
+
+            return res
+        except ValueError:
+            with np.errstate(all='ignore'):
+                return np.matmul(a, b, out=out)
 
     # Heuristic: Parallelize if total work > threshold
     # Increased threshold to 1.5e8 (150M ops) to avoid thread overhead for medium sizes
@@ -143,7 +211,7 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
                     futures.append(executor.submit(compute_block, i, m_end, j, n_end))
 
             # Wait for all tasks to complete
-            for f in as_completed(futures):
+            for f in futures:
                 f.result()
         else:
             # Serial execution
