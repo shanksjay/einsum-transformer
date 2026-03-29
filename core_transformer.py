@@ -82,8 +82,66 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
     # Fallback to standard matmul if b is not 2D (batched matmul)
     # The current tiling implementation assumes b is [K, N] and broadcasts a over it.
     if b.ndim > 2:
-        with np.errstate(all='ignore'):
-            return np.matmul(a, b, out=out)
+        if a.ndim == 1:
+            with np.errstate(all='ignore'):
+                return np.matmul(a, b, out=out)
+
+        # Handle case where both are batched, but batch dims don't match
+        if a.ndim > 2 and a.shape[:-2] != b.shape[:-2]:
+            with np.errstate(all='ignore'):
+                return np.matmul(a, b, out=out)
+
+        if executor is None:
+            with np.errstate(all='ignore'):
+                return np.matmul(a, b, out=out)
+
+        b_batch_shape = b.shape[:-2]
+        b_batch_size = int(np.prod(b_batch_shape))
+
+        # Determine out_shape
+        out_shape = list(b_batch_shape)
+        if a.ndim >= 2:
+            out_shape += [a.shape[-2], b.shape[-1]]
+        else:
+            out_shape += [b.shape[-1]]
+
+        if out is not None and out.shape == tuple(out_shape) and out.dtype == a.dtype:
+            res = out
+        else:
+            res = np.empty(out_shape, dtype=a.dtype)
+
+        try:
+            # Reshape into flat batches to process
+            b_flat = b.reshape(b_batch_size, b.shape[-2], b.shape[-1])
+            res_flat = res.reshape(b_batch_size, res.shape[-2], res.shape[-1])
+
+            # If a is batched, we need to index it in parallel with b
+            if a.ndim > 2:
+                a_flat = a.reshape(b_batch_size, a.shape[-2], a.shape[-1])
+            else:
+                a_flat = a # Broadcast over all b batches
+
+            def compute_batch(idx):
+                if a.ndim > 2:
+                    with np.errstate(all='ignore'):
+                        np.matmul(a_flat[idx], b_flat[idx], out=res_flat[idx])
+                else:
+                    with np.errstate(all='ignore'):
+                        np.matmul(a_flat, b_flat[idx], out=res_flat[idx])
+
+            futures = [executor.submit(compute_batch, i) for i in range(b_batch_size)]
+
+            for f in as_completed(futures):
+                f.result()
+
+            # Copy memory back if reshape made a copy (non-contiguous)
+            if not np.shares_memory(res, res_flat):
+                np.copyto(res, res_flat.reshape(res.shape))
+
+            return res
+        except ValueError:
+            with np.errstate(all='ignore'):
+                return np.matmul(a, b, out=out)
 
     # Heuristic: Parallelize if total work > threshold
     # Increased threshold to 1.5e8 (150M ops) to avoid thread overhead for medium sizes
