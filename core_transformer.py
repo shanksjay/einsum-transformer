@@ -79,11 +79,78 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
     M = int(np.prod(a_shape[:-1]))
     N = b.shape[-1]
 
-    # Fallback to standard matmul if b is not 2D (batched matmul)
-    # The current tiling implementation assumes b is [K, N] and broadcasts a over it.
+    # Handle batched matmul if b is not 2D
     if b.ndim > 2:
-        with np.errstate(all='ignore'):
-            return np.matmul(a, b, out=out)
+        # Fall back to native if a is 1D to let numpy handle the broadcasting cleanly
+        if a.ndim == 1:
+            with np.errstate(all='ignore'):
+                return np.matmul(a, b, out=out)
+
+        # Fall back to native if batch dimensions don't match exactly (avoid complex manual broadcast)
+        if a.ndim > 2 and a.shape[:-2] != b.shape[:-2]:
+            with np.errstate(all='ignore'):
+                return np.matmul(a, b, out=out)
+
+        try:
+            b_shape = b.shape
+            K = b_shape[-2]
+            N = b_shape[-1]
+            # Flatten batch dimensions into one
+            B_total = int(np.prod(b_shape[:-2]))
+
+            b_flat = b.reshape(B_total, K, N)
+
+            # Broadcast or reshape 'a' to match B_total
+            if a.ndim == 2:
+                M = a.shape[0]
+                a_flat = np.broadcast_to(a, (B_total, M, K))
+            else:
+                M = a.shape[-2]
+                a_flat = a.reshape(B_total, M, K)
+
+            out_shape = list(b_shape[:-2]) + [M, N]
+
+            result_dtype = np.result_type(a, b)
+            if out is not None and out.shape == tuple(out_shape) and out.dtype == result_dtype:
+                res = out
+            else:
+                res = np.empty(out_shape, dtype=result_dtype)
+
+            res_flat = res.reshape(B_total, M, N)
+
+            if executor is not None:
+                def compute_batch_slice(start, end):
+                    with np.errstate(all='ignore'):
+                        np.matmul(
+                            a_flat[start:end],
+                            b_flat[start:end],
+                            out=res_flat[start:end]
+                        )
+
+                # Determine workers and chunks
+                # Use os.cpu_count() or 4 instead of private _max_workers to be Python version agnostic
+                num_workers = os.cpu_count() or 4
+                chunk_size = max(1, B_total // num_workers)
+                futures = []
+                for i in range(0, B_total, chunk_size):
+                    end = min(i + chunk_size, B_total)
+                    futures.append(executor.submit(compute_batch_slice, i, end))
+
+                for f in futures:
+                    f.result()
+            else:
+                with np.errstate(all='ignore'):
+                    np.matmul(a_flat, b_flat, out=res_flat)
+
+            # Ensure result is correctly written to 'out' if views got detached
+            if not np.shares_memory(res, res_flat):
+                np.copyto(res, res_flat.reshape(res.shape))
+
+            return res
+        except ValueError:
+            # Fall back on shape/view errors
+            with np.errstate(all='ignore'):
+                return np.matmul(a, b, out=out)
 
     # Heuristic: Parallelize if total work > threshold
     # Increased threshold to 1.5e8 (150M ops) to avoid thread overhead for medium sizes
