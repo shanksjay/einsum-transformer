@@ -16,6 +16,12 @@ except ImportError:
     ml_dtypes = None
 
 try:
+    import cupy as cp
+    HAS_CUPY = True
+except ImportError:
+    HAS_CUPY = False
+
+try:
     import mlx.core as mx
     HAS_MLX = True
 except ImportError:
@@ -64,11 +70,36 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
         if not isinstance(b, mx.array): b = mx.array(b)
         return mx.matmul(a, b)
 
+    if backend == "cupy" and HAS_CUPY:
+        if not isinstance(a, cp.ndarray): a = cp.asarray(a)
+        if not isinstance(b, cp.ndarray): b = cp.asarray(b)
+        if out is not None:
+            if isinstance(out, cp.ndarray):
+                return cp.matmul(a, b, out=out)
+            else:
+                res = cp.matmul(a, b)
+                res.get(out=out)
+                return out
+        return cp.matmul(a, b)
+
     # Auto GPU Path: If MLX is available and inputs are on GPU (or we want to use it), use it directly
     if (backend == "auto" and HAS_MLX) and (isinstance(a, mx.array) or isinstance(b, mx.array)):
         if not isinstance(a, mx.array): a = mx.array(a)
         if not isinstance(b, mx.array): b = mx.array(b)
         return mx.matmul(a, b)
+
+    # Auto GPU Path: If CuPy is available and inputs are on GPU
+    if (backend == "auto" and HAS_CUPY) and (isinstance(a, cp.ndarray) or isinstance(b, cp.ndarray)):
+        if not isinstance(a, cp.ndarray): a = cp.asarray(a)
+        if not isinstance(b, cp.ndarray): b = cp.asarray(b)
+        if out is not None:
+            if isinstance(out, cp.ndarray):
+                return cp.matmul(a, b, out=out)
+            else:
+                res = cp.matmul(a, b)
+                res.get(out=out)
+                return out
+        return cp.matmul(a, b)
 
     if block_size is None:
         block_size = _get_platform_block_size()
@@ -82,8 +113,64 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
     # Fallback to standard matmul if b is not 2D (batched matmul)
     # The current tiling implementation assumes b is [K, N] and broadcasts a over it.
     if b.ndim > 2:
-        with np.errstate(all='ignore'):
-            return np.matmul(a, b, out=out)
+        if a.ndim == 1:
+            with np.errstate(all='ignore'):
+                return np.matmul(a, b, out=out)
+
+        batch_shape_a = a.shape[:-2]
+        batch_shape_b = b.shape[:-2]
+        if batch_shape_a != batch_shape_b and a.ndim > 2:
+            with np.errstate(all='ignore'):
+                return np.matmul(a, b, out=out)
+
+        # Flatten batch dimensions
+        batch_size = int(np.prod(b.shape[:-2]))
+        # a is typically (..., M, K) or (M, K) broadcasted
+        M_inner = a.shape[-2]
+        K_inner = a.shape[-1]
+        N_inner = b.shape[-1]
+
+        total_ops = float(batch_size) * M_inner * K_inner * N_inner
+        if executor is not None and total_ops > 1.5e8:
+            out_shape = list(b.shape)
+            if a.ndim > 2:
+                out_shape = list(np.broadcast_shapes(a.shape[:-2], b.shape[:-2])) + [M_inner, N_inner]
+            else:
+                out_shape[-2] = M_inner
+
+            if out is not None and out.shape == tuple(out_shape) and out.dtype == a.dtype:
+                res = out
+            else:
+                res = np.empty(out_shape, dtype=np.result_type(a, b))
+
+            res_flat = res.reshape(batch_size, M_inner, N_inner)
+            a_flat = a.reshape(-1, M_inner, K_inner)
+            b_flat = b.reshape(batch_size, K_inner, N_inner)
+
+            # If a is not batched, it has shape (M_inner, K_inner), so a_flat has shape (1, M_inner, K_inner)
+            if a.ndim == 2:
+                a_flat = np.broadcast_to(a_flat, (batch_size, M_inner, K_inner))
+
+            def compute_batch_item(idx):
+                with np.errstate(all='ignore'):
+                    np.matmul(a_flat[idx], b_flat[idx], out=res_flat[idx])
+
+            futures = [executor.submit(compute_batch_item, i) for i in range(batch_size)]
+            for f in futures:
+                f.result()
+
+            try:
+                res_reshaped = res_flat.reshape(out_shape)
+                if out is not None and not np.shares_memory(res_reshaped, out):
+                    np.copyto(out, res_reshaped)
+                return res_reshaped
+            except ValueError:
+                with np.errstate(all='ignore'):
+                    return np.matmul(a, b, out=out)
+
+        else:
+            with np.errstate(all='ignore'):
+                return np.matmul(a, b, out=out)
 
     # Heuristic: Parallelize if total work > threshold
     # Increased threshold to 1.5e8 (150M ops) to avoid thread overhead for medium sizes
