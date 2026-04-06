@@ -82,8 +82,70 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
     # Fallback to standard matmul if b is not 2D (batched matmul)
     # The current tiling implementation assumes b is [K, N] and broadcasts a over it.
     if b.ndim > 2:
-        with np.errstate(all='ignore'):
-            return np.matmul(a, b, out=out)
+        # If a is a 1D vector, fall back to native matmul instead of complex broadcasting
+        if a.ndim == 1:
+            with np.errstate(all='ignore'):
+                return np.matmul(a, b, out=out)
+
+        # If both are batched and their batch dims are mismatched, fall back to native
+        if a.ndim > 2 and b.ndim > 2 and a.shape[:-2] != b.shape[:-2]:
+            with np.errstate(all='ignore'):
+                return np.matmul(a, b, out=out)
+
+        # Ensure we have an executor for parallelization, else native
+        if executor is None:
+            with np.errstate(all='ignore'):
+                return np.matmul(a, b, out=out)
+
+        try:
+            # Broadcast the batch dimensions
+            batch_shape = np.broadcast_shapes(a.shape[:-2], b.shape[:-2])
+            B_total = int(np.prod(batch_shape))
+
+            # Extract inner dims
+            M_inner, K = a.shape[-2], a.shape[-1]
+            K_b, N_inner = b.shape[-2], b.shape[-1]
+
+            out_dtype = np.result_type(a, b)
+            out_shape = list(batch_shape) + [M_inner, N_inner]
+
+            # Allocate or use provided output buffer
+            if out is not None and out.shape == tuple(out_shape) and out.dtype == out_dtype:
+                res = out
+            else:
+                res = np.empty(out_shape, dtype=out_dtype)
+
+            # Broadcast input arrays to matching full shapes before flattening
+            a_b = np.broadcast_to(a, list(batch_shape) + [M_inner, K])
+            b_b = np.broadcast_to(b, list(batch_shape) + [K_b, N_inner])
+
+            # Flatten batch dimension
+            a_flat = a_b.reshape(B_total, M_inner, K)
+            b_flat = b_b.reshape(B_total, K_b, N_inner)
+            res_flat = res.reshape(B_total, M_inner, N_inner)
+
+            # Helper for thread mapping
+            def compute_batch(idx):
+                with np.errstate(all='ignore'):
+                    np.matmul(a_flat[idx], b_flat[idx], out=res_flat[idx])
+
+            # Map batched tasks onto the executor
+            futures = [executor.submit(compute_batch, i) for i in range(B_total)]
+
+            # Iterate to catch thread exceptions
+            for f in futures:
+                f.result()
+
+            # Copy back if the reshape created a disconnected array due to strides
+            if not np.shares_memory(res, res_flat):
+                np.copyto(res, res_flat.reshape(res.shape))
+
+            return res
+
+        except ValueError:
+            # If broadcast_shapes or reshape fails (e.g., non-contiguous), fall back safely
+            with np.errstate(all='ignore'):
+                return np.matmul(a, b, out=out)
 
     # Heuristic: Parallelize if total work > threshold
     # Increased threshold to 1.5e8 (150M ops) to avoid thread overhead for medium sizes
