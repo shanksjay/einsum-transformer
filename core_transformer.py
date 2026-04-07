@@ -16,6 +16,12 @@ except ImportError:
     ml_dtypes = None
 
 try:
+    import cupy as cp
+    HAS_CUPY = True
+except ImportError:
+    HAS_CUPY = False
+
+try:
     import mlx.core as mx
     HAS_MLX = True
 except ImportError:
@@ -53,11 +59,43 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
     and improve stability. Supports parallel dispatch for chunks.
 
     a: [..., K]
-    b: [K, N]
+    b: [K, N] or batched [..., K, N]
     Output: [..., N]
-    backend: "auto", "mlx", "numba", "numpy"
+    backend: "auto", "cupy", "mlx", "numba", "numpy"
     out: Optional output array (only used if shapes match)
     """
+    # Force cupy backend if specified
+    if backend == "cupy" and HAS_CUPY:
+        is_cp_a, is_cp_b = isinstance(a, cp.ndarray), isinstance(b, cp.ndarray)
+        if not is_cp_a: a = cp.asarray(a)
+        if not is_cp_b: b = cp.asarray(b)
+
+        if out is not None and isinstance(out, cp.ndarray):
+            cp.matmul(a, b, out=out)
+            return out
+        else:
+            res = cp.matmul(a, b)
+            if out is not None:
+                res.get(out=out)
+                return out
+            return res
+
+    # Auto GPU Path for Cupy
+    if backend == "auto" and HAS_CUPY and (isinstance(a, cp.ndarray) or isinstance(b, cp.ndarray)):
+        is_cp_a, is_cp_b = isinstance(a, cp.ndarray), isinstance(b, cp.ndarray)
+        if not is_cp_a: a = cp.asarray(a)
+        if not is_cp_b: b = cp.asarray(b)
+
+        if out is not None and isinstance(out, cp.ndarray):
+            cp.matmul(a, b, out=out)
+            return out
+        else:
+            res = cp.matmul(a, b)
+            if out is not None:
+                res.get(out=out)
+                return out
+            return res
+
     # Force backend if specified
     if backend == "mlx" and HAS_MLX:
         if not isinstance(a, mx.array): a = mx.array(a)
@@ -74,16 +112,69 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
         block_size = _get_platform_block_size()
 
     a_shape = a.shape
+    b_shape = b.shape
     K = a_shape[-1]
+
+    # Check if we need to do batched tiling via ThreadPoolExecutor
+    if b.ndim > 2:
+        if a.ndim == 1:
+            with np.errstate(all='ignore'):
+                return np.matmul(a, b, out=out)
+
+        # If executor is available and batch shapes match, parallelize over batch dimension
+        if executor is not None and a_shape[:-2] == b_shape[:-2]:
+            B_total = int(np.prod(a_shape[:-2]))
+            M_inner = a_shape[-2]
+            N_inner = b_shape[-1]
+
+            try:
+                a_flat_batch = a.reshape(B_total, M_inner, K)
+                b_flat_batch = b.reshape(B_total, K, N_inner)
+            except ValueError:
+                with np.errstate(all='ignore'):
+                    return np.matmul(a, b, out=out)
+
+            out_shape = list(np.broadcast_shapes(a_shape[:-2], b_shape[:-2]))
+            out_shape.extend([M_inner, N_inner])
+
+            if out is not None and out.shape == tuple(out_shape):
+                res = out
+            else:
+                res = np.empty(out_shape, dtype=np.result_type(a, b))
+
+            try:
+                res_flat_batch = res.reshape(B_total, M_inner, N_inner)
+            except ValueError:
+                with np.errstate(all='ignore'):
+                    return np.matmul(a, b, out=out)
+
+            def compute_batch_slice(idx):
+                with np.errstate(all='ignore'):
+                    np.matmul(
+                        a_flat_batch[idx],
+                        b_flat_batch[idx],
+                        out=res_flat_batch[idx]
+                    )
+
+            futures = [executor.submit(compute_batch_slice, i) for i in range(B_total)]
+            for f in futures:
+                f.result()
+
+            if out is not None and not np.shares_memory(res, res_flat_batch):
+                try:
+                    np.copyto(out, res_flat_batch.reshape(out.shape))
+                except ValueError:
+                    with np.errstate(all='ignore'):
+                        return np.matmul(a, b, out=out)
+
+            return res
+        else:
+            with np.errstate(all='ignore'):
+                return np.matmul(a, b, out=out)
+
     # Calculate M (product of leading dimensions of a)
     M = int(np.prod(a_shape[:-1]))
     N = b.shape[-1]
-
-    # Fallback to standard matmul if b is not 2D (batched matmul)
-    # The current tiling implementation assumes b is [K, N] and broadcasts a over it.
-    if b.ndim > 2:
-        with np.errstate(all='ignore'):
-            return np.matmul(a, b, out=out)
 
     # Heuristic: Parallelize if total work > threshold
     # Increased threshold to 1.5e8 (150M ops) to avoid thread overhead for medium sizes
@@ -111,12 +202,16 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
     out_shape = list(a_shape)
     out_shape[-1] = N
 
-    if out is not None and out.shape == tuple(out_shape) and out.dtype == a.dtype:
+    if out is not None and out.shape == tuple(out_shape):
         res = out
     else:
-        res = np.empty(out_shape, dtype=a.dtype)
+        res = np.empty(out_shape, dtype=np.result_type(a, b))
 
-    res_flat = res.reshape(M, N)
+    try:
+        res_flat = res.reshape(M, N)
+    except ValueError:
+        with np.errstate(all='ignore'):
+            return np.matmul(a, b, out=out)
 
     use_numba = (backend == "numba" and HAS_NUMBA) or (backend == "auto" and HAS_NUMBA)
 
@@ -152,6 +247,13 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
                 for j in range(0, N, block_size):
                     n_end = min(j + block_size, N)
                     compute_block(i, m_end, j, n_end)
+
+    if out is not None and not np.shares_memory(res, res_flat):
+        try:
+            np.copyto(out, res_flat.reshape(out.shape))
+        except ValueError:
+            with np.errstate(all='ignore'):
+                return np.matmul(a, b, out=out)
 
     return res
 
