@@ -16,6 +16,12 @@ except ImportError:
     ml_dtypes = None
 
 try:
+    import cupy as cp
+    HAS_CUPY = True
+except ImportError:
+    HAS_CUPY = False
+
+try:
     import mlx.core as mx
     HAS_MLX = True
 except ImportError:
@@ -59,16 +65,28 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
     out: Optional output array (only used if shapes match)
     """
     # Force backend if specified
+    if backend == "cupy" and HAS_CUPY:
+        a_cp = cp.asarray(a) if not hasattr(a, 'get') else a
+        b_cp = cp.asarray(b) if not hasattr(b, 'get') else b
+        res = cp.matmul(a_cp, b_cp, out=out if hasattr(out, 'get') else None)
+        return res if hasattr(out, 'get') else res.get(out=out)
+
     if backend == "mlx" and HAS_MLX:
-        if not isinstance(a, mx.array): a = mx.array(a)
-        if not isinstance(b, mx.array): b = mx.array(b)
+        if not hasattr(a, 'item'): a = mx.array(a)
+        if not hasattr(b, 'item'): b = mx.array(b)
         return mx.matmul(a, b)
 
-    # Auto GPU Path: If MLX is available and inputs are on GPU (or we want to use it), use it directly
-    if (backend == "auto" and HAS_MLX) and (isinstance(a, mx.array) or isinstance(b, mx.array)):
-        if not isinstance(a, mx.array): a = mx.array(a)
-        if not isinstance(b, mx.array): b = mx.array(b)
-        return mx.matmul(a, b)
+    # Auto GPU Path
+    if backend == "auto":
+        if HAS_CUPY and (hasattr(a, 'get') or hasattr(b, 'get')):
+            a_cp = cp.asarray(a) if not hasattr(a, 'get') else a
+            b_cp = cp.asarray(b) if not hasattr(b, 'get') else b
+            res = cp.matmul(a_cp, b_cp, out=out if hasattr(out, 'get') else None)
+            return res if hasattr(out, 'get') else res.get(out=out)
+        elif HAS_MLX and (isinstance(a, mx.array) or isinstance(b, mx.array)):
+            if not isinstance(a, mx.array): a = mx.array(a)
+            if not isinstance(b, mx.array): b = mx.array(b)
+            return mx.matmul(a, b)
 
     if block_size is None:
         block_size = _get_platform_block_size()
@@ -79,11 +97,46 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
     M = int(np.prod(a_shape[:-1]))
     N = b.shape[-1]
 
-    # Fallback to standard matmul if b is not 2D (batched matmul)
-    # The current tiling implementation assumes b is [K, N] and broadcasts a over it.
+    # Batched Matmul support
     if b.ndim > 2:
-        with np.errstate(all='ignore'):
-            return np.matmul(a, b, out=out)
+        # If batch dimensions don't match or 'a' is 1D (can't easily be broadcasted cleanly here without more logic),
+        # or we don't have an executor, fall back to BLAS which is highly optimized for this.
+        if a.ndim == 1 or a.shape[:-2] != b.shape[:-2] or executor is None:
+            with np.errstate(all='ignore'):
+                return np.matmul(a, b, out=out)
+
+        # Parallelize over the flattened batch dimension
+        batch_shape = a.shape[:-2]
+        B_total = int(np.prod(batch_shape))
+        M_inner, K_inner = a.shape[-2], a.shape[-1]
+        N_inner = b.shape[-1]
+
+        # Allocate output if needed
+        if out is None:
+            # Determine output shape by broadcasting batch dimensions
+            # Since we enforced a.shape[:-2] == b.shape[:-2], out_shape is straightforward
+            out_shape = list(batch_shape) + [M_inner, N_inner]
+            out = np.empty(out_shape, dtype=np.result_type(a, b))
+
+        # Flatten batch dimensions for iteration
+        a_flat_batch = a.reshape(B_total, M_inner, K_inner)
+        b_flat_batch = b.reshape(B_total, K_inner, N_inner)
+        out_flat_batch = out.reshape(B_total, M_inner, N_inner)
+
+        def compute_batch_item(idx):
+            with np.errstate(all='ignore'):
+                np.matmul(a_flat_batch[idx], b_flat_batch[idx], out=out_flat_batch[idx])
+
+        # Heuristic for multi-threading over batch dimension
+        if B_total > 1 and float(B_total) * M_inner * K_inner * N_inner > 1.5e8:
+            futures = [executor.submit(compute_batch_item, i) for i in range(B_total)]
+            for f in as_completed(futures):
+                f.result()
+        else:
+            for i in range(B_total):
+                compute_batch_item(i)
+
+        return out
 
     # Heuristic: Parallelize if total work > threshold
     # Increased threshold to 1.5e8 (150M ops) to avoid thread overhead for medium sizes
