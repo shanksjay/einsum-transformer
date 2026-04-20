@@ -22,6 +22,12 @@ except ImportError:
     HAS_MLX = False
 
 try:
+    import cupy as cp
+    HAS_CUPY = True
+except ImportError:
+    HAS_CUPY = False
+
+try:
     import numba as nb
     HAS_NUMBA = True
 except ImportError:
@@ -64,6 +70,26 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
         if not isinstance(b, mx.array): b = mx.array(b)
         return mx.matmul(a, b)
 
+    # Auto GPU Path: CuPy
+    if backend == "cupy" or (backend == "auto" and HAS_CUPY and (hasattr(a, 'get') or hasattr(b, 'get'))):
+        if not hasattr(a, 'get'):
+            a = cp.asarray(a)
+        if not hasattr(b, 'get'):
+            b = cp.asarray(b)
+
+        # If output buffer is a cupy array, do in-place directly on GPU
+        if hasattr(out, 'get'):
+            return cp.matmul(a, b, out=out)
+
+        # Otherwise compute on GPU
+        res = cp.matmul(a, b)
+
+        # If out is provided (e.g. numpy array), copy back
+        if out is not None:
+            res.get(out=out)
+            return out
+        return res
+
     # Auto GPU Path: If MLX is available and inputs are on GPU (or we want to use it), use it directly
     if (backend == "auto" and HAS_MLX) and (isinstance(a, mx.array) or isinstance(b, mx.array)):
         if not isinstance(a, mx.array): a = mx.array(a)
@@ -79,11 +105,61 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
     M = int(np.prod(a_shape[:-1]))
     N = b.shape[-1]
 
-    # Fallback to standard matmul if b is not 2D (batched matmul)
-    # The current tiling implementation assumes b is [K, N] and broadcasts a over it.
+    # Batched Matmul Multi-Threading Support
     if b.ndim > 2:
-        with np.errstate(all='ignore'):
-            return np.matmul(a, b, out=out)
+        # Fallback to standard matmul if 1D a or mismatched batch shapes
+        if a.ndim == 1 or a.shape[:-2] != b.shape[:-2]:
+            with np.errstate(all='ignore'):
+                return np.matmul(a, b, out=out)
+
+        # Heuristic: Parallelize if total ops > 1.5e8
+        total_ops = float(np.prod(a.shape[:-2])) * a.shape[-2] * K * N
+        if total_ops < 1.5e8:
+            with np.errstate(all='ignore'):
+                return np.matmul(a, b, out=out)
+
+        batch_shape = a.shape[:-2]
+        B_total = int(np.prod(batch_shape))
+        M_inner = a.shape[-2]
+
+        a_flat = a.reshape(B_total, M_inner, K)
+        b_flat = b.reshape(B_total, K, N)
+
+        if out is None:
+            out_dtype = np.result_type(a, b)
+            out = np.empty((*batch_shape, M_inner, N), dtype=out_dtype)
+
+        out_flat = out.reshape(B_total, M_inner, N)
+
+        num_workers = os.cpu_count() or 4
+        chunk_size = max(1, B_total // num_workers)
+
+        def _batch_matmul_chunk(start, end):
+            with np.errstate(all='ignore'):
+                np.matmul(a_flat[start:end], b_flat[start:end], out=out_flat[start:end])
+
+        if executor is not None:
+            futures = []
+            for i in range(0, B_total, chunk_size):
+                end = min(i + chunk_size, B_total)
+                futures.append(executor.submit(_batch_matmul_chunk, i, end))
+            for f in as_completed(futures):
+                f.result()
+        else:
+            # Create temporary executor if none provided but parallelization is requested
+            with ThreadPoolExecutor(max_workers=num_workers) as temp_exec:
+                futures = []
+                for i in range(0, B_total, chunk_size):
+                    end = min(i + chunk_size, B_total)
+                    futures.append(temp_exec.submit(_batch_matmul_chunk, i, end))
+                for f in as_completed(futures):
+                    f.result()
+
+        # Explicit copy if out is non-contiguous
+        if out is not None and not np.shares_memory(out, out_flat):
+            np.copyto(out, out_flat.reshape(out.shape))
+
+        return out
 
     # Heuristic: Parallelize if total work > threshold
     # Increased threshold to 1.5e8 (150M ops) to avoid thread overhead for medium sizes
