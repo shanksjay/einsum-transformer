@@ -22,6 +22,12 @@ except ImportError:
     HAS_MLX = False
 
 try:
+    import cupy as cp
+    HAS_CUPY = True
+except ImportError:
+    HAS_CUPY = False
+
+try:
     import numba as nb
     HAS_NUMBA = True
 except ImportError:
@@ -64,11 +70,45 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
         if not isinstance(b, mx.array): b = mx.array(b)
         return mx.matmul(a, b)
 
+    # Force backend if specified for CuPy
+    if backend == "cupy" and HAS_CUPY:
+        if not hasattr(a, 'get'): a = cp.array(a)
+        if not hasattr(b, 'get'): b = cp.array(b)
+
+        # Determine output strategy
+        if hasattr(out, 'get'):
+            # In-place on GPU
+            cp.matmul(a, b, out=out)
+            return out
+        elif out is not None:
+            # Compute on GPU, copy back to CPU array
+            res = cp.matmul(a, b)
+            res.get(out=out)
+            return out
+        else:
+            # Return GPU array
+            return cp.matmul(a, b)
+
     # Auto GPU Path: If MLX is available and inputs are on GPU (or we want to use it), use it directly
     if (backend == "auto" and HAS_MLX) and (isinstance(a, mx.array) or isinstance(b, mx.array)):
         if not isinstance(a, mx.array): a = mx.array(a)
         if not isinstance(b, mx.array): b = mx.array(b)
         return mx.matmul(a, b)
+
+    # Auto GPU Path for CuPy
+    if (backend == "auto" and HAS_CUPY) and (hasattr(a, 'get') or hasattr(b, 'get')):
+        if not hasattr(a, 'get'): a = cp.array(a)
+        if not hasattr(b, 'get'): b = cp.array(b)
+
+        if hasattr(out, 'get'):
+            cp.matmul(a, b, out=out)
+            return out
+        elif out is not None:
+            res = cp.matmul(a, b)
+            res.get(out=out)
+            return out
+        else:
+            return cp.matmul(a, b)
 
     if block_size is None:
         block_size = _get_platform_block_size()
@@ -79,11 +119,76 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
     M = int(np.prod(a_shape[:-1]))
     N = b.shape[-1]
 
-    # Fallback to standard matmul if b is not 2D (batched matmul)
-    # The current tiling implementation assumes b is [K, N] and broadcasts a over it.
+    # Batched Matmul handling using ThreadPoolExecutor
     if b.ndim > 2:
-        with np.errstate(all='ignore'):
-            return np.matmul(a, b, out=out)
+        if a.ndim == 1:
+            # 1D vector fallback
+            with np.errstate(all='ignore'):
+                return np.matmul(a, b, out=out)
+
+        if executor is None:
+            # Serial fallback
+            with np.errstate(all='ignore'):
+                return np.matmul(a, b, out=out)
+
+        try:
+            batch_shape = np.broadcast_shapes(a.shape[:-2], b.shape[:-2])
+            B_total = int(np.prod(batch_shape))
+        except ValueError:
+            with np.errstate(all='ignore'):
+                return np.matmul(a, b, out=out)
+
+        M_inner = a.shape[-2]
+        N_inner = b.shape[-1]
+        out_shape = list(batch_shape) + [M_inner, N_inner]
+
+        target_dtype = np.result_type(a, b)
+
+        if out is not None and out.shape == tuple(out_shape) and out.dtype == target_dtype:
+            res = out
+        else:
+            res = np.empty(out_shape, dtype=target_dtype)
+
+        try:
+            res_reshaped = res.reshape(B_total, M_inner, N_inner)
+
+            if a.shape[:-2] != tuple(batch_shape):
+                a_bcast = np.broadcast_to(a, list(batch_shape) + list(a.shape[-2:]))
+                a_flat = a_bcast.reshape(B_total, M_inner, a.shape[-1])
+            else:
+                a_flat = a.reshape(B_total, M_inner, a.shape[-1])
+
+            if b.shape[:-2] != tuple(batch_shape):
+                b_bcast = np.broadcast_to(b, list(batch_shape) + list(b.shape[-2:]))
+                b_flat = b_bcast.reshape(B_total, b.shape[-2], N_inner)
+            else:
+                b_flat = b.reshape(B_total, b.shape[-2], N_inner)
+
+        except ValueError:
+            # Fallback for non-contiguous array shaping issues
+            with np.errstate(all='ignore'):
+                return np.matmul(a, b, out=out)
+
+        num_workers = os.cpu_count() or 4
+        chunk_size = max(1, (B_total + num_workers - 1) // num_workers)
+
+        def compute_batch_slice(start_idx, end_idx):
+            with np.errstate(all='ignore'):
+                for i in range(start_idx, end_idx):
+                    np.matmul(a_flat[i], b_flat[i], out=res_reshaped[i])
+
+        futures = []
+        for i in range(0, B_total, chunk_size):
+            end = min(i + chunk_size, B_total)
+            futures.append(executor.submit(compute_batch_slice, i, end))
+
+        for f in futures:
+            f.result()
+
+        if out is not None and not np.shares_memory(res, res_reshaped):
+            np.copyto(out, res_reshaped.reshape(out.shape))
+
+        return res
 
     # Heuristic: Parallelize if total work > threshold
     # Increased threshold to 1.5e8 (150M ops) to avoid thread overhead for medium sizes
