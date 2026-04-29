@@ -79,11 +79,67 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
     M = int(np.prod(a_shape[:-1]))
     N = b.shape[-1]
 
-    # Fallback to standard matmul if b is not 2D (batched matmul)
-    # The current tiling implementation assumes b is [K, N] and broadcasts a over it.
     if b.ndim > 2:
-        with np.errstate(all='ignore'):
-            return np.matmul(a, b, out=out)
+        if a.ndim == 1:
+            with np.errstate(all='ignore'):
+                return np.matmul(a, b, out=out)
+
+        try:
+            batch_shape = np.broadcast_shapes(a.shape[:-2] if a.ndim > 2 else (), b.shape[:-2])
+        except ValueError:
+            with np.errstate(all='ignore'):
+                return np.matmul(a, b, out=out)
+
+        if a.ndim > 2 and a.shape[:-2] != batch_shape:
+            with np.errstate(all='ignore'):
+                return np.matmul(a, b, out=out)
+        if b.shape[:-2] != batch_shape:
+            with np.errstate(all='ignore'):
+                return np.matmul(a, b, out=out)
+
+        M_inner = a.shape[-2]
+        N_inner = b.shape[-1]
+        B_total = int(np.prod(batch_shape)) if batch_shape else 1
+
+        total_ops = float(B_total) * M_inner * K * N_inner
+        use_parallel = executor is not None and total_ops > 1.5e8
+
+        if not use_parallel:
+            with np.errstate(all='ignore'):
+                return np.matmul(a, b, out=out)
+
+        out_shape = list(batch_shape) + [M_inner, N_inner]
+        out_dtype = np.result_type(a, b)
+
+        if out is not None and out.shape == tuple(out_shape) and out.dtype == out_dtype:
+            res = out
+        else:
+            res = np.empty(out_shape, dtype=out_dtype)
+
+        try:
+            b_flat = b.reshape(B_total, K, N_inner)
+            res_flat = res.reshape(B_total, M_inner, N_inner)
+            if a.ndim > 2:
+                a_flat = a.reshape(B_total, M_inner, K)
+
+            futures = []
+            for i in range(B_total):
+                if a.ndim > 2:
+                    futures.append(executor.submit(np.matmul, a_flat[i], b_flat[i], out=res_flat[i]))
+                else:
+                    futures.append(executor.submit(np.matmul, a, b_flat[i], out=res_flat[i]))
+
+            for f in futures:
+                f.result()
+
+            if not np.shares_memory(res, res_flat):
+                np.copyto(res, res_flat.reshape(res.shape))
+
+            return res
+
+        except ValueError:
+            with np.errstate(all='ignore'):
+                return np.matmul(a, b, out=out)
 
     # Heuristic: Parallelize if total work > threshold
     # Increased threshold to 1.5e8 (150M ops) to avoid thread overhead for medium sizes
