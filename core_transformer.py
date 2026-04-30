@@ -27,6 +27,11 @@ try:
 except ImportError:
     HAS_NUMBA = False
 
+try:
+    import cupy as cp
+    HAS_CUPY = True
+except ImportError:
+    HAS_CUPY = False
 
 import platform
 
@@ -79,11 +84,96 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
     M = int(np.prod(a_shape[:-1]))
     N = b.shape[-1]
 
-    # Fallback to standard matmul if b is not 2D (batched matmul)
-    # The current tiling implementation assumes b is [K, N] and broadcasts a over it.
+    if backend == "cupy" and HAS_CUPY:
+        a_gpu = cp.asarray(a) if not hasattr(a, 'get') else a
+        b_gpu = cp.asarray(b) if not hasattr(b, 'get') else b
+        if out is not None and hasattr(out, 'get'):
+            cp.matmul(a_gpu, b_gpu, out=out)
+            return out
+        else:
+            res = cp.matmul(a_gpu, b_gpu)
+            if out is not None:
+                res.get(out=out)
+                return out
+            return res
+
+    if (backend == "auto" and HAS_CUPY) and (hasattr(a, 'get') or hasattr(b, 'get')):
+        a_gpu = a if hasattr(a, 'get') else cp.asarray(a)
+        b_gpu = b if hasattr(b, 'get') else cp.asarray(b)
+        if out is not None and hasattr(out, 'get'):
+            cp.matmul(a_gpu, b_gpu, out=out)
+            return out
+        else:
+            res = cp.matmul(a_gpu, b_gpu)
+            if out is not None:
+                res.get(out=out)
+                return out
+            return res
+
     if b.ndim > 2:
-        with np.errstate(all='ignore'):
-            return np.matmul(a, b, out=out)
+        if a.ndim == 1:
+            with np.errstate(all='ignore'):
+                return np.matmul(a, b, out=out)
+
+        a_batch_shape = a.shape[:-2] if a.ndim > 2 else tuple()
+        b_batch_shape = b.shape[:-2]
+
+        if a.ndim > 2 and a_batch_shape != b_batch_shape:
+            with np.errstate(all='ignore'):
+                return np.matmul(a, b, out=out)
+
+        M_inner = int(np.prod(a.shape[:-1]))
+        total_ops = float(np.prod(b.shape[:-2])) * M_inner * K * N
+
+        if executor is not None and total_ops > 1.5e8:
+            try:
+                b_flat = b.reshape(-1, b.shape[-2], b.shape[-1])
+                B_total = b_flat.shape[0]
+
+                if a.ndim > 2:
+                    a_flat = a.reshape(-1, a.shape[-2], a.shape[-1])
+                else:
+                    a_flat = a
+
+                batch_shape = np.broadcast_shapes(a_batch_shape, b_batch_shape)
+                inner_M = a.shape[-2] if a.ndim > 2 else a.shape[0]
+                out_shape = batch_shape + (inner_M, N)
+
+                if out is not None and out.shape == tuple(out_shape):
+                    res = out
+                else:
+                    res = np.empty(out_shape, dtype=np.result_type(a, b))
+
+                res_flat = res.reshape(B_total, res.shape[-2], res.shape[-1])
+
+                workers = os.cpu_count() or 4
+                chunk_size = max(1, B_total // workers)
+
+                def compute_batch(start, end):
+                    with np.errstate(all='ignore'):
+                        if a.ndim > 2:
+                            np.matmul(a_flat[start:end], b_flat[start:end], out=res_flat[start:end])
+                        else:
+                            np.matmul(a, b_flat[start:end], out=res_flat[start:end])
+
+                futures = []
+                for i in range(0, B_total, chunk_size):
+                    end = min(i + chunk_size, B_total)
+                    futures.append(executor.submit(compute_batch, i, end))
+
+                for f in as_completed(futures):
+                    f.result()
+
+                if not np.shares_memory(res, res_flat):
+                    np.copyto(res, res_flat.reshape(out_shape))
+
+                return res
+            except ValueError:
+                with np.errstate(all='ignore'):
+                    return np.matmul(a, b, out=out)
+        else:
+            with np.errstate(all='ignore'):
+                return np.matmul(a, b, out=out)
 
     # Heuristic: Parallelize if total work > threshold
     # Increased threshold to 1.5e8 (150M ops) to avoid thread overhead for medium sizes
