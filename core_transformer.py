@@ -16,6 +16,12 @@ except ImportError:
     ml_dtypes = None
 
 try:
+    import cupy as cp
+    HAS_CUPY = True
+except ImportError:
+    HAS_CUPY = False
+
+try:
     import mlx.core as mx
     HAS_MLX = True
 except ImportError:
@@ -55,9 +61,35 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
     a: [..., K]
     b: [K, N]
     Output: [..., N]
-    backend: "auto", "mlx", "numba", "numpy"
+    backend: "auto", "mlx", "numba", "numpy", "cupy"
     out: Optional output array (only used if shapes match)
     """
+    if backend == "cupy" and HAS_CUPY:
+        if not hasattr(a, 'get'): a = cp.array(a)
+        if not hasattr(b, 'get'): b = cp.array(b)
+        if out is not None and hasattr(out, 'get'):
+            cp.matmul(a, b, out=out)
+            return out
+        else:
+            res = cp.matmul(a, b)
+            if out is not None:
+                res.get(out=out)
+                return out
+            return res
+
+    if backend == "auto" and HAS_CUPY and (hasattr(a, 'get') or hasattr(b, 'get')):
+        if not hasattr(a, 'get'): a = cp.array(a)
+        if not hasattr(b, 'get'): b = cp.array(b)
+        if out is not None and hasattr(out, 'get'):
+            cp.matmul(a, b, out=out)
+            return out
+        else:
+            res = cp.matmul(a, b)
+            if out is not None:
+                res.get(out=out)
+                return out
+            return res
+
     # Force backend if specified
     if backend == "mlx" and HAS_MLX:
         if not isinstance(a, mx.array): a = mx.array(a)
@@ -79,11 +111,71 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
     M = int(np.prod(a_shape[:-1]))
     N = b.shape[-1]
 
-    # Fallback to standard matmul if b is not 2D (batched matmul)
-    # The current tiling implementation assumes b is [K, N] and broadcasts a over it.
+    # Batched execution using threads if b is > 2D
     if b.ndim > 2:
-        with np.errstate(all='ignore'):
-            return np.matmul(a, b, out=out)
+        if a.ndim == 1:
+            with np.errstate(all='ignore'):
+                return np.matmul(a, b, out=out)
+
+        try:
+            batch_shape = np.broadcast_shapes(a.shape[:-2], b.shape[:-2])
+        except ValueError:
+            with np.errstate(all='ignore'):
+                return np.matmul(a, b, out=out)
+
+        M_inner = a.shape[-2]
+        N_inner = b.shape[-1]
+        out_shape = batch_shape + (M_inner, N_inner)
+        B_total = int(np.prod(batch_shape))
+
+        if out is not None and out.shape == out_shape and out.dtype == np.result_type(a, b):
+            res = out
+        else:
+            res = np.empty(out_shape, dtype=np.result_type(a, b))
+
+        try:
+            a_flat = np.broadcast_to(a, batch_shape + a.shape[-2:]).reshape(B_total, M_inner, K)
+            b_flat = np.broadcast_to(b, batch_shape + b.shape[-2:]).reshape(B_total, K, N_inner)
+            res_flat = res.reshape(B_total, M_inner, N_inner)
+        except ValueError:
+            with np.errstate(all='ignore'):
+                return np.matmul(a, b, out=out)
+
+        total_ops = float(B_total) * M_inner * K * N_inner
+        use_parallel = executor is not None and total_ops > 1.5e8
+
+        if use_parallel:
+            futures = []
+
+            # Determine thread counts, up to cpu count or 4
+            num_workers = os.cpu_count() or 4
+
+            # Slice by batches
+            chunk_size = (B_total + num_workers - 1) // num_workers
+
+            def compute_batch_chunk(start_idx, end_idx):
+                with np.errstate(all='ignore'):
+                    np.matmul(
+                        a_flat[start_idx:end_idx],
+                        b_flat[start_idx:end_idx],
+                        out=res_flat[start_idx:end_idx]
+                    )
+
+            for i in range(0, B_total, chunk_size):
+                end_idx = min(i + chunk_size, B_total)
+                futures.append(executor.submit(compute_batch_chunk, i, end_idx))
+
+            for f in as_completed(futures):
+                f.result()
+        else:
+            with np.errstate(all='ignore'):
+                np.matmul(a_flat, b_flat, out=res_flat)
+
+        # Handle non-contiguous out mapping for standard result reshaping
+        if out is not None and res is out and not np.shares_memory(out, res_flat):
+            np.copyto(out, res_flat.reshape(out_shape))
+
+        return res
 
     # Heuristic: Parallelize if total work > threshold
     # Increased threshold to 1.5e8 (150M ops) to avoid thread overhead for medium sizes
@@ -111,10 +203,10 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
     out_shape = list(a_shape)
     out_shape[-1] = N
 
-    if out is not None and out.shape == tuple(out_shape) and out.dtype == a.dtype:
+    if out is not None and out.shape == tuple(out_shape) and out.dtype == np.result_type(a, b):
         res = out
     else:
-        res = np.empty(out_shape, dtype=a.dtype)
+        res = np.empty(out_shape, dtype=np.result_type(a, b))
 
     res_flat = res.reshape(M, N)
 
