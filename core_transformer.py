@@ -16,6 +16,12 @@ except ImportError:
     ml_dtypes = None
 
 try:
+    import cupy as cp
+    HAS_CUPY = True
+except ImportError:
+    HAS_CUPY = False
+
+try:
     import mlx.core as mx
     HAS_MLX = True
 except ImportError:
@@ -69,6 +75,25 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
         if not isinstance(a, mx.array): a = mx.array(a)
         if not isinstance(b, mx.array): b = mx.array(b)
         return mx.matmul(a, b)
+
+    # CuPy backend handling
+    is_a_cupy = HAS_CUPY and hasattr(a, 'get')
+    is_b_cupy = HAS_CUPY and hasattr(b, 'get')
+    if backend == "cupy" or (backend == "auto" and HAS_CUPY and (is_a_cupy or is_b_cupy)):
+        if not is_a_cupy: a = cp.array(a)
+        if not is_b_cupy: b = cp.array(b)
+
+        if out is not None:
+            if hasattr(out, 'get'):
+                # out is a cupy array, do in-place
+                return cp.matmul(a, b, out=out)
+            else:
+                # out is a numpy array
+                res = cp.matmul(a, b)
+                res.get(out=out)
+                return out
+        else:
+            return cp.matmul(a, b)
 
     if block_size is None:
         block_size = _get_platform_block_size()
