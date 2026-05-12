@@ -82,8 +82,62 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
     # Fallback to standard matmul if b is not 2D (batched matmul)
     # The current tiling implementation assumes b is [K, N] and broadcasts a over it.
     if b.ndim > 2:
-        with np.errstate(all='ignore'):
-            return np.matmul(a, b, out=out)
+        if a.ndim == 1:
+            with np.errstate(all='ignore'):
+                return np.matmul(a, b, out=out)
+
+        try:
+            batch_shape = np.broadcast_shapes(a.shape[:-2], b.shape[:-2])
+            M_inner = a.shape[-2]
+            K_inner = a.shape[-1]
+            N_inner = b.shape[-1]
+            B_total = int(np.prod(batch_shape))
+
+            total_ops = float(B_total) * M_inner * K_inner * N_inner
+            use_parallel = executor is not None and total_ops > 1.5e8
+
+            if not use_parallel:
+                with np.errstate(all='ignore'):
+                    return np.matmul(a, b, out=out)
+
+            a_bcast_shape = tuple(batch_shape) + (M_inner, K_inner)
+            b_bcast_shape = tuple(batch_shape) + (K_inner, N_inner)
+
+            a_bcast = np.broadcast_to(a, a_bcast_shape).reshape(B_total, M_inner, K_inner)
+            b_bcast = np.broadcast_to(b, b_bcast_shape).reshape(B_total, K_inner, N_inner)
+
+            out_shape = tuple(batch_shape) + (M_inner, N_inner)
+
+            if out is not None and out.shape == out_shape:
+                res = out
+            else:
+                res = np.empty(out_shape, dtype=np.result_type(a, b))
+
+            res_flat = res.reshape(B_total, M_inner, N_inner)
+
+            def compute_batch(start, end):
+                with np.errstate(all='ignore'):
+                    for i in range(start, end):
+                        np.matmul(a_bcast[i], b_bcast[i], out=res_flat[i])
+
+            num_workers = os.cpu_count() or 4
+            chunk_size = max(1, B_total // num_workers)
+
+            futures = []
+            for i in range(0, B_total, chunk_size):
+                end = min(i + chunk_size, B_total)
+                futures.append(executor.submit(compute_batch, i, end))
+
+            for f in futures:
+                f.result()
+
+            if not np.shares_memory(res, res_flat):
+                np.copyto(res, res_flat.reshape(out_shape))
+
+            return res
+        except ValueError:
+            with np.errstate(all='ignore'):
+                return np.matmul(a, b, out=out)
 
     # Heuristic: Parallelize if total work > threshold
     # Increased threshold to 1.5e8 (150M ops) to avoid thread overhead for medium sizes
