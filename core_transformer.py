@@ -55,9 +55,35 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
     a: [..., K]
     b: [K, N]
     Output: [..., N]
-    backend: "auto", "mlx", "numba", "numpy"
+    backend: "auto", "mlx", "numba", "cupy", "numpy"
     out: Optional output array (only used if shapes match)
     """
+    # CuPy Path
+    # Determine if we should use cupy
+    use_cupy = False
+    try:
+        import cupy as cp
+        HAS_CUPY = True
+    except ImportError:
+        HAS_CUPY = False
+
+    use_cupy = (backend == "cupy" and HAS_CUPY) or (backend == "auto" and HAS_CUPY and (hasattr(a, 'get') or hasattr(b, 'get')))
+
+    if use_cupy:
+        if not hasattr(a, 'get'): a = cp.array(a)
+        if not hasattr(b, 'get'): b = cp.array(b)
+
+        if out is not None:
+            if hasattr(out, 'get'):
+                cp.matmul(a, b, out=out)
+                return out
+            else:
+                res = cp.matmul(a, b)
+                res.get(out=out)
+                return out
+        else:
+            return cp.matmul(a, b)
+
     # Force backend if specified
     if backend == "mlx" and HAS_MLX:
         if not isinstance(a, mx.array): a = mx.array(a)
@@ -73,17 +99,79 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
     if block_size is None:
         block_size = _get_platform_block_size()
 
+    # Batched matrix multiplication path
+    if b.ndim > 2:
+        if a.ndim == 1:
+            with np.errstate(all='ignore'):
+                return np.matmul(a, b, out=out)
+
+        try:
+            batch_shape = np.broadcast_shapes(a.shape[:-2], b.shape[:-2])
+        except ValueError:
+            with np.errstate(all='ignore'):
+                return np.matmul(a, b, out=out)
+
+        M_inner, K_inner = a.shape[-2:] if a.ndim >= 2 else (1, a.shape[-1])
+        K_b, N_inner = b.shape[-2:]
+        if K_inner != K_b:
+            with np.errstate(all='ignore'):
+                return np.matmul(a, b, out=out)
+
+        total_ops = float(np.prod(batch_shape)) * M_inner * K_inner * N_inner
+
+        if executor is None or total_ops <= 1.5e8:
+            with np.errstate(all='ignore'):
+                return np.matmul(a, b, out=out)
+
+        B_total = np.prod(batch_shape)
+
+        try:
+            a_bc = np.broadcast_to(a, batch_shape + a.shape[-2:])
+            b_bc = np.broadcast_to(b, batch_shape + b.shape[-2:])
+
+            a_flat = a_bc.reshape(B_total, M_inner, K_inner)
+            b_flat = b_bc.reshape(B_total, K_inner, N_inner)
+        except ValueError:
+            with np.errstate(all='ignore'):
+                return np.matmul(a, b, out=out)
+
+        out_shape = tuple(list(batch_shape) + [M_inner, N_inner])
+        if out is not None and out.shape == out_shape and out.dtype == np.result_type(a, b):
+            res = out
+        else:
+            res = np.empty(out_shape, dtype=np.result_type(a, b))
+
+        try:
+            res_flat = res.reshape(B_total, M_inner, N_inner)
+        except ValueError:
+            with np.errstate(all='ignore'):
+                return np.matmul(a, b, out=out)
+
+        num_workers = getattr(executor, '_max_workers', 4)
+        chunk_size = max(1, B_total // num_workers)
+
+        def compute_batch_chunk(start, end):
+            with np.errstate(all='ignore'):
+                np.matmul(a_flat[start:end], b_flat[start:end], out=res_flat[start:end])
+
+        futures = []
+        for i in range(0, B_total, chunk_size):
+            end = min(i + chunk_size, B_total)
+            futures.append(executor.submit(compute_batch_chunk, i, end))
+
+        for f in futures:
+            f.result()
+
+        if not np.shares_memory(res, res_flat):
+            np.copyto(res, res_flat.reshape(out_shape))
+
+        return res
+
     a_shape = a.shape
     K = a_shape[-1]
     # Calculate M (product of leading dimensions of a)
     M = int(np.prod(a_shape[:-1]))
     N = b.shape[-1]
-
-    # Fallback to standard matmul if b is not 2D (batched matmul)
-    # The current tiling implementation assumes b is [K, N] and broadcasts a over it.
-    if b.ndim > 2:
-        with np.errstate(all='ignore'):
-            return np.matmul(a, b, out=out)
 
     # Heuristic: Parallelize if total work > threshold
     # Increased threshold to 1.5e8 (150M ops) to avoid thread overhead for medium sizes
@@ -111,12 +199,16 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
     out_shape = list(a_shape)
     out_shape[-1] = N
 
-    if out is not None and out.shape == tuple(out_shape) and out.dtype == a.dtype:
+    if out is not None and out.shape == tuple(out_shape) and out.dtype == np.result_type(a, b):
         res = out
     else:
-        res = np.empty(out_shape, dtype=a.dtype)
+        res = np.empty(out_shape, dtype=np.result_type(a, b))
 
-    res_flat = res.reshape(M, N)
+    try:
+        res_flat = res.reshape(M, N)
+    except ValueError:
+        with np.errstate(all='ignore'):
+            return np.matmul(a, b, out=out)
 
     use_numba = (backend == "numba" and HAS_NUMBA) or (backend == "auto" and HAS_NUMBA)
 
