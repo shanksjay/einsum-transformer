@@ -27,6 +27,12 @@ try:
 except ImportError:
     HAS_NUMBA = False
 
+try:
+    import cupy as cp
+    HAS_CUPY = True
+except ImportError:
+    HAS_CUPY = False
+
 
 import platform
 
@@ -70,6 +76,21 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
         if not isinstance(b, mx.array): b = mx.array(b)
         return mx.matmul(a, b)
 
+    is_cupy_a = hasattr(a, 'get')
+    is_cupy_b = hasattr(b, 'get')
+    if backend == "cupy" or (backend == "auto" and HAS_CUPY and (is_cupy_a or is_cupy_b)):
+        if HAS_CUPY:
+            if not is_cupy_a: a = cp.array(a)
+            if not is_cupy_b: b = cp.array(b)
+            if out is not None:
+                if hasattr(out, 'get'):
+                    return cp.matmul(a, b, out=out)
+                else:
+                    res = cp.matmul(a, b)
+                    return res.get(out=out)
+            else:
+                return cp.matmul(a, b)
+
     if block_size is None:
         block_size = _get_platform_block_size()
 
@@ -82,8 +103,68 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
     # Fallback to standard matmul if b is not 2D (batched matmul)
     # The current tiling implementation assumes b is [K, N] and broadcasts a over it.
     if b.ndim > 2:
-        with np.errstate(all='ignore'):
-            return np.matmul(a, b, out=out)
+        if a.ndim == 1:
+            with np.errstate(all='ignore'):
+                return np.matmul(a, b, out=out)
+
+        batch_shape_a = a.shape[:-2] if a.ndim > 2 else ()
+        batch_shape_b = b.shape[:-2]
+        if batch_shape_a and batch_shape_b and batch_shape_a != batch_shape_b:
+            with np.errstate(all='ignore'):
+                return np.matmul(a, b, out=out)
+
+        try:
+            batch_shape = np.broadcast_shapes(a.shape[:-2] if a.ndim > 1 else (), b.shape[:-2])
+            M_inner = a.shape[-2] if a.ndim > 1 else 1
+            K_inner = a.shape[-1]
+            N_inner = b.shape[-1]
+
+            total_ops = float(np.prod(batch_shape)) * M_inner * K_inner * N_inner
+            if executor is None or total_ops < 1.5e8:
+                with np.errstate(all='ignore'):
+                    return np.matmul(a, b, out=out)
+
+            out_shape = tuple(list(batch_shape) + [M_inner, N_inner])
+            res_dtype = np.result_type(a, b)
+
+            if out is not None and out.shape == out_shape and out.dtype == res_dtype:
+                res = out
+            else:
+                res = np.empty(out_shape, dtype=res_dtype)
+
+            B_total = int(np.prod(batch_shape))
+
+            a_reshaped = np.broadcast_to(a, tuple(list(batch_shape) + [M_inner, K_inner])).reshape(B_total, M_inner, K_inner)
+            b_reshaped = np.broadcast_to(b, tuple(list(batch_shape) + [K_inner, N_inner])).reshape(B_total, K_inner, N_inner)
+            res_reshaped = res.reshape(B_total, M_inner, N_inner)
+
+            num_workers = getattr(executor, '_max_workers', os.cpu_count() or 4)
+            chunk_size = max(1, B_total // num_workers)
+
+            def compute_batch_chunk(start_idx, end_idx):
+                with np.errstate(all='ignore'):
+                    np.matmul(
+                        a_reshaped[start_idx:end_idx],
+                        b_reshaped[start_idx:end_idx],
+                        out=res_reshaped[start_idx:end_idx]
+                    )
+
+            futures = []
+            for i in range(0, B_total, chunk_size):
+                end_idx = min(i + chunk_size, B_total)
+                futures.append(executor.submit(compute_batch_chunk, i, end_idx))
+
+            for f in futures:
+                f.result()
+
+            if out is not None and not np.shares_memory(res, res_reshaped):
+                np.copyto(out, res_reshaped.reshape(out_shape))
+
+            return res
+
+        except ValueError:
+            with np.errstate(all='ignore'):
+                return np.matmul(a, b, out=out)
 
     # Heuristic: Parallelize if total work > threshold
     # Increased threshold to 1.5e8 (150M ops) to avoid thread overhead for medium sizes
@@ -111,10 +192,11 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
     out_shape = list(a_shape)
     out_shape[-1] = N
 
-    if out is not None and out.shape == tuple(out_shape) and out.dtype == a.dtype:
+    res_dtype = np.result_type(a, b)
+    if out is not None and out.shape == tuple(out_shape) and out.dtype == res_dtype:
         res = out
     else:
-        res = np.empty(out_shape, dtype=a.dtype)
+        res = np.empty(out_shape, dtype=res_dtype)
 
     res_flat = res.reshape(M, N)
 
@@ -153,6 +235,9 @@ def tiled_matmul(a, b, block_size=None, executor=None, backend="auto", out=None)
                     n_end = min(j + block_size, N)
                     compute_block(i, m_end, j, n_end)
 
+    if out is not None and not np.shares_memory(res, res_flat):
+        np.copyto(out, res_flat.reshape(tuple(out_shape)))
+
     return res
 
 if HAS_NUMBA:
@@ -164,7 +249,9 @@ if HAS_NUMBA:
         # Parallelize outer loops over blocks
         # Numba's parallel loop handling is often better than manual chunking
         # We iterate over blocks to keep memory locality
-        for i in nb.prange(0, M, block_size):
+        num_blocks = (M + block_size - 1) // block_size
+        for blk in nb.prange(num_blocks):
+            i = blk * block_size
             m_end = min(i + block_size, M)
             for j in range(0, N, block_size):
                 n_end = min(j + block_size, N)
@@ -172,7 +259,9 @@ if HAS_NUMBA:
                 # Since res is empty, we assign directly.
                 # However, np.dot/matmul inside njit might not support out= argument or slicing assignment perfectly with BLAS
                 # But typical usage:
-                res[i:m_end, j:n_end] = a[i:m_end, :] @ b[:, j:n_end]
+                a_slice = a[i:m_end, :].astype(res.dtype, copy=False)
+                b_slice = b[:, j:n_end].astype(res.dtype, copy=False)
+                res[i:m_end, j:n_end] = a_slice @ b_slice
 else:
     _numba_tiled_matmul = None
 
